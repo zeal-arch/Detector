@@ -306,6 +306,12 @@ async function cleanupMergeOPFS() {
   }
 }
 
+/**
+ * Remove common MEMFS input and output files created during merge/download operations.
+ *
+ * Attempts to unlink both MP4 and WebM variants of input_video, input_audio, and output files
+ * from the libav instance's MEMFS and ignores any unlink errors (e.g., file not present).
+ */
 function cleanupMEMFS() {
   if (!libavInstance) return;
   // Clean up all possible input/output filenames (both MP4 and WebM variants)
@@ -318,6 +324,10 @@ function cleanupMEMFS() {
   }
 }
 
+/**
+ * Cancels any in-progress merge operation, cleans up partial in-memory files, and reports the outcome.
+ * @param {function(Object): void} sendResponse - Callback invoked with the result object: `{ success: true }` on successful cancellation, or `{ success: false, error: string }` if no active merge exists.
+ */
 function handleCancelMerge(sendResponse) {
   if (activeMergeAbort) {
     console.log("[OFFSCREEN] Cancelling active merge...");
@@ -331,6 +341,21 @@ function handleCancelMerge(sendResponse) {
   }
 }
 
+/**
+ * Download video and audio streams, merge them into a single media file, and trigger a background download.
+ *
+ * Orchestrates parallel downloads of the provided video and audio URLs, writes them to libav.js MEMFS, runs an FFmpeg merge
+ * (copying streams, using WebM when both inputs are WebM), produces a Blob URL for the merged output, and asks the background
+ * script to start the actual file download. Progress updates are emitted via the broadcast channel; the operation can be
+ * cancelled (AbortController) and cleans up MEMFS and temporary buffers on completion or error.
+ *
+ * @param {Object} msg - Message payload containing merge parameters.
+ * @param {string} msg.videoUrl - URL of the video track to download.
+ * @param {string} msg.audioUrl - URL of the audio track to download.
+ * @param {string} [msg.filename] - Preferred filename for the merged output; extension will be ensured.
+ * @param {string} [msg.mergeId] - Optional identifier used for progress reporting.
+ * @param {Function} sendResponse - Callback to send the result back (called with an object describing success or error).
+ */
 async function handleMergeAndDownload(msg, sendResponse) {
   const { videoUrl, audioUrl, filename, mergeId } = msg;
   const progressKey = mergeId || Date.now().toString();

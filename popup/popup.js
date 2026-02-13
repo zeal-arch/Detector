@@ -70,6 +70,15 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+/**
+ * Produce a human-friendly label for a client identifier used to obtain a stream.
+ *
+ * Converts known identifiers (e.g., "web", "android", "page_deciphered") to readable labels.
+ * If the input contains "+" and is not an exact known key, each plus-separated token is labeled (known tokens mapped, "cipher" -> "Cipher", unknown tokens uppercased) and joined with " + ".
+ *
+ * @param {string} clientUsed - Client identifier string or a plus-separated composite (e.g., "web", "page_deciphered", "web+cipher").
+ * @returns {string} A human-readable label for the provided client identifier; returns an empty string for falsy input.
+ */
 function formatSourceLabel(clientUsed) {
   if (!clientUsed) return "";
   const labels = {
@@ -213,6 +222,26 @@ function renderError(title, message) {
   document.getElementById("retryBtn")?.addEventListener("click", init);
 }
 
+/**
+ * Render the video information card and associated download UI for a detected video.
+ *
+ * Updates internal state with the provided video info, builds and inserts the appropriate
+ * UI (compact single-format card or multi-format selector), displays DRM and login hints,
+ * and wires download/merge controls and thumbnail fallbacks.
+ *
+ * @param {Object} info - Video metadata and available formats.
+ * @param {string} [info.title] - Video title.
+ * @param {string} [info.videoId] - Video identifier (used to derive a thumbnail if none provided).
+ * @param {string} [info.author] - Video author/channel name.
+ * @param {number} [info.lengthSeconds] - Video duration in seconds.
+ * @param {string} [info.thumbnail] - URL of the video thumbnail.
+ * @param {Array<Object>} [info.formats] - Array of available format objects (muxed, video-only, audio-only) with properties like itag, url, mimeType, codecs, height, bitrate, contentLength, isHLS, isDASH, isMuxed, isVideo, isAudio, fps, audioBitrate.
+ * @param {boolean} [info.drmDetected] - True if DRM was detected for this video.
+ * @param {string} [info.drmType] - DRM type label (when drmDetected is true).
+ * @param {number|string} [info.drmConfidence] - Confidence level for DRM detection.
+ * @param {boolean} [info.loggedIn] - False if the user is detected as not signed into the source (used to show a sign-in hint).
+ * @param {string} [info.clientUsed] - Identifier of the source client used to obtain info (used to render a source label).
+ */
 function renderVideo(info) {
   currentVideoInfo = info; // Store current video info for DRM checks
   const {
@@ -561,6 +590,13 @@ function renderStreamItem(stream) {
     </div>`;
 }
 
+/**
+ * Handle the Download button click: validate selection and initiate the appropriate download flow.
+ *
+ * Reads the selected quality/option from the quality selector, prevents downloads for DRM-protected content,
+ * and either starts a merge download for separate video+audio tracks or starts a worker/direct download for a single format.
+ * Updates the download button state briefly while the download is being started.
+ */
 function handleDownloadClick() {
   // Check for DRM protection
   const currentInfo = currentVideoInfo;
@@ -638,6 +674,14 @@ async function downloadFormat(url, filename) {
   }
 }
 
+/**
+ * Starts a background worker download for the given URL and begins polling for download progress on success.
+ *
+ * Sends the download request (including optional video title and thumbnail metadata) to the extension background so the worker can perform HLS/DASH downloads and keeps the UI updated by starting the download poll when accepted.
+ * @param {string} url - The resource URL to download.
+ * @param {string} type - The download type, e.g. "hls", "dash", or "direct".
+ * @param {string} filename - The desired filename for the downloaded file.
+ */
 async function workerDownload(url, type, filename) {
   try {
     const resp = await chrome.runtime.sendMessage({
@@ -659,6 +703,19 @@ async function workerDownload(url, type, filename) {
   }
 }
 
+/**
+ * Starts merging a video and audio stream into a single file and updates the UI to reflect merge progress.
+ *
+ * Initiates a background merge request for the provided video and audio URLs, disables relevant UI controls,
+ * shows progress, and handles success, failure, and cancellation states. On completion (success or failure)
+ * the UI is reset and the internal merge-in-progress flag is cleared.
+ *
+ * @param {string} videoUrl - URL of the video-only stream to merge.
+ * @param {string} audioUrl - URL of the audio-only stream to merge.
+ * @param {string} filename - Desired output filename for the merged file.
+ * @param {string|number} videoItag - Format itag or identifier for the video stream.
+ * @param {string|number} audioItag - Format itag or identifier for the audio stream.
+ */
 async function mergeDownload(
   videoUrl,
   audioUrl,
@@ -841,6 +898,15 @@ function showBanner(type, html) {
   }
 }
 
+/**
+ * Periodically polls session storage for an active merge and updates the UI with merge progress.
+ *
+ * Starts a repeating poll that reads "activeMerge" from chrome.storage.session and, while the merge
+ * is active, updates either the inline progress UI (element with id "progressWrap") or the global
+ * merge banner (element with id "activeBanner") with the current percent and message. If no active
+ * merge is found the poll is stopped and cleared. Calling this while a poll is already running has
+ * no effect.
+ */
 function startMergePoll() {
   if (mergePollTimer) return;
   mergePollTimer = setInterval(async () => {
@@ -877,6 +943,14 @@ function startMergePoll() {
   }, 1200);
 }
 
+/**
+ * Begin a periodic check of session storage for active downloads and render/update download banners in the UI.
+ *
+ * If a poll is already active this is a no-op. While running, the function:
+ * - Creates or updates per-download banners showing progress, percentage, and an optional thumbnail and title.
+ * - Converts completed or errored downloads into final banners and removes them after a short delay.
+ * - Stops polling and clears banners when there are no active downloads.
+ */
 function startDownloadPoll() {
   if (downloadPollTimer) return;
   downloadPollTimer = setInterval(async () => {
@@ -975,6 +1049,16 @@ function startDownloadPoll() {
   }, 1500);
 }
 
+/**
+ * Render banners for current active downloads stored in session storage.
+ *
+ * Retrieves `activeDownloads` from `chrome.storage.session` and creates a banner
+ * for each entry under the page `content` element. Each banner reflects the
+ * download's phase: "complete" (success), "error" (failure), or active
+ * (in-progress). When available, video metadata (`videoTitle`, `videoThumbnail`)
+ * is shown; active banners display percentage progress and a progress bar and
+ * will trigger the download poll to keep UI in sync.
+ */
 async function showActiveDownloads() {
   try {
     const result = await chrome.storage.session.get("activeDownloads");
@@ -1039,6 +1123,14 @@ async function showActiveDownloads() {
   } catch {}
 }
 
+/**
+ * Initialize the popup UI, detect video content on the active tab, and render the appropriate view.
+ *
+ * Queries the active browser tab, requests video information and any sniffed streams from the background
+ * script, and then renders one of: a detailed video card, sniffed streams list, a waiting-for-content view,
+ * or an error state. Restores and displays any active merge state (inline or as a banner), starts merge/download
+ * polling when appropriate, and populates active download banners. On failure, logs the error and renders an error view.
+ */
 async function init() {
   if (currentView === "settings") return;
   renderLoading();

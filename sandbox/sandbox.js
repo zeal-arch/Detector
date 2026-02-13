@@ -1,5 +1,19 @@
 const fnCache = new Map();
 
+/**
+ * Create a sandboxed, window-like environment suitable for evaluating code in isolation.
+ *
+ * The returned object mimics a browser global with minimal, deterministic implementations of
+ * location, navigator, document, localStorage, sessionStorage, common built-in constructors
+ * and globals (e.g., Math, String, Array, Object, JSON), console, timing APIs, and Promise.
+ *
+ * @returns {Object} A mock `window` object containing:
+ *  - `location`, `navigator`, `document` (minimal shapes),
+ *  - `localStorage` and `sessionStorage` (simple key/value stores with `getItem`, `setItem`, `removeItem`, `clear`, `length`, and `key`),
+ *  - common global constructors and functions (Math, String, Array, Object, Number, Boolean, RegExp, Date, JSON, parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent, atob, btoa),
+ *  - `console`, `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, and `Promise`,
+ *  - aliases `window`, `self`, and `globalThis` pointing to the mock object.
+ */
 function createMockEnv() {
   const createMockStorage = () => {
     const store = {};
@@ -82,6 +96,16 @@ window.addEventListener("message", (e) => {
   }
 });
 
+/**
+ * Evaluate a provided N-sig function source against multiple inputs and send the results back to the message sender.
+ *
+ * Compiles and caches a callable function from `fnCode`, executes it for each value in `params`, and posts a reply to `e.source` containing the `id` and an array of results. On successful execution for an input, the function's string result is used; if execution fails or produces a non-string, the original input is returned. If a fatal error occurs, an error message and the original `params` are posted.
+ *
+ * @param {MessageEvent} e - The incoming message event whose `source` will receive the reply.
+ * @param {string|number} id - Correlation identifier included in the reply message.
+ * @param {string} fnCode - Source code of the N-sig function to compile and evaluate.
+ * @param {Array<any>} params - Array of inputs to pass to the compiled function; results are collected in order.
+ */
 function handleEvalNSig(e, id, fnCode, params) {
   try {
     let fn = fnCache.get("nsig:" + fnCode);
