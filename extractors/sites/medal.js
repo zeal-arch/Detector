@@ -1,0 +1,108 @@
+(function () {
+    const SITE_ID = 'medal';
+
+    if (window.__SITE_SPECIALIST_LOADED === SITE_ID) return;
+    window.__SITE_SPECIALIST_LOADED = SITE_ID;
+
+    function log(...args) {
+        console.log(`[Specialist][${SITE_ID}]`, ...args);
+    }
+
+    function sendToBackground(videos) {
+        window.postMessage({
+            type: 'LALHLIMPUII_JAHAU_DETECTED',
+            source: SITE_ID,
+            data: { videos }
+        }, '*');
+    }
+
+    function extractFromPage() {
+        const videos = [];
+
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+            const content = script.textContent || '';
+
+            const sourceMatch = content.match(/"contentUrl"\s*:\s*"([^"]+)"/);
+            if (sourceMatch) {
+                videos.push({
+                    url: sourceMatch[1],
+                    type: 'mp4',
+                    quality: 'auto',
+                    title: document.title
+                });
+            }
+
+            const clipMatch = content.match(/"videoUrl"\s*:\s*"([^"]+)"/);
+            if (clipMatch) {
+                videos.push({
+                    url: clipMatch[1],
+                    type: 'mp4',
+                    quality: 'auto',
+                    title: document.title
+                });
+            }
+        }
+
+        const ldJson = document.querySelectorAll('script[type="application/ld+json"]');
+        for (const script of ldJson) {
+            try {
+                const data = JSON.parse(script.textContent);
+                const items = Array.isArray(data) ? data : [data];
+                for (const item of items) {
+                    if (item['@type'] === 'VideoObject' && item.contentUrl) {
+                        videos.push({
+                            url: item.contentUrl,
+                            type: 'mp4',
+                            quality: 'auto',
+                            title: item.name || document.title
+                        });
+                    }
+                }
+            } catch {  }
+        }
+
+        const videoElements = document.querySelectorAll('video');
+        for (const video of videoElements) {
+            const src = video.src || video.currentSrc;
+            if (src && !src.startsWith('blob:')) {
+                videos.push({
+                    url: src,
+                    type: 'mp4',
+                    quality: 'auto',
+                    title: document.title
+                });
+            }
+        }
+
+        return videos;
+    }
+
+    function extractAll() {
+        const allVideos = [...extractFromPage()];
+
+        const seen = new Set();
+        const unique = allVideos.filter(v => {
+            if (seen.has(v.url)) return false;
+            seen.add(v.url);
+            return true;
+        });
+
+        if (unique.length > 0) {
+            log(`Found ${unique.length} videos`);
+            sendToBackground(unique);
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', extractAll);
+    } else {
+        extractAll();
+    }
+
+    const observer = new MutationObserver(() => setTimeout(extractAll, 1000));
+    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+
+    setInterval(extractAll, 5000);
+    log('Medal.tv specialist initialized');
+})();

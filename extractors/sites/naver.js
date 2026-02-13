@@ -1,0 +1,134 @@
+(function () {
+    const SITE_ID = 'naver';
+
+    if (window.__SITE_SPECIALIST_LOADED === SITE_ID) return;
+    window.__SITE_SPECIALIST_LOADED = SITE_ID;
+
+    function log(...args) {
+        console.log(`[Specialist][${SITE_ID}]`, ...args);
+    }
+
+    function sendToBackground(videos) {
+        window.postMessage({
+            type: 'LALHLIMPUII_JAHAU_DETECTED',
+            source: SITE_ID,
+            data: { videos }
+        }, '*');
+    }
+
+    function extractFromPage() {
+        const videos = [];
+
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+            const content = script.textContent || '';
+
+            const playerMatch = content.match(/new\s+nhn\.video\.player\s*\(\s*(\{[^}]+\})/);
+            if (playerMatch) {
+                try {
+                    const config = JSON.parse(playerMatch[1]);
+                    if (config.videoUrl) {
+                        videos.push({
+                            url: config.videoUrl,
+                            type: config.videoUrl.includes('.m3u8') ? 'hls' : 'mp4',
+                            quality: 'auto',
+                            title: document.title
+                        });
+                    }
+                } catch {  }
+            }
+
+            const hlsMatch = content.match(/["']([^"']+\.m3u8[^"']*)/gi);
+            if (hlsMatch) {
+                for (const match of hlsMatch) {
+                    const url = match.replace(/^['"]|['"]$/g, '');
+                    videos.push({
+                        url: url,
+                        type: 'hls',
+                        quality: 'auto',
+                        title: document.title
+                    });
+                }
+            }
+
+            const videoMatch = content.match(/"(?:videoUrl|playUrl|source)"\s*:\s*"([^"]+)"/gi);
+            if (videoMatch) {
+                for (const match of videoMatch) {
+                    const urlMatch = match.match(/"([^"]+)"/g);
+                    if (urlMatch && urlMatch[1]) {
+                        const url = urlMatch[1].replace(/"/g, '');
+                        if (url.includes('.m3u8') || url.includes('.mp4')) {
+                            videos.push({
+                                url: url,
+                                type: url.includes('.m3u8') ? 'hls' : 'mp4',
+                                quality: 'auto',
+                                title: document.title
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        const ldJson = document.querySelectorAll('script[type="application/ld+json"]');
+        for (const script of ldJson) {
+            try {
+                const data = JSON.parse(script.textContent);
+                const items = Array.isArray(data) ? data : [data];
+                for (const item of items) {
+                    if (item['@type'] === 'VideoObject' && item.contentUrl) {
+                        videos.push({
+                            url: item.contentUrl,
+                            type: item.contentUrl.includes('.m3u8') ? 'hls' : 'mp4',
+                            quality: 'auto',
+                            title: item.name || document.title
+                        });
+                    }
+                }
+            } catch {  }
+        }
+
+        const videoElements = document.querySelectorAll('video');
+        for (const video of videoElements) {
+            const src = video.src || video.currentSrc;
+            if (src && !src.startsWith('blob:')) {
+                videos.push({
+                    url: src,
+                    type: src.includes('.m3u8') ? 'hls' : 'mp4',
+                    quality: 'auto',
+                    title: document.title
+                });
+            }
+        }
+
+        return videos;
+    }
+
+    function extractAll() {
+        const allVideos = [...extractFromPage()];
+
+        const seen = new Set();
+        const unique = allVideos.filter(v => {
+            if (seen.has(v.url)) return false;
+            seen.add(v.url);
+            return true;
+        });
+
+        if (unique.length > 0) {
+            log(`Found ${unique.length} videos`);
+            sendToBackground(unique);
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', extractAll);
+    } else {
+        extractAll();
+    }
+
+    const observer = new MutationObserver(() => setTimeout(extractAll, 1000));
+    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+
+    setInterval(extractAll, 5000);
+    log('Naver specialist initialized');
+})();

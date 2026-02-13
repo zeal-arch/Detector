@@ -1,0 +1,330 @@
+{
+    "manifest_version": 3,
+    "name": "Detector",
+    "version": "1.1.0",
+    "description": "Download videos and photos from ANYWHERE",
+    "icons": {
+        "16": "icons/icon16.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+    },
+    "action": {
+        "default_popup": "popup/popup.html",
+        "default_icon": {
+            "16": "icons/icon16.png",
+            "48": "icons/icon48.png",
+            "128": "icons/icon128.png"
+        }
+    },
+    "content_security_policy": {
+        "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "permissions": [
+        "tabs",
+        "downloads",
+        "storage",
+        "unlimitedStorage",
+        "cookies",
+        "offscreen",
+        "declarativeNetRequest",
+        "declarativeNetRequestFeedback",
+        "webNavigation",
+        "webRequest",
+        "notifications",
+        "scripting"
+    ],
+    "host_permissions": [
+        "*://*.youtube.com/*",
+        "*://*.googlevideo.com/*",
+        "*://*.google.com/*",
+        "*://*.twitter.com/*",
+        "*://*.x.com/*",
+        "*://*.twimg.com/*",
+        "*://*.instagram.com/*",
+        "*://*.cdninstagram.com/*",
+        "*://*.fbcdn.net/*",
+        "<all_urls>"
+    ],
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.youtube.com/*"
+            ],
+            "exclude_matches": [
+                "*://accounts.youtube.com/*"
+            ],
+            "js": [
+                "extractors/sites/youtube/content.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.twitter.com/*",
+                "*://*.x.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/twitter.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.instagram.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/instagram.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.tiktok.com/*"
+            ],
+            "js": [
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.reddit.com/*"
+            ],
+            "js": [
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.facebook.com/*",
+                "*://*.fb.com/*"
+            ],
+            "js": [
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.dailymotion.com/*"
+            ],
+            "js": [
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.mxplayer.in/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/mxplayer-advanced.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://baahi.xomoy.com/*",
+                "*://*.baahi.xomoy.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/baahi-advanced.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://nenow.in/*",
+                "*://nenews.in/*",
+                "*://*.nenow.in/*",
+                "*://*.nenews.in/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/northeast-news-advanced.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://eastmojo.com/*",
+                "*://*.eastmojo.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/eastmojo-advanced.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://lersia.com/*",
+                "*://*.lersia.com/*",
+                "*://api.lersia.com/*",
+                "*://lersia.lailendemo.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/sites/lersiaplay-advanced.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_end",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "exclude_matches": [
+                "*://*.youtube.com/*",
+                "*://accounts.youtube.com/*",
+                "*://*.twitter.com/*",
+                "*://*.x.com/*",
+                "*://*.instagram.com/*",
+                "*://*.tiktok.com/*",
+                "*://*.reddit.com/*",
+                "*://*.facebook.com/*",
+                "*://*.fb.com/*",
+                "*://*.dailymotion.com/*",
+                "*://*.mxplayer.in/*",
+                "*://baahi.xomoy.com/*",
+                "*://*.baahi.xomoy.com/*",
+                "*://nenow.in/*",
+                "*://*.nenow.in/*",
+                "*://nenews.in/*",
+                "*://*.nenews.in/*",
+                "*://eastmojo.com/*",
+                "*://*.eastmojo.com/*",
+                "*://lersia.com/*",
+                "*://*.lersia.com/*",
+                "*://api.lersia.com/*",
+                "*://lersia.lailendemo.com/*"
+            ],
+            "js": [
+                "extractors/base.js",
+                "extractors/generic/generic.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_idle",
+            "all_frames": false
+        },
+        {
+            "matches": [
+                "*://*.twitter.com/*",
+                "*://*.x.com/*"
+            ],
+            "js": [
+                "hooks/twitter-network-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN"
+        },
+        {
+            "matches": [
+                "<all_urls>"
+            ],
+            "exclude_matches": [
+                "*://*.youtube.com/*",
+                "*://accounts.youtube.com/*",
+                "*://*.twitter.com/*",
+                "*://*.x.com/*",
+                "*://*.instagram.com/*",
+                "*://*.tiktok.com/*",
+                "*://*.reddit.com/*",
+                "*://*.facebook.com/*",
+                "*://*.fb.com/*",
+                "*://*.dailymotion.com/*",
+                "*://*.mxplayer.in/*",
+                "*://baahi.xomoy.com/*",
+                "*://*.baahi.xomoy.com/*",
+                "*://nenow.in/*",
+                "*://*.nenow.in/*",
+                "*://nenews.in/*",
+                "*://*.nenews.in/*",
+                "*://eastmojo.com/*",
+                "*://*.eastmojo.com/*",
+                "*://lersia.com/*",
+                "*://*.lersia.com/*",
+                "*://api.lersia.com/*",
+                "*://lersia.lailendemo.com/*"
+            ],
+            "js": [
+                "hooks/generic-network-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN"
+        }
+    ],
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "extractors/sites/youtube/inject.js",
+                "icons/*",
+                "lib/libav-6.5.7.1-h264-aac-mp3.wasm.mjs",
+                "lib/libav-6.5.7.1-h264-aac-mp3.wasm.wasm",
+                "workers/download-worker.js",
+                "workers/segment-pool.js"
+            ],
+            "matches": [
+                "*://*.youtube.com/*"
+            ]
+        },
+        {
+            "resources": [
+                "icons/*",
+                "hooks/*.js",
+                "workers/download-worker.js",
+                "workers/segment-pool.js"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        },
+        {
+            "resources": [
+                "extractors/sites/*.js"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        }
+    ],
+    "sandbox": {
+        "pages": [
+            "sandbox/sandbox.html"
+        ]
+    }
+}
