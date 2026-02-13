@@ -1627,7 +1627,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         const playerUrl = pageData.playerUrl || null;
         if (playerUrl) {
           try {
-            sig = await loadSignatureData(playerUrl, videoId);
+            sig = await loadSignatureData(playerUrl);
             nSigCode = nSigCode || sig?.nSigCode || null;
             nSigBundled = nSigBundled || sig?.nSigBundled || null;
             console.log(
@@ -1688,7 +1688,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || pageData.thumbnail || "",
       formats: pageData.resolvedFormats,
       clientUsed: pageData.formatSource || "page_deciphered",
-      loggedIn: pageData.loggedIn || false,
+      loggedIn: pageData.loggedIn ?? null,
     };
   }
 
@@ -1722,7 +1722,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let sig = null;
   if (playerUrl) {
     try {
-      sig = await loadSignatureData(playerUrl, videoId);
+      sig = await loadSignatureData(playerUrl);
       console.log(
         "[BG] Signature data loaded from background fetch —",
         "cipher:",
@@ -1935,7 +1935,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
       thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
       formats: mergedFormats,
       clientUsed: successfulClients.join("+"),
-      loggedIn: pageData.loggedIn || false,
+      loggedIn: pageData.loggedIn ?? null,
     };
   }
 
@@ -1978,7 +1978,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         thumbnail,
         formats: sniffedFormats,
         clientUsed: "sniffed",
-        loggedIn: pageData.loggedIn || false,
+        loggedIn: pageData.loggedIn ?? null,
       };
     }
   }
@@ -1992,7 +1992,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
     lastErr,
     cipherCode,
     cipherArgName,
-    pageData.loggedIn || false,
+    pageData.loggedIn ?? null,
   );
 }
 
@@ -2610,7 +2610,7 @@ async function pageScrapeWithCipher(
     playerUrl = playerUrl || pd.playerUrl;
     if (playerUrl && !sig) {
       try {
-        sig = await loadSignatureData(playerUrl, videoId);
+        sig = await loadSignatureData(playerUrl);
       } catch (e) {}
     }
   }
@@ -2772,11 +2772,11 @@ async function pageScrapeWithCipher(
     thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
     formats,
     clientUsed: "page_scrape",
-    loggedIn: loggedIn || false,
+    loggedIn: loggedIn ?? null,
   };
 }
 
-async function loadSignatureData(playerUrl, videoId = null) {
+async function loadSignatureData(playerUrl) {
   if (sigCache.has(playerUrl)) {
     const c = sigCache.get(playerUrl);
     if (Date.now() < c.expiresAt) return c;
@@ -2816,29 +2816,26 @@ async function loadSignatureData(playerUrl, videoId = null) {
     throw lastFetchErr || new Error("Player.js load failed");
   }
 
-  // Also try to fetch the YouTube watch-page HTML to find cipher helper
-  // (2025+ architecture: helper defined in inline <script> tags, not in base.js).
-  // The homepage (youtube.com/) does NOT contain these inline scripts —
-  // we need the actual watch page (youtube.com/watch?v=ID).
+  // Also try to fetch the YouTube page HTML to find cipher helper
+  // (2025+ architecture: helper defined in inline scripts, not in base.js)
   let pageHtml = null;
-  if (videoId) {
-    try {
-      const pageUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      const pageResp = await fetch(pageUrl, { cache: "force-cache" });
-      if (pageResp.ok) {
-        pageHtml = await pageResp.text();
-        console.log(
-          "[BG] Watch-page HTML loaded for cipher helper extraction:",
-          pageHtml.length,
-          "bytes",
-        );
-      }
-    } catch (e) {
-      console.warn(
-        "[BG] Could not fetch watch-page HTML for cipher helper:",
-        e.message,
+  try {
+    // Extract video ID from any cached tab data to build the page URL
+    const pageUrl = "https://www.youtube.com/";
+    const pageResp = await fetch(pageUrl, { cache: "force-cache" });
+    if (pageResp.ok) {
+      pageHtml = await pageResp.text();
+      console.log(
+        "[BG] Page HTML loaded for cipher helper extraction:",
+        pageHtml.length,
+        "bytes",
       );
     }
+  } catch (e) {
+    console.warn(
+      "[BG] Could not fetch page HTML for cipher helper:",
+      e.message,
+    );
   }
 
   const actionList = extractCipherActions(js, pageHtml);
@@ -4544,12 +4541,8 @@ const MIN_MEDIA_SIZE = 100 * 1024;
 
 function isYouTubeTab(tabId) {
   const data = tabData.get(tabId);
-  if (!data?.videoId) return false;
-  // Specialist/generic extractor tabs are NOT YouTube — don't block sniffer
-  if (injectedTabs.has(tabId)) return false;
-  const client = data.info?.clientUsed || '';
-  if (client && client !== 'inject.js' && client !== 'page_deciphered') return false;
-  return true;
+  if (data?.videoId) return true;
+  return false;
 }
 
 function getTabHost(tabId) {
@@ -5156,20 +5149,24 @@ async function injectSpecialist(tabId, scriptFile) {
  * The MAIN-world hook intercepts XHR/fetch for m3u8/mpd URLs.
  * The ISOLATED-world relay forwards detected URLs to background.js.
  */
-async function injectIframeHooks(tabId) {
+async function injectIframeHooks(tabId, frameId) {
+  const target =
+    frameId != null
+      ? { tabId, frameIds: [frameId] }
+      : { tabId, allFrames: true };
   try {
-    // 1. Inject the generic network hook into ALL frames (MAIN world)
+    // 1. Inject the generic network hook (MAIN world)
     await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target,
       files: ["hooks/generic-network-hook.js"],
       world: "MAIN",
-      injectImmediately: true,
+      injectImmediately: false,
     });
 
-    // 2. Inject a relay script into ALL frames (ISOLATED world)
+    // 2. Inject a relay script (ISOLATED world)
     //    Listens for postMessages from the MAIN-world hook and sends to background
     await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target,
       world: "ISOLATED",
       func: function iframeStreamRelay() {
         if (window.__iframeStreamRelayLoaded) return;
@@ -5212,7 +5209,11 @@ async function injectIframeHooks(tabId) {
       },
     });
 
-    console.log(`[BG] Iframe hooks injected into all frames of tab ${tabId}`);
+    console.log(
+      `[BG] Iframe hooks injected into ${
+        frameId != null ? `frame ${frameId} of` : "all frames of"
+      } tab ${tabId}`,
+    );
   } catch (e) {
     if (
       !e.message?.includes("Cannot access") &&
@@ -5223,12 +5224,12 @@ async function injectIframeHooks(tabId) {
   }
 }
 
-// Re-inject iframe hooks when new sub-frames start loading on specialist tabs
-// onCommitted fires earlier than onCompleted, so hooks are in place before JS runs
-chrome.webNavigation.onCommitted.addListener((details) => {
+// Re-inject iframe hooks when new sub-frames load on specialist tabs
+chrome.webNavigation.onCompleted.addListener((details) => {
   if (details.frameId === 0) return; // only sub-frames
   if (!injectedTabs.has(details.tabId)) return; // only specialist tabs
-  injectIframeHooks(details.tabId).catch(() => {});
+  // Inject only into the specific sub-frame that just navigated
+  injectIframeHooks(details.tabId, details.frameId).catch(() => {});
 });
 
 chrome.webNavigation.onCommitted.addListener(
