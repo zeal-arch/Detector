@@ -292,16 +292,6 @@ function renderVideo(info) {
     }
   }
 
-  for (const f of formats) {
-    if (f.isMuxed || (f.isVideo && f.codecs?.includes("mp4a"))) {
-      muxed.push(f);
-    } else if (f.isVideo) {
-      videoOnly.push(f);
-    } else if (f.isAudio) {
-      audioOnly.push(f);
-    }
-  }
-
   currentAudioFormats = audioOnly;
 
   muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
@@ -341,8 +331,11 @@ function renderVideo(info) {
       ? `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
       : "icons/icon48.png");
 
+  const uniqueMuxedCount = new Set(
+    muxed.map((f) => f.itag || `${f.mimeType}:${f.quality}`),
+  ).size;
   const isSimple =
-    videoOnly.length === 0 && audioOnly.length === 0 && muxed.length === 1;
+    videoOnly.length === 0 && audioOnly.length === 0 && uniqueMuxedCount === 1;
 
   if (isSimple) {
     const bestFmt = muxed[0];

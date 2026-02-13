@@ -109,7 +109,10 @@
               ct === "" ||
               isProxyDomain(hookUrl)
             ) {
-              var len = parseInt(xhr.getResponseHeader("content-length") || "0", 10);
+              var len = parseInt(
+                xhr.getResponseHeader("content-length") || "0",
+                10,
+              );
               if (!len || len <= 1048576) {
                 checkResponseForHLS(hookUrl, xhr.responseText);
               }
@@ -134,18 +137,25 @@
         .then(function (response) {
           try {
             var ct = (response.headers.get("content-type") || "").toLowerCase();
-            if (
+            var isTextLike =
               ct.includes("mpegurl") ||
               ct.includes("text") ||
-              ct.includes("json") ||
+              ct.includes("json");
+            var isBinaryLike =
               ct.includes("octet") ||
               ct.includes("binary") ||
               ct === "" ||
-              isProxyDomain(url)
-            ) {
+              isProxyDomain(url);
+            if (isTextLike || isBinaryLike) {
               // Skip large binary payloads (video segments) to avoid freezing the page
-              var len = parseInt(response.headers.get("content-length") || "0", 10);
+              var len = parseInt(
+                response.headers.get("content-length") || "0",
+                10,
+              );
               if (len && len > 1048576) return response;
+              // For binary/unknown content types without Content-Length (chunked),
+              // skip body inspection to avoid pulling large video segments into memory
+              if (isBinaryLike && !isTextLike && !len) return response;
               // Clone to avoid consuming the body
               response
                 .clone()

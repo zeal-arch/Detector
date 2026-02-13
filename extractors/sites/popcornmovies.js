@@ -65,12 +65,20 @@
     "player.videasy.net",
   ];
 
+  function safeDecodeURIComponent(str) {
+    try {
+      return decodeURIComponent(str);
+    } catch (e) {
+      return str;
+    }
+  }
+
   function isVideoUrl(url) {
     if (!url || typeof url !== "string") return false;
     // Standard extensions
     if (/\.(m3u8|mpd|mp4|webm|mkv)(\?|#|$)/i.test(url)) return true;
     // URL-encoded .m3u8 in proxy URLs (e.g., cGxheWxpc3QubTN1OA== is base64 for playlist.m3u8)
-    if (/\.m3u8/i.test(decodeURIComponent(url))) return true;
+    if (/\.m3u8/i.test(safeDecodeURIComponent(url))) return true;
     // Proxy URLs that contain encoded m3u8 paths
     if (/m3u8|mpegurl/i.test(url)) return true;
     // Known proxy domain patterns serving video
@@ -174,6 +182,10 @@
     ]);
   }
 
+  // Maximum response size (in bytes) to inspect — skip larger payloads
+  // to avoid stalling on video segments or large binary responses.
+  const MAX_RESPONSE_BYTES = 2 * 1024 * 1024; // 2 MB
+
   // ========== XHR Interception ==========
   const originalXHROpen = XMLHttpRequest.prototype.open;
   const originalXHRSend = XMLHttpRequest.prototype.send;
@@ -197,8 +209,18 @@
           });
         }
 
+        // Skip large responses to avoid memory issues (e.g., video segments)
+        const contentLength = parseInt(
+          this.getResponseHeader("content-length") || "0",
+          10,
+        );
+        if (contentLength > MAX_RESPONSE_BYTES) return;
+
         const response = this.responseText;
         if (!response || typeof response !== "string") return;
+
+        // Also guard by actual string length in case Content-Length was absent
+        if (response.length > MAX_RESPONSE_BYTES) return;
 
         // Search for m3u8/mpd/mp4 URLs in the response
         extractUrlsFromText(response);
@@ -234,6 +256,15 @@
           type: getVideoType(url),
           title: cleanTitle(),
         });
+      }
+
+      // Skip large responses to avoid OOM on video segments
+      const contentLength = parseInt(
+        response.headers.get("content-length") || "0",
+        10,
+      );
+      if (contentLength > MAX_RESPONSE_BYTES) {
+        return response;
       }
 
       // Clone and analyze the response body

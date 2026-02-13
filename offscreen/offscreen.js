@@ -316,11 +316,16 @@ function cleanupMEMFS() {
   if (!libavInstance) return;
   // Clean up all possible input/output filenames (both MP4 and WebM variants)
   for (const f of [
-    "input_video.mp4", "input_video.webm",
-    "input_audio.mp4", "input_audio.webm",
-    "output.mp4", "output.webm",
+    "input_video.mp4",
+    "input_video.webm",
+    "input_audio.mp4",
+    "input_audio.webm",
+    "output.mp4",
+    "output.webm",
   ]) {
-    try { libavInstance.unlink(f); } catch (e) {}
+    try {
+      libavInstance.unlink(f);
+    } catch (e) {}
   }
 }
 
@@ -448,6 +453,18 @@ async function handleMergeAndDownload(msg, sendResponse) {
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
+    // --- Auto-detect output container ---
+    // This only activates when BOTH inputs are WebM (VP9/Opus), so H.264/AAC
+    // never enters the WebM path.  With -c:v copy -c:a copy, no codec
+    // decoders/encoders are needed — only muxer/demuxer support matters.
+    const isWebMVideo =
+      /mime=video(%2F|\/)webm/i.test(videoUrl) ||
+      /webm/i.test((videoUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
+    const isWebMAudio =
+      /mime=audio(%2F|\/)webm/i.test(audioUrl) ||
+      /webm/i.test((audioUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
+    const useWebM = isWebMVideo && isWebMAudio;
+
     // Name input files with correct extensions so FFmpeg picks the right
     // demuxer (WebM data in a .mp4 file could confuse format probing).
     const videoInputFile = isWebMVideo ? "input_video.webm" : "input_video.mp4";
@@ -464,18 +481,6 @@ async function handleMergeAndDownload(msg, sendResponse) {
     videoData = null;
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
-
-    // --- Auto-detect output container ---
-    // This only activates when BOTH inputs are WebM (VP9/Opus), so H.264/AAC
-    // never enters the WebM path.  With -c:v copy -c:a copy, no codec
-    // decoders/encoders are needed — only muxer/demuxer support matters.
-    const isWebMVideo =
-      /mime=video(%2F|\/)webm/i.test(videoUrl) ||
-      /webm/i.test((videoUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
-    const isWebMAudio =
-      /mime=audio(%2F|\/)webm/i.test(audioUrl) ||
-      /webm/i.test((audioUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
-    const useWebM = isWebMVideo && isWebMAudio;
     const outputExt = useWebM ? "webm" : "mp4";
     const outputFile = `output.${outputExt}`;
     const mimeType = useWebM ? "video/webm" : "video/mp4";
