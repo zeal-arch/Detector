@@ -308,15 +308,14 @@ async function cleanupMergeOPFS() {
 
 function cleanupMEMFS() {
   if (!libavInstance) return;
-  try {
-    libavInstance.unlink("input_video.mp4");
-  } catch (e) {}
-  try {
-    libavInstance.unlink("input_audio.mp4");
-  } catch (e) {}
-  try {
-    libavInstance.unlink("output.mp4");
-  } catch (e) {}
+  // Clean up all possible input/output filenames (both MP4 and WebM variants)
+  for (const f of [
+    "input_video.mp4", "input_video.webm",
+    "input_audio.mp4", "input_audio.webm",
+    "output.mp4", "output.webm",
+  ]) {
+    try { libavInstance.unlink(f); } catch (e) {}
+  }
 }
 
 function handleCancelMerge(sendResponse) {
@@ -424,21 +423,27 @@ async function handleMergeAndDownload(msg, sendResponse) {
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
+    // Name input files with correct extensions so FFmpeg picks the right
+    // demuxer (WebM data in a .mp4 file could confuse format probing).
+    const videoInputFile = isWebMVideo ? "input_video.webm" : "input_video.mp4";
+    const audioInputFile = isWebMAudio ? "input_audio.webm" : "input_audio.mp4";
+
     // Write audio to MEMFS first (small) then free it
     const audioSize = audioData.byteLength;
-    libav.writeFile("input_audio.mp4", audioData, { canOwn: true });
+    libav.writeFile(audioInputFile, audioData, { canOwn: true });
     audioData = null;
 
     // Write video to MEMFS and free it
     const videoSize = videoData.byteLength;
-    libav.writeFile("input_video.mp4", videoData, { canOwn: true });
+    libav.writeFile(videoInputFile, videoData, { canOwn: true });
     videoData = null;
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
     // --- Auto-detect output container ---
-    // VP9/VP8 + Opus/Vorbis → WebM (natural container, better compatibility)
-    // H.264/AV1 + AAC/MP3  → MP4  (universal playback)
+    // This only activates when BOTH inputs are WebM (VP9/Opus), so H.264/AAC
+    // never enters the WebM path.  With -c:v copy -c:a copy, no codec
+    // decoders/encoders are needed — only muxer/demuxer support matters.
     const isWebMVideo =
       /mime=video(%2F|\/)webm/i.test(videoUrl) ||
       /webm/i.test((videoUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
@@ -463,9 +468,9 @@ async function handleMergeAndDownload(msg, sendResponse) {
     const ffmpegArgs = [
       "-y",
       "-i",
-      "input_video.mp4",
+      videoInputFile,
       "-i",
-      "input_audio.mp4",
+      audioInputFile,
       "-c:v",
       "copy",
       "-c:a",
@@ -488,10 +493,10 @@ async function handleMergeAndDownload(msg, sendResponse) {
 
     // Free input files from MEMFS BEFORE reading output — reduces peak memory
     try {
-      libav.unlink("input_video.mp4");
+      libav.unlink(videoInputFile);
     } catch (e) {}
     try {
-      libav.unlink("input_audio.mp4");
+      libav.unlink(audioInputFile);
     } catch (e) {}
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");

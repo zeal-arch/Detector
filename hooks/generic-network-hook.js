@@ -97,7 +97,9 @@
             var ct = (
               xhr.getResponseHeader("content-type") || ""
             ).toLowerCase();
-            // Check response body for HLS content if content-type suggests text
+            // Check response body for HLS content if content-type suggests text.
+            // Guard with Content-Length to avoid pulling multi-MB binary payloads
+            // (e.g. video segments from proxy domains) into memory as text.
             if (
               ct.includes("mpegurl") ||
               ct.includes("text") ||
@@ -107,7 +109,10 @@
               ct === "" ||
               isProxyDomain(hookUrl)
             ) {
-              checkResponseForHLS(hookUrl, xhr.responseText);
+              var len = parseInt(xhr.getResponseHeader("content-length") || "0", 10);
+              if (!len || len <= 1048576) {
+                checkResponseForHLS(hookUrl, xhr.responseText);
+              }
             }
           }
         } catch (e) {}
@@ -138,6 +143,9 @@
               ct === "" ||
               isProxyDomain(url)
             ) {
+              // Skip large binary payloads (video segments) to avoid freezing the page
+              var len = parseInt(response.headers.get("content-length") || "0", 10);
+              if (len && len > 1048576) return response;
               // Clone to avoid consuming the body
               response
                 .clone()
