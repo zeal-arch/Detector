@@ -1627,7 +1627,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         const playerUrl = pageData.playerUrl || null;
         if (playerUrl) {
           try {
-            sig = await loadSignatureData(playerUrl);
+            sig = await loadSignatureData(playerUrl, videoId);
             nSigCode = nSigCode || sig?.nSigCode || null;
             nSigBundled = nSigBundled || sig?.nSigBundled || null;
             console.log(
@@ -1722,7 +1722,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let sig = null;
   if (playerUrl) {
     try {
-      sig = await loadSignatureData(playerUrl);
+      sig = await loadSignatureData(playerUrl, videoId);
       console.log(
         "[BG] Signature data loaded from background fetch —",
         "cipher:",
@@ -2610,7 +2610,7 @@ async function pageScrapeWithCipher(
     playerUrl = playerUrl || pd.playerUrl;
     if (playerUrl && !sig) {
       try {
-        sig = await loadSignatureData(playerUrl);
+        sig = await loadSignatureData(playerUrl, videoId);
       } catch (e) {}
     }
   }
@@ -2776,7 +2776,7 @@ async function pageScrapeWithCipher(
   };
 }
 
-async function loadSignatureData(playerUrl) {
+async function loadSignatureData(playerUrl, videoId = null) {
   if (sigCache.has(playerUrl)) {
     const c = sigCache.get(playerUrl);
     if (Date.now() < c.expiresAt) return c;
@@ -2816,26 +2816,29 @@ async function loadSignatureData(playerUrl) {
     throw lastFetchErr || new Error("Player.js load failed");
   }
 
-  // Also try to fetch the YouTube page HTML to find cipher helper
-  // (2025+ architecture: helper defined in inline scripts, not in base.js)
+  // Also try to fetch the YouTube watch-page HTML to find cipher helper
+  // (2025+ architecture: helper defined in inline <script> tags, not in base.js).
+  // The homepage (youtube.com/) does NOT contain these inline scripts —
+  // we need the actual watch page (youtube.com/watch?v=ID).
   let pageHtml = null;
-  try {
-    // Extract video ID from any cached tab data to build the page URL
-    const pageUrl = "https://www.youtube.com/";
-    const pageResp = await fetch(pageUrl, { cache: "force-cache" });
-    if (pageResp.ok) {
-      pageHtml = await pageResp.text();
-      console.log(
-        "[BG] Page HTML loaded for cipher helper extraction:",
-        pageHtml.length,
-        "bytes",
+  if (videoId) {
+    try {
+      const pageUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      const pageResp = await fetch(pageUrl, { cache: "force-cache" });
+      if (pageResp.ok) {
+        pageHtml = await pageResp.text();
+        console.log(
+          "[BG] Watch-page HTML loaded for cipher helper extraction:",
+          pageHtml.length,
+          "bytes",
+        );
+      }
+    } catch (e) {
+      console.warn(
+        "[BG] Could not fetch watch-page HTML for cipher helper:",
+        e.message,
       );
     }
-  } catch (e) {
-    console.warn(
-      "[BG] Could not fetch page HTML for cipher helper:",
-      e.message,
-    );
   }
 
   const actionList = extractCipherActions(js, pageHtml);
@@ -4541,8 +4544,12 @@ const MIN_MEDIA_SIZE = 100 * 1024;
 
 function isYouTubeTab(tabId) {
   const data = tabData.get(tabId);
-  if (data?.videoId) return true;
-  return false;
+  if (!data?.videoId) return false;
+  // Specialist/generic extractor tabs are NOT YouTube — don't block sniffer
+  if (injectedTabs.has(tabId)) return false;
+  const client = data.info?.clientUsed || '';
+  if (client && client !== 'inject.js' && client !== 'page_deciphered') return false;
+  return true;
 }
 
 function getTabHost(tabId) {
@@ -5156,7 +5163,7 @@ async function injectIframeHooks(tabId) {
       target: { tabId, allFrames: true },
       files: ["hooks/generic-network-hook.js"],
       world: "MAIN",
-      injectImmediately: false,
+      injectImmediately: true,
     });
 
     // 2. Inject a relay script into ALL frames (ISOLATED world)
@@ -5216,8 +5223,9 @@ async function injectIframeHooks(tabId) {
   }
 }
 
-// Re-inject iframe hooks when new sub-frames load on specialist tabs
-chrome.webNavigation.onCompleted.addListener((details) => {
+// Re-inject iframe hooks when new sub-frames start loading on specialist tabs
+// onCommitted fires earlier than onCompleted, so hooks are in place before JS runs
+chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) return; // only sub-frames
   if (!injectedTabs.has(details.tabId)) return; // only specialist tabs
   injectIframeHooks(details.tabId).catch(() => {});

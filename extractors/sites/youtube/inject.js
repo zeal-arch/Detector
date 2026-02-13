@@ -679,7 +679,7 @@
     // Names to skip when looking for cipher helper
     var skipNames = {};
     for (var i = 0; i < paramNames.length; i++) skipNames[paramNames[i]] = true;
-    for (var i = 0; i < localVars.length; i++) skipNames[localVars[i]] = true;
+    for (var j = 0; j < localVars.length; j++) skipNames[localVars[j]] = true;
     // Also skip built-in objects
     skipNames["String"] = true;
     skipNames["Array"] = true;
