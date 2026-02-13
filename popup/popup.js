@@ -70,6 +70,15 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+/**
+ * Produce a human-friendly label for a client identifier used to obtain a stream.
+ *
+ * Converts known identifiers (e.g., "web", "android", "page_deciphered") to readable labels.
+ * If the input contains "+" and is not an exact known key, each plus-separated token is labeled (known tokens mapped, "cipher" -> "Cipher", unknown tokens uppercased) and joined with " + ".
+ *
+ * @param {string} clientUsed - Client identifier string or a plus-separated composite (e.g., "web", "page_deciphered", "web+cipher").
+ * @returns {string} A human-readable label for the provided client identifier; returns an empty string for falsy input.
+ */
 function formatSourceLabel(clientUsed) {
   if (!clientUsed) return "";
   const labels = {
@@ -81,6 +90,7 @@ function formatSourceLabel(clientUsed) {
     web: "Web API",
     "web+cipher": "Web API (Cipher)",
     page_scrape: "Page Scrape",
+    sniffed: "Network Sniffed",
   };
 
   if (clientUsed.includes("+") && !labels[clientUsed]) {
@@ -212,6 +222,26 @@ function renderError(title, message) {
   document.getElementById("retryBtn")?.addEventListener("click", init);
 }
 
+/**
+ * Render the video information card and associated download UI for a detected video.
+ *
+ * Updates internal state with the provided video info, builds and inserts the appropriate
+ * UI (compact single-format card or multi-format selector), displays DRM and login hints,
+ * and wires download/merge controls and thumbnail fallbacks.
+ *
+ * @param {Object} info - Video metadata and available formats.
+ * @param {string} [info.title] - Video title.
+ * @param {string} [info.videoId] - Video identifier (used to derive a thumbnail if none provided).
+ * @param {string} [info.author] - Video author/channel name.
+ * @param {number} [info.lengthSeconds] - Video duration in seconds.
+ * @param {string} [info.thumbnail] - URL of the video thumbnail.
+ * @param {Array<Object>} [info.formats] - Array of available format objects (muxed, video-only, audio-only) with properties like itag, url, mimeType, codecs, height, bitrate, contentLength, isHLS, isDASH, isMuxed, isVideo, isAudio, fps, audioBitrate.
+ * @param {boolean} [info.drmDetected] - True if DRM was detected for this video.
+ * @param {string} [info.drmType] - DRM type label (when drmDetected is true).
+ * @param {number|string} [info.drmConfidence] - Confidence level for DRM detection.
+ * @param {boolean} [info.loggedIn] - False if the user is detected as not signed into the source (used to show a sign-in hint).
+ * @param {string} [info.clientUsed] - Identifier of the source client used to obtain info (used to render a source label).
+ */
 function renderVideo(info) {
   currentVideoInfo = info; // Store current video info for DRM checks
   const {
@@ -237,6 +267,16 @@ function renderVideo(info) {
       <span class="drm-text">DRM Protected${drmType ? ` (${drmType})` : ""}${drmConfidence ? ` - ${drmConfidence} confidence` : ""}</span>
     </div>`
     : "";
+
+  // Login hint for YouTube
+  const loginHint =
+    info.loggedIn === false
+      ? `
+    <div class="login-hint">
+      <span class="login-hint-icon">ℹ️</span>
+      <span class="login-hint-text">Sign in to YouTube for all video qualities</span>
+    </div>`
+      : "";
 
   const muxed = [];
   const videoOnly = [];
@@ -302,7 +342,7 @@ function renderVideo(info) {
       : "icons/icon48.png");
 
   const isSimple =
-    videoOnly.length === 0 && audioOnly.length === 0 && muxed.length > 0;
+    videoOnly.length === 0 && audioOnly.length === 0 && muxed.length === 1;
 
   if (isSimple) {
     const bestFmt = muxed[0];
@@ -325,6 +365,7 @@ function renderVideo(info) {
             ${info.clientUsed ? `<span class="video-meta-tag">· ${escapeHtml(formatSourceLabel(info.clientUsed))}</span>` : ""}
           </div>
           ${drmWarning}
+          ${loginHint}
         </div>
       </div>
       <div class="video-controls">
@@ -351,7 +392,21 @@ function renderVideo(info) {
         q,
         container.toLowerCase(),
       );
-      downloadFormat(fmt.url, filename);
+
+      const isHLS =
+        fmt.isHLS ||
+        (fmt.mimeType || "").includes("mpegurl") ||
+        fmt.url.includes(".m3u8");
+      const isDASH =
+        fmt.isDASH ||
+        (fmt.mimeType || "").includes("dash") ||
+        fmt.url.includes(".mpd");
+
+      if (isHLS || isDASH) {
+        workerDownload(fmt.url, isHLS ? "hls" : "dash", filename);
+      } else {
+        downloadFormat(fmt.url, filename);
+      }
       const btn = document.getElementById("dlBtn");
       if (btn) {
         btn.innerHTML = "Starting...";
@@ -429,6 +484,7 @@ function renderVideo(info) {
             ${info.clientUsed ? `<span class="video-meta-tag">· ${escapeHtml(formatSourceLabel(info.clientUsed))}</span>` : ""}
           </div>
           ${drmWarning}
+          ${loginHint}
         </div>
       </div>
       <div class="video-controls">
@@ -534,9 +590,16 @@ function renderStreamItem(stream) {
     </div>`;
 }
 
+/**
+ * Handle the Download button click: validate selection and initiate the appropriate download flow.
+ *
+ * Reads the selected quality/option from the quality selector, prevents downloads for DRM-protected content,
+ * and either starts a merge download for separate video+audio tracks or starts a worker/direct download for a single format.
+ * Updates the download button state briefly while the download is being started.
+ */
 function handleDownloadClick() {
   // Check for DRM protection
-  const currentInfo = getCurrentVideoInfo();
+  const currentInfo = currentVideoInfo;
   if (currentInfo && currentInfo.drmDetected) {
     alert("This video is DRM protected and cannot be downloaded.");
     return;
@@ -611,6 +674,14 @@ async function downloadFormat(url, filename) {
   }
 }
 
+/**
+ * Starts a background worker download for the given URL and begins polling for download progress on success.
+ *
+ * Sends the download request (including optional video title and thumbnail metadata) to the extension background so the worker can perform HLS/DASH downloads and keeps the UI updated by starting the download poll when accepted.
+ * @param {string} url - The resource URL to download.
+ * @param {string} type - The download type, e.g. "hls", "dash", or "direct".
+ * @param {string} filename - The desired filename for the downloaded file.
+ */
 async function workerDownload(url, type, filename) {
   try {
     const resp = await chrome.runtime.sendMessage({
@@ -618,6 +689,9 @@ async function workerDownload(url, type, filename) {
       url,
       type,
       filename,
+      // Include video metadata for persistent display
+      videoTitle: currentVideoTitle || null,
+      videoThumbnail: currentVideoInfo?.thumbnail || null,
     });
     if (resp?.success) {
       startDownloadPoll();
@@ -629,6 +703,19 @@ async function workerDownload(url, type, filename) {
   }
 }
 
+/**
+ * Starts merging a video and audio stream into a single file and updates the UI to reflect merge progress.
+ *
+ * Initiates a background merge request for the provided video and audio URLs, disables relevant UI controls,
+ * shows progress, and handles success, failure, and cancellation states. On completion (success or failure)
+ * the UI is reset and the internal merge-in-progress flag is cleared.
+ *
+ * @param {string} videoUrl - URL of the video-only stream to merge.
+ * @param {string} audioUrl - URL of the audio-only stream to merge.
+ * @param {string} filename - Desired output filename for the merged file.
+ * @param {string|number} videoItag - Format itag or identifier for the video stream.
+ * @param {string|number} audioItag - Format itag or identifier for the audio stream.
+ */
 async function mergeDownload(
   videoUrl,
   audioUrl,
@@ -668,6 +755,9 @@ async function mergeDownload(
       videoItag,
       audioItag,
       videoId: currentVideoId,
+      // Include video metadata for persistent display
+      videoTitle: currentVideoTitle || null,
+      videoThumbnail: currentVideoInfo?.thumbnail || null,
     });
 
     if (response?.success) {
@@ -808,6 +898,15 @@ function showBanner(type, html) {
   }
 }
 
+/**
+ * Periodically polls session storage for an active merge and updates the UI with merge progress.
+ *
+ * Starts a repeating poll that reads "activeMerge" from chrome.storage.session and, while the merge
+ * is active, updates either the inline progress UI (element with id "progressWrap") or the global
+ * merge banner (element with id "activeBanner") with the current percent and message. If no active
+ * merge is found the poll is stopped and cleared. Calling this while a poll is already running has
+ * no effect.
+ */
 function startMergePoll() {
   if (mergePollTimer) return;
   mergePollTimer = setInterval(async () => {
@@ -821,13 +920,37 @@ function startMergePoll() {
         return;
       }
 
-      const pct = merge.percent || 0;
+      const pct = Math.round(merge.percent || 0);
       const msg = merge.message || merge.phase || "Merging...";
-      showProgress(pct, `${msg} · ${pct}%`);
+
+      // Check if we have video card elements (progressWrap exists)
+      const hasProgressUI = document.getElementById("progressWrap");
+      if (hasProgressUI) {
+        showProgress(pct, `${msg} · ${pct}%`);
+      } else {
+        // Update the merge banner
+        const banner = document.getElementById("activeBanner");
+        if (banner) {
+          const msgEl = banner.querySelector(".banner-msg");
+          const pctEl = banner.querySelector(".banner-pct");
+          const barEl = banner.querySelector(".banner-bar-fill");
+          if (msgEl) msgEl.textContent = msg;
+          if (pctEl) pctEl.textContent = `${pct}%`;
+          if (barEl) barEl.style.width = `${pct}%`;
+        }
+      }
     } catch {}
   }, 1200);
 }
 
+/**
+ * Begin a periodic check of session storage for active downloads and render/update download banners in the UI.
+ *
+ * If a poll is already active this is a no-op. While running, the function:
+ * - Creates or updates per-download banners showing progress, percentage, and an optional thumbnail and title.
+ * - Converts completed or errored downloads into final banners and removes them after a short delay.
+ * - Stops polling and clears banners when there are no active downloads.
+ */
 function startDownloadPoll() {
   if (downloadPollTimer) return;
   downloadPollTimer = setInterval(async () => {
@@ -845,12 +968,23 @@ function startDownloadPoll() {
       let hasActive = false;
       for (const [dlId, dl] of Object.entries(downloads)) {
         const existing = document.getElementById(`dl-banner-${dlId}`);
+        const hasMetadata = dl.videoTitle || dl.videoThumbnail;
 
         if (dl.phase === "complete" || dl.phase === "error") {
           if (existing) {
             existing.className = `banner ${dl.phase === "complete" ? "complete" : "error"}`;
             const icon = dl.phase === "complete" ? "✓" : "✗";
-            existing.innerHTML = `<div class="banner-row">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div>`;
+            if (hasMetadata) {
+              const thumbHtml = dl.videoThumbnail
+                ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
+                : "";
+              const titleHtml = dl.videoTitle
+                ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
+                : "";
+              existing.innerHTML = `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div></div></div>`;
+            } else {
+              existing.innerHTML = `<div class="banner-row">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div>`;
+            }
             setTimeout(() => existing.remove(), 5000);
           }
         } else {
@@ -868,15 +1002,38 @@ function startDownloadPoll() {
             const banner = document.createElement("div");
             banner.className = "banner active";
             banner.id = `dl-banner-${dlId}`;
-            banner.innerHTML = `
-              <div class="banner-row">
-                <span class="banner-spinner"></span>
-                <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
-                <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
-              </div>
-              <div class="banner-bar-bg">
-                <div class="banner-bar-fill" style="width: ${pct}%"></div>
+            if (hasMetadata) {
+              const thumbHtml = dl.videoThumbnail
+                ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
+                : "";
+              const titleHtml = dl.videoTitle
+                ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
+                : "";
+              banner.innerHTML = `<div class="banner-video-row">
+                ${thumbHtml}
+                <div class="banner-video-info">
+                  ${titleHtml}
+                  <div class="banner-row" style="margin-top:4px">
+                    <span class="banner-spinner"></span>
+                    <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
+                    <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                  </div>
+                  <div class="banner-bar-bg">
+                    <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                  </div>
+                </div>
               </div>`;
+            } else {
+              banner.innerHTML = `
+                <div class="banner-row">
+                  <span class="banner-spinner"></span>
+                  <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
+                  <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                </div>
+                <div class="banner-bar-bg">
+                  <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                </div>`;
+            }
             if (content.firstChild)
               content.insertBefore(banner, content.firstChild);
             else content.appendChild(banner);
@@ -892,6 +1049,16 @@ function startDownloadPoll() {
   }, 1500);
 }
 
+/**
+ * Render banners for current active downloads stored in session storage.
+ *
+ * Retrieves `activeDownloads` from `chrome.storage.session` and creates a banner
+ * for each entry under the page `content` element. Each banner reflects the
+ * download's phase: "complete" (success), "error" (failure), or active
+ * (in-progress). When available, video metadata (`videoTitle`, `videoThumbnail`)
+ * is shown; active banners display percentage progress and a progress bar and
+ * will trigger the download poll to keep UI in sync.
+ */
 async function showActiveDownloads() {
   try {
     const result = await chrome.storage.session.get("activeDownloads");
@@ -902,24 +1069,51 @@ async function showActiveDownloads() {
       const banner = document.createElement("div");
       banner.id = `dl-banner-${dlId}`;
 
+      // Build video info section if metadata is available
+      const hasMetadata = dl.videoTitle || dl.videoThumbnail;
+      const thumbHtml = dl.videoThumbnail
+        ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
+        : "";
+      const titleHtml = dl.videoTitle
+        ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
+        : "";
+
       if (dl.phase === "complete") {
         banner.className = "banner complete";
-        banner.innerHTML = `<div class="banner-row">✓ ${escapeHtml(dl.filename || "Download complete")}</div>`;
+        banner.innerHTML = hasMetadata
+          ? `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✓ ${escapeHtml(dl.filename || "Download complete")}</div></div></div>`
+          : `<div class="banner-row">✓ ${escapeHtml(dl.filename || "Download complete")}</div>`;
       } else if (dl.phase === "error") {
         banner.className = "banner error";
-        banner.innerHTML = `<div class="banner-row">✗ ${escapeHtml(dl.message || "Download failed")}</div>`;
+        banner.innerHTML = hasMetadata
+          ? `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✗ ${escapeHtml(dl.message || "Download failed")}</div></div></div>`
+          : `<div class="banner-row">✗ ${escapeHtml(dl.message || "Download failed")}</div>`;
       } else {
         banner.className = "banner active";
         const pct = Math.round(dl.percent || 0);
-        banner.innerHTML = `
-          <div class="banner-row">
-            <span class="banner-spinner"></span>
-            <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
-            <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
-          </div>
-          <div class="banner-bar-bg">
-            <div class="banner-bar-fill" style="width: ${pct}%"></div>
-          </div>`;
+        banner.innerHTML = hasMetadata
+          ? `<div class="banner-video-row">
+              ${thumbHtml}
+              <div class="banner-video-info">
+                ${titleHtml}
+                <div class="banner-row" style="margin-top:4px">
+                  <span class="banner-spinner"></span>
+                  <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
+                  <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                </div>
+                <div class="banner-bar-bg">
+                  <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                </div>
+              </div>
+            </div>`
+          : `<div class="banner-row">
+              <span class="banner-spinner"></span>
+              <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
+              <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+            </div>
+            <div class="banner-bar-bg">
+              <div class="banner-bar-fill" style="width: ${pct}%"></div>
+            </div>`;
         startDownloadPoll();
       }
 
@@ -929,6 +1123,14 @@ async function showActiveDownloads() {
   } catch {}
 }
 
+/**
+ * Initialize the popup UI, detect video content on the active tab, and render the appropriate view.
+ *
+ * Queries the active browser tab, requests video information and any sniffed streams from the background
+ * script, and then renders one of: a detailed video card, sniffed streams list, a waiting-for-content view,
+ * or an error state. Restores and displays any active merge state (inline or as a banner), starts merge/download
+ * polling when appropriate, and populates active download banners. On failure, logs the error and renders an error view.
+ */
 async function init() {
   if (currentView === "settings") return;
   renderLoading();
@@ -1007,36 +1209,104 @@ async function init() {
     }
 
     if (activeMerge && activeMerge.status === "active") {
-      showProgress(
-        activeMerge.percent || 0,
-        activeMerge.message || "Merging...",
-      );
-      const btn = document.getElementById("dlBtn");
-      const select = document.getElementById("qualitySelect");
-      if (btn) {
-        btn.className = "dl-btn dl-btn-stop";
-        btn.innerHTML = `${ICONS.stop} Stop`;
-        btn.disabled = false;
-        btn.onclick = async () => {
-          btn.disabled = true;
-          btn.innerHTML = "Cancelling...";
-          try {
-            await chrome.runtime.sendMessage({ action: "CANCEL_MERGE" });
-          } catch {}
-        };
+      // Check if we have video card elements (progressWrap exists)
+      const hasProgressUI = document.getElementById("progressWrap");
+      if (hasProgressUI) {
+        // We're on the video page - use inline progress
+        showProgress(
+          activeMerge.percent || 0,
+          activeMerge.message || "Merging...",
+        );
+        const btn = document.getElementById("dlBtn");
+        const select = document.getElementById("qualitySelect");
+        if (btn) {
+          btn.className = "dl-btn dl-btn-stop";
+          btn.innerHTML = `${ICONS.stop} Stop`;
+          btn.disabled = false;
+          btn.onclick = async () => {
+            btn.disabled = true;
+            btn.innerHTML = "Cancelling...";
+            try {
+              await chrome.runtime.sendMessage({ action: "CANCEL_MERGE" });
+            } catch {}
+          };
+        }
+        if (select) select.disabled = true;
+      } else {
+        // We're on a different tab - show merge as a banner with video card
+        const pct = Math.round(activeMerge.percent || 0);
+        const hasMetadata =
+          activeMerge.videoTitle || activeMerge.videoThumbnail;
+        const thumbHtml = activeMerge.videoThumbnail
+          ? `<img src="${escapeHtml(activeMerge.videoThumbnail)}" class="banner-thumb" alt="" />`
+          : "";
+        const titleHtml = activeMerge.videoTitle
+          ? `<div class="banner-title">${escapeHtml(activeMerge.videoTitle)}</div>`
+          : "";
+        const bannerHtml = hasMetadata
+          ? `<div class="banner-video-row">
+              ${thumbHtml}
+              <div class="banner-video-info">
+                ${titleHtml}
+                <div class="banner-row" style="margin-top:4px">
+                  <span class="banner-spinner"></span>
+                  <span class="banner-msg">${escapeHtml(activeMerge.message || "Merging...")}</span>
+                  <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                </div>
+                <div class="banner-bar-bg">
+                  <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                </div>
+              </div>
+            </div>`
+          : `<div class="banner-row">
+              <span class="banner-spinner"></span>
+              <span class="banner-msg">${escapeHtml(activeMerge.message || "Merging...")}</span>
+              <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+            </div>
+            <div class="banner-bar-bg">
+              <div class="banner-bar-fill" style="width: ${pct}%"></div>
+            </div>`;
+        showBanner("active", bannerHtml);
       }
-      if (select) select.disabled = true;
       startMergePoll();
     } else if (activeMerge?.status === "complete") {
-      showBanner(
-        "complete",
-        `<div class="banner-row">✓ Merge complete: ${escapeHtml(activeMerge.filename || "")}</div>`,
-      );
+      const hasMetadata = activeMerge.videoTitle || activeMerge.videoThumbnail;
+      if (hasMetadata) {
+        const thumbHtml = activeMerge.videoThumbnail
+          ? `<img src="${escapeHtml(activeMerge.videoThumbnail)}" class="banner-thumb" alt="" />`
+          : "";
+        const titleHtml = activeMerge.videoTitle
+          ? `<div class="banner-title">${escapeHtml(activeMerge.videoTitle)}</div>`
+          : "";
+        showBanner(
+          "complete",
+          `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✓ ${escapeHtml(activeMerge.filename || "Download complete")}</div></div></div>`,
+        );
+      } else {
+        showBanner(
+          "complete",
+          `<div class="banner-row">✓ Merge complete: ${escapeHtml(activeMerge.filename || "")}</div>`,
+        );
+      }
     } else if (activeMerge?.status === "failed") {
-      showBanner(
-        "error",
-        `<div class="banner-row">✗ ${escapeHtml(activeMerge.error || "Merge failed")}</div>`,
-      );
+      const hasMetadata = activeMerge.videoTitle || activeMerge.videoThumbnail;
+      if (hasMetadata) {
+        const thumbHtml = activeMerge.videoThumbnail
+          ? `<img src="${escapeHtml(activeMerge.videoThumbnail)}" class="banner-thumb" alt="" />`
+          : "";
+        const titleHtml = activeMerge.videoTitle
+          ? `<div class="banner-title">${escapeHtml(activeMerge.videoTitle)}</div>`
+          : "";
+        showBanner(
+          "error",
+          `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✗ ${escapeHtml(activeMerge.error || "Merge failed")}</div></div></div>`,
+        );
+      } else {
+        showBanner(
+          "error",
+          `<div class="banner-row">✗ ${escapeHtml(activeMerge.error || "Merge failed")}</div>`,
+        );
+      }
     }
 
     await showActiveDownloads();

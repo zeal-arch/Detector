@@ -1117,6 +1117,15 @@ const SITE_DOMAIN_MAP = {
     notes: "Popcornflix — free movie streaming",
   },
 
+  "popcornmovies.js": {
+    domains: ["*.popcornmovies.org", "popcornmovies.org"],
+    protocol: "MAGIC_M3U8",
+    pattern: "IIFE",
+    verified: false,
+    notes:
+      "PopcornMovies — free movie/TV streaming. XHR/fetch interception + DOM scanning for HLS/MP4",
+  },
+
   "raiplay.js": {
     domains: ["*.raiplay.it", "*.rai.it"],
     protocol: "LALHLIMPUII_JAHAU",

@@ -7,13 +7,24 @@
 
   console.log(
     TAG,
-    "Running in code-extraction mode (no client-side eval due to CSP)",
+    "Running in hybrid mode (direct global access + code extraction fallback)",
   );
 
+  /**
+   * Escape special characters in a string for use in a regular expression.
+   * @param {string} s - The input string to escape.
+   * @returns {string} The input with regex metacharacters escaped so it can be safely used in a RegExp.
+   */
   function escRe(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
+  /**
+   * Extracts a balanced `{ ... }` block starting at the given position, respecting string literals and escape sequences.
+   * @param {string} code - Source code to scan.
+   * @param {number} pos - Index of an opening `{` in `code`.
+   * @returns {string|null} The substring containing the balanced `{ ... }` block including braces, or `null` if `pos` is not an opening brace or a matching closing brace is not found within 500000 characters.
+   */
   function extractBraceBlock(code, pos) {
     if (code[pos] !== "{") return null;
     var depth = 0,
@@ -48,6 +59,392 @@
     return null;
   }
 
+  /**
+   * Extracts a balanced bracket-delimited block (array or similar) starting at the given position.
+   *
+   * The extraction correctly handles nested brackets, string literals (single, double, template),
+   * and escaped characters so that brackets inside strings are ignored.
+   * @param {string} code - The source text to scan.
+   * @param {number} pos - Index of the opening `[` in `code`.
+   * @returns {string|null} The substring from `pos` through the matching closing `]`, or `null` if no balanced block is found.
+   */
+  function extractBracketBlock(code, pos) {
+    if (code[pos] !== "[") return null;
+    var depth = 0,
+      inStr = false,
+      strCh = "",
+      esc = false;
+    for (var i = pos; i < code.length && i < pos + 500000; i++) {
+      var c = code[i];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (c === "\\") {
+        esc = true;
+        continue;
+      }
+      if (inStr) {
+        if (c === strCh) inStr = false;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        inStr = true;
+        strCh = c;
+        continue;
+      }
+      if (c === "[") depth++;
+      if (c === "]") {
+        depth--;
+        if (depth === 0) return code.substring(pos, i + 1);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Detects external dependency identifiers and the large lookup array used by player.js
+   * for cipher dispatch and N-signature handling.
+   *
+   * @param {string} js - The player.js source code to analyze.
+   * @returns {{
+   *   cipherHelper: (string|null),
+   *   cipherOps: Array<{methodName: string, arg: number}>,
+   *   cipherDispatchValue: (number|null),
+   *   nSigWrapper: (string|null),
+   *   lookupArray: (string[]|null),
+   *   lookupName: (string|null)
+   * }} An object describing discovered external dependencies:
+   * - `cipherHelper`: name of the global helper object referenced by the dispatch cipher, or `null`.
+   * - `cipherOps`: ordered list of cipher operations inferred from the dispatch function; each entry has `methodName` (lookup value) and `arg` (numeric argument).
+   * - `cipherDispatchValue`: numeric dispatch value passed to the cipher dispatch call, or `null`.
+   * - `nSigWrapper`: name of the global wrapper (array/object) that contains the N-signature transform, or `null`.
+   * - `lookupArray`: the extracted lookup array (split string) with 50+ entries when found, or `null`.
+   * - `lookupName`: variable name of the lookup array in the code, or `null`.
+   */
+  function findExternalDeps(js) {
+    var result = {
+      cipherHelper: null,
+      cipherOps: [],
+      cipherDispatchValue: null,
+      nSigWrapper: null,
+      lookupArray: null,
+      lookupName: null,
+    };
+
+    // Find the lookup array: var NAME = "...".split("DELIM") with 50+ elements
+    var lookupRe =
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+    var lm;
+    while ((lm = lookupRe.exec(js)) !== null) {
+      var parts = lm[2].split(lm[3]);
+      if (parts.length > 50) {
+        result.lookupName = lm[1];
+        result.lookupArray = parts;
+        break;
+      }
+    }
+    if (!result.lookupArray) return result;
+
+    // Find dispatch cipher call: funcName(N, decodeURIComponent(p.s))
+    var dispatchCall = js.match(
+      /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
+    );
+    if (dispatchCall) {
+      var cipherFuncName = dispatchCall[1];
+      result.cipherDispatchValue = parseInt(dispatchCall[2]);
+
+      var funcDefIdx = js.indexOf(cipherFuncName + "=function(");
+      if (funcDefIdx !== -1) {
+        var braceIdx = js.indexOf("{", funcDefIdx);
+        var funcBody = extractBraceBlock(js, braceIdx);
+        if (funcBody) {
+          // Find helper references: HELPER[LOOKUP[IDX]](ARRAY, NUM)
+          var le = escRe(result.lookupName);
+          var helperRe = new RegExp(
+            "([a-zA-Z0-9$_]+)\\[" +
+              le +
+              "\\[(\\d+)\\]\\]\\s*\\(\\s*([a-zA-Z0-9$_]+)\\s*,\\s*(\\d+)\\s*\\)",
+            "g",
+          );
+          var hm;
+          while ((hm = helperRe.exec(funcBody)) !== null) {
+            if (!result.cipherHelper) result.cipherHelper = hm[1];
+            result.cipherOps.push({
+              methodName: result.lookupArray[parseInt(hm[2])],
+              arg: parseInt(hm[4]),
+            });
+          }
+        }
+      }
+    }
+
+    // Find N-sig wrapper:
+    // Look for WRAPPER[0](x) near a .set("n" pattern in the player code
+    // The lookup array maps: l[33]="n", l[20]="set", l[42]="get"
+    var nIdx = result.lookupArray.indexOf("n");
+    var setIdx = result.lookupArray.indexOf("set");
+    if (nIdx !== -1 && setIdx !== -1) {
+      // Search for: WRAPPER[0](VAR), ... [l[setIdx]](l[nIdx], VAR)
+      // or simpler: find any XXX[0](y) near l[nIdx] context
+      var wrapperRe = /([a-zA-Z0-9$_]+)\[0\]\s*\(\s*(\w+)\s*\)/g;
+      var wm;
+      while ((wm = wrapperRe.exec(js)) !== null) {
+        // Check nearby context for n-sig indicators
+        var ctx = js.substring(
+          Math.max(0, wm.index - 100),
+          Math.min(js.length, wm.index + 200),
+        );
+        // Should be near: l[nIdx] (the "n" parameter) or .set("n"
+        if (
+          ctx.indexOf("l[" + nIdx + "]") !== -1 ||
+          ctx.indexOf('"n"') !== -1
+        ) {
+          result.nSigWrapper = wm[1];
+          console.log(TAG, "N-sig wrapper found:", wm[1]);
+          break;
+        }
+      }
+    }
+
+    console.log(
+      TAG,
+      "External deps — cipher helper:",
+      result.cipherHelper || "none",
+      "| ops:",
+      result.cipherOps.length,
+      "| N-sig wrapper:",
+      result.nSigWrapper || "none",
+    );
+    return result;
+  }
+
+  /**
+   * Determine which cipher operation a helper function performs by invoking it on test arrays.
+   *
+   * The function calls the provided helper with sample inputs and infers one of: `"reverse"`, `"splice"`, `"swap"`, or `"unknown"`.
+   * @param {Function} method - A cipher helper function that mutates an array in-place and accepts (array, index) arguments.
+   * @returns {string} One of `"reverse"`, `"splice"`, `"swap"`, or `"unknown"` indicating the inferred operation.
+   */
+  function classifyCipherMethod(method) {
+    try {
+      var test = ["A", "B", "C", "D", "E", "F", "G", "H"];
+      var a = test.slice();
+      method(a, 3);
+      if (a.length < test.length) return "splice";
+      if (a[0] === test[3] && a[3] === test[0]) return "swap";
+      if (a[0] === test[test.length - 1]) return "reverse";
+      // Try with different arg to distinguish swap from reverse
+      var b = test.slice();
+      method(b, 1);
+      if (b[0] === test[1] && b[1] === test[0]) return "swap";
+      if (b[0] === test[test.length - 1]) return "reverse";
+      return "unknown";
+    } catch (e) {
+      return "unknown";
+    }
+  }
+
+  /**
+   * Construct a sequence of cipher actions by inspecting a global cipher helper object and classifying its methods.
+   *
+   * For each operation in `ops`, looks up the corresponding function on `window[helperName]`, classifies it
+   * into a known action type (`"reverse"`, `"splice"`, or `"swap"`), and produces an actions array compatible
+   * with applyCipherActions.
+   * @param {string} helperName - Name of the global helper object (property on `window`) that implements cipher methods.
+   * @param {Array<{methodName: string, arg: number}>} ops - Ordered list of operations where `methodName` names a helper method and `arg` is its numeric argument (if any).
+   * @returns {Array<[string, number|null]>|null} An array of actions where each item is `[type, arg]` (use `null` for `reverse`'s arg), or `null` if the helper or any method cannot be found or classified.
+   */
+  function buildCipherActionsFromGlobal(helperName, ops) {
+    try {
+      var helper = window[helperName];
+      if (!helper || typeof helper !== "object") {
+        console.warn(TAG, "Cipher helper not found as global:", helperName);
+        return null;
+      }
+
+      var actions = [];
+      var methodTypes = {};
+      for (var i = 0; i < ops.length; i++) {
+        var op = ops[i];
+        var method = helper[op.methodName];
+        if (typeof method !== "function") {
+          console.warn(TAG, "Cipher method not a function:", op.methodName);
+          return null;
+        }
+        if (!methodTypes[op.methodName]) {
+          methodTypes[op.methodName] = classifyCipherMethod(method);
+        }
+        var type = methodTypes[op.methodName];
+        if (type === "unknown") {
+          console.warn(TAG, "Could not classify cipher method:", op.methodName);
+          return null;
+        }
+        actions.push([type, type === "reverse" ? null : op.arg]);
+      }
+
+      console.log(
+        TAG,
+        "Cipher actions from global:",
+        actions
+          .map(function (a) {
+            return a[0] + (a[1] != null ? "(" + a[1] + ")" : "");
+          })
+          .join(", "),
+      );
+      return actions;
+    } catch (e) {
+      console.warn(TAG, "buildCipherActionsFromGlobal error:", e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Transform a signature string by applying a sequence of cipher actions.
+   *
+   * Each action is a two-element array [type, arg] where `type` is one of:
+   * - `"reverse"`: reverse the characters.
+   * - `"splice"`: remove `arg` characters from the start.
+   * - `"swap"`: swap the first character with the character at index `arg % length`.
+   * - `"slice"`: return the substring starting at `arg`.
+   *
+   * @param {Array.<Array>} actions - List of actions to apply in order.
+   * @param {string} sig - The signature string to transform.
+   * @returns {string} The transformed signature. */
+  function applyCipherActions(actions, sig) {
+    var a = sig.split("");
+    for (var i = 0; i < actions.length; i++) {
+      var op = actions[i][0];
+      var n = actions[i][1];
+      switch (op) {
+        case "reverse":
+          a.reverse();
+          break;
+        case "splice":
+          a.splice(0, n);
+          break;
+        case "swap":
+          var t = a[0];
+          a[0] = a[n % a.length];
+          a[n % a.length] = t;
+          break;
+        case "slice":
+          a = a.slice(n);
+          break;
+      }
+    }
+    return a.join("");
+  }
+
+  /**
+   * Retrieve the N-signature transformation function from a global wrapper array.
+   * @param {string} wrapperName - The global variable name that should reference an array containing the transform function at index 0 (e.g., `R8K = [fn]`).
+   * @returns {Function|null} The transform function if present at `window[wrapperName][0]`, `null` otherwise.
+   */
+  function getNSigFromGlobal(wrapperName) {
+    try {
+      var wrapper = window[wrapperName];
+      if (
+        wrapper &&
+        Array.isArray(wrapper) &&
+        typeof wrapper[0] === "function"
+      ) {
+        console.log(TAG, "N-sig function found via global:", wrapperName);
+        return wrapper[0];
+      }
+      console.warn(TAG, "N-sig wrapper not found or invalid:", wrapperName);
+      return null;
+    } catch (e) {
+      console.warn(TAG, "getNSigFromGlobal error:", e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Locate and extract a cipher helper object definition from inline script tags.
+   *
+   * Searches non-external <script> elements for a declaration like `var HELPER = { ... }`
+   * or `HELPER = { ... }` and returns a self-contained snippet that redefines the helper.
+   *
+   * @param {string} helperName - The global helper object name to find.
+   * @returns {string|null} `string` containing `var <helperName> = { ... };` if found, `null` otherwise.
+   */
+  function extractCipherHelperFromPage(helperName) {
+    try {
+      var scripts = document.querySelectorAll("script:not([src])");
+      for (var i = 0; i < scripts.length; i++) {
+        var text = scripts[i].textContent;
+        if (!text || text.length < 10) continue;
+
+        // Look for: var HELPER = { ... } or HELPER = { ... }
+        var re = new RegExp(
+          "(?:var\\s+)?" + escRe(helperName) + "\\s*=\\s*\\{",
+        );
+        var m = re.exec(text);
+        if (m) {
+          var braceIdx = m.index + m[0].lastIndexOf("{");
+          var block = extractBraceBlock(text, braceIdx);
+          if (block) {
+            return "var " + helperName + "=" + block + ";";
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(TAG, "extractCipherHelperFromPage error:", e.message);
+    }
+    return null;
+  }
+
+  /**
+   * Locate and extract a page-defined N-sig wrapper array from inline script tags.
+   *
+   * Searches inline <script> elements for a variable named by wrapperName that is
+   * assigned to an array and returns a self-contained `var NAME = [ ... ];` code
+   * snippet suitable for evaluation. Returns `null` if no such wrapper is found.
+   *
+   * @param {string} wrapperName - The global wrapper variable name to locate.
+   * @returns {string|null} `string` containing `var <wrapperName> = [ ... ];` when found, `null` otherwise.
+   */
+  function extractNSigWrapperFromPage(wrapperName) {
+    try {
+      var scripts = document.querySelectorAll("script:not([src])");
+      for (var i = 0; i < scripts.length; i++) {
+        var text = scripts[i].textContent;
+        if (!text || text.length < 10) continue;
+
+        var re = new RegExp(
+          "(?:var\\s+)?" + escRe(wrapperName) + "\\s*=\\s*\\[",
+        );
+        var m = re.exec(text);
+        if (m) {
+          var bracketIdx = m.index + m[0].lastIndexOf("[");
+          var block = extractBracketBlock(text, bracketIdx);
+          if (block) {
+            return "var " + wrapperName + "=" + block + ";";
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(TAG, "extractNSigWrapperFromPage error:", e.message);
+    }
+    return null;
+  }
+
+  /**
+   * Collects available YouTube page data useful for player/script analysis and deciphering.
+   *
+   * Gathers the in-page player response, player JS URL, visitor and session identifiers, API/client metadata, signed-timestamp (STS), logged-in state, and videoId when present; normalizes the playerUrl to an absolute https URL when possible.
+   *
+   * @returns {Object} An object containing any of the following properties found on the page:
+   *  - playerResponse: The parsed player response object (e.g., ytInitialPlayerResponse or movie_player.getPlayerResponse()).
+   *  - playerUrl: The resolved PLAYER_JS_URL or equivalent URL for the player script, normalized to start with `https://` if detected.
+   *  - visitorData: Visitor identifier (VISITOR_DATA) when available.
+   *  - sts: Signature timestamp (STS) when available.
+   *  - apiKey: INNERTUBE_API_KEY when available.
+   *  - clientVersion: INNERTUBE_CLIENT_VERSION when available.
+   *  - loggedIn: Boolean indicating logged-in state when available.
+   *  - videoId: Video identifier from the player element when available.
+   */
   function extractPageData() {
     var data = {};
 
@@ -81,6 +478,10 @@
         data.sts = ytcfg.get("STS") || null;
         data.apiKey = ytcfg.get("INNERTUBE_API_KEY") || null;
         data.clientVersion = ytcfg.get("INNERTUBE_CLIENT_VERSION") || null;
+        var loggedInVal = ytcfg.get("LOGGED_IN");
+        if (typeof loggedInVal === "boolean") {
+          data.loggedIn = loggedInVal;
+        }
       }
     } catch (e) {}
 
@@ -240,6 +641,15 @@
     );
   }
 
+  /**
+   * Locate the name of the signature decipher function within YouTube player JavaScript.
+   *
+   * Scans the provided player JS source for known invocation and definition patterns (including common
+   * set/encodeURIComponent usages, split/join function forms, and signature-transform heuristics) and
+   * returns the first matching function name.
+   * @param {string} js - The player JavaScript source code to search.
+   * @returns {string|null} The decipher function name if found, `null` otherwise.
+   */
   function findCipherFunctionName(js) {
     var patterns = [
       /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
@@ -296,7 +706,175 @@
     return null;
   }
 
+  /**
+   * Attempts to extract a new-style "dispatch" cipher implementation from a YouTube player JS blob.
+   *
+   * Searches the provided player JS for a dispatch-based cipher call and, if found, builds a self-contained
+   * JavaScript snippet that defines the lookup array, helper object, and cipher function and then invokes
+   * the cipher with a placeholder argument name.
+   *
+   * @param {string} js - The source text of player.js to analyze.
+   * @returns {{cipherCode: string, argName: string}|null} An object containing:
+   *   - `cipherCode`: a self-contained JS snippet that, when evaluated with a variable named as `argName`,
+   *     will return the deciphered signature; and
+   *   - `argName`: the placeholder parameter name the snippet expects for the signature value.
+   *   Returns `null` if no dispatch cipher could be located or extracted.
+   */
+  function extractDispatchCipher(js) {
+    // New-style dispatch cipher (2025+): funcName(dispatchValue, decodeURIComponent(p.s))
+    var callMatch = js.match(
+      /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
+    );
+    if (!callMatch) return null;
+    var cipherFuncName = callMatch[1];
+    var dispatchValue = callMatch[2];
+
+    // Find lookup array: var NAME = "...".split("DELIM") with 50+ elements
+    var lookupArrayRe =
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+    var lookupMatch = null;
+    var lookupName = null;
+    var lookupRaw = null;
+    var lookupDelim = null;
+    var lm;
+    while ((lm = lookupArrayRe.exec(js)) !== null) {
+      var parts = lm[2].split(lm[3]);
+      if (parts.length > 50) {
+        lookupMatch = lm;
+        lookupName = lm[1];
+        lookupRaw = lm[2];
+        lookupDelim = lm[3];
+        break;
+      }
+    }
+    if (!lookupName) return null;
+
+    // Find cipher function definition
+    var funcDefIdx = js.indexOf(cipherFuncName + "=function(");
+    if (funcDefIdx === -1) return null;
+    var braceIdx = js.indexOf("{", funcDefIdx);
+    var funcBody = extractBraceBlock(js, braceIdx);
+    if (!funcBody) return null;
+
+    // Get param list
+    var paramMatch = js.slice(funcDefIdx).match(/=function\s*\(([^)]+)\)/);
+    if (!paramMatch) return null;
+
+    // Extract parameter names
+    var paramNames = paramMatch[1].split(",").map(function (p) {
+      return p.trim();
+    });
+
+    // Find local variables in function body (var NAME = ...)
+    var localVarRe = /var\s+([a-zA-Z0-9$_]+)\s*=/g;
+    var localVars = [];
+    var lvm;
+    while ((lvm = localVarRe.exec(funcBody)) !== null) {
+      localVars.push(lvm[1]);
+    }
+
+    // Names to skip when looking for cipher helper
+    var skipNames = {};
+    for (var i = 0; i < paramNames.length; i++) skipNames[paramNames[i]] = true;
+    for (var j = 0; j < localVars.length; j++) skipNames[localVars[j]] = true;
+    // Also skip built-in objects
+    skipNames["String"] = true;
+    skipNames["Array"] = true;
+    skipNames["Math"] = true;
+    skipNames["Object"] = true;
+    skipNames["Number"] = true;
+    skipNames["JSON"] = true;
+
+    // Find helper object from function body (excluding params and locals)
+    var lookupEsc = escRe(lookupName);
+    // Look for HELPER[lookup[N]]( pattern - method call via lookup array
+    var helperRefRe = new RegExp(
+      "([a-zA-Z0-9$_]+)\\[" + lookupEsc + "\\[\\d+\\]\\]\\s*\\(",
+      "g",
+    );
+    var helperName = null;
+    var hrm;
+    while ((hrm = helperRefRe.exec(funcBody)) !== null) {
+      if (!skipNames[hrm[1]]) {
+        helperName = hrm[1];
+        break;
+      }
+    }
+    if (!helperName) {
+      console.warn(
+        TAG,
+        "Could not find cipher helper (after filtering params/locals)",
+      );
+      return null;
+    }
+
+    // Find helper object definition
+    var helperDefMatch = js.match(
+      new RegExp("(?:var\\s+|[;,]\\s*)" + escRe(helperName) + "\\s*=\\s*\\{"),
+    );
+    if (!helperDefMatch) return null;
+    var helperBraceIdx = js.indexOf(
+      "{",
+      helperDefMatch.index + helperDefMatch[0].lastIndexOf("=") + 1,
+    );
+    var helperBlock = extractBraceBlock(js, helperBraceIdx);
+    if (!helperBlock) return null;
+
+    // Build self-contained code
+    var argName = "_sig_";
+    var code =
+      "var " +
+      lookupName +
+      '="' +
+      lookupRaw +
+      '".split("' +
+      lookupDelim +
+      '");\n' +
+      "var " +
+      helperName +
+      "=" +
+      helperBlock +
+      ";\n" +
+      "var " +
+      cipherFuncName +
+      "=function" +
+      paramMatch[0].slice(paramMatch[0].indexOf("(")) +
+      funcBody +
+      ";\n" +
+      "return " +
+      cipherFuncName +
+      "(" +
+      dispatchValue +
+      ", " +
+      argName +
+      ");";
+
+    console.log(
+      TAG,
+      "Dispatch cipher extracted:",
+      code.length,
+      "chars, func:",
+      cipherFuncName,
+      "dispatch:",
+      dispatchValue,
+    );
+    return { cipherCode: code, argName: argName };
+  }
+
+  /**
+   * Extracts a self-contained cipher code snippet and the cipher function's argument name from YouTube player JavaScript.
+   *
+   * Attempts a new-style dispatch cipher extraction first, then falls back to legacy function patterns; when successful returns a runnable snippet that defines any helper object, splits the input argument into an array, includes the cipher function body (ensuring it returns the transformed string), and the argument name used by the function.
+   *
+   * @param {string} js - The full player JavaScript source to analyze.
+   * @returns {{cipherCode: string, argName: string}|null} An object with `cipherCode` (the reconstructed code snippet) and `argName` (the cipher function's parameter name) when extraction succeeds, or `null` if no cipher could be extracted.
+   */
   function extractCipher(js) {
+    // === Try new-style dispatch cipher first (2025+) ===
+    var dispatchResult = extractDispatchCipher(js);
+    if (dispatchResult) return dispatchResult;
+
+    // === Legacy patterns (pre-2025) ===
     var fname = findCipherFunctionName(js);
     if (!fname) {
       console.warn(TAG, "Could not find cipher function name");
@@ -704,6 +1282,26 @@
     return null;
   }
 
+  /**
+   * Parse a YouTube player.js URL to extract decipher (cipher) and N-sig resolution data.
+   *
+   * Parses and caches analysis of the player JavaScript referenced by playerUrl, attempting
+   * multiple strategies: direct global inspection for runtime helpers, and fallback code
+   * extraction from the fetched player.js. Also extracts a signature timestamp (STS) when present.
+   *
+   * @param {string} playerUrl - The full URL of the player.js to fetch and analyze.
+   * @returns {Object} An object with parsing results:
+   *   - cipher: null or an object describing extracted cipher code or helper info.
+   *   - nSig: null or an object describing extracted N-sig code or wrapper info.
+   *   - sts: number|null — the extracted signature timestamp, or null if not found.
+   *   - cipherActions: null or Array — direct list of cipher actions derived from runtime globals.
+   *   - nSigFn: null or Function — direct N-sig transform function obtained from runtime globals.
+   *   - externalDeps: Object — detected external dependency names/metadata used during analysis.
+   *   - extractionErrors: Array<string> — present when extraction attempts failed (optional).
+   *   - fetchFailed: true when the player.js could not be fetched after retries (optional).
+   *
+   * The function caches the returned result keyed by playerUrl.
+   */
   async function parsePlayerJs(playerUrl) {
     if (playerCache[playerUrl]) {
       console.log(TAG, "Using cached player data for", playerUrl);
@@ -732,23 +1330,64 @@
     }
     console.log(TAG, "Player.js loaded:", js.length, "bytes");
 
-    var cipher = extractCipher(js);
-    var nSig = extractNSig(js);
+    // === Step 1: Find external dependency names (2025+ architecture) ===
+    var externalDeps = findExternalDeps(js);
 
-    var extractionErrors = [];
-    if (!cipher) {
-      extractionErrors.push("cipher extraction failed");
-      console.warn(
-        TAG,
-        "⚠ Cipher extraction failed - player.js patterns may be outdated",
+    // === Step 2: Try direct global access first (fast, reliable) ===
+    var cipherActions = null;
+    var nSigFn = null;
+
+    if (externalDeps.cipherHelper && externalDeps.cipherOps.length > 0) {
+      cipherActions = buildCipherActionsFromGlobal(
+        externalDeps.cipherHelper,
+        externalDeps.cipherOps,
       );
     }
-    if (!nSig) {
-      extractionErrors.push("N-sig extraction failed");
-      console.warn(
-        TAG,
-        "⚠ N-sig extraction failed - player.js patterns may be outdated",
-      );
+
+    if (externalDeps.nSigWrapper) {
+      nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
+    }
+
+    // === Step 3: Fallback to code extraction (legacy approach) ===
+    var cipher = null;
+    var nSig = null;
+    var extractionErrors = [];
+
+    if (!cipherActions) {
+      cipher = extractCipher(js);
+      if (!cipher) {
+        extractionErrors.push("cipher extraction failed");
+        console.warn(
+          TAG,
+          "⚠ Cipher extraction failed - trying inline script extraction",
+        );
+        // Try to extract cipher helper from page inline scripts
+        if (externalDeps.cipherHelper) {
+          var helperCode = extractCipherHelperFromPage(
+            externalDeps.cipherHelper,
+          );
+          if (helperCode) {
+            console.log(TAG, "Cipher helper extracted from inline script");
+            // We have the helper code — classify methods from the code
+            // This is still useful for sending to background.js
+            cipher = {
+              cipherHelperCode: helperCode,
+              cipherHelperName: externalDeps.cipherHelper,
+            };
+          }
+        }
+      }
+    }
+
+    if (!nSigFn) {
+      nSig = extractNSig(js);
+      if (!nSig) {
+        extractionErrors.push("N-sig extraction failed");
+        console.warn(
+          TAG,
+          "⚠ N-sig extraction failed - player.js patterns may be outdated",
+        );
+      }
     }
 
     var sts = null;
@@ -765,7 +1404,14 @@
       }
     }
 
-    var result = { cipher: cipher, nSig: nSig, sts: sts };
+    var result = {
+      cipher: cipher,
+      nSig: nSig,
+      sts: sts,
+      cipherActions: cipherActions, // Direct action list (from global access)
+      nSigFn: nSigFn, // Direct N-sig function (from global access)
+      externalDeps: externalDeps,
+    };
 
     if (extractionErrors.length > 0) {
       result.extractionErrors = extractionErrors;
@@ -776,24 +1422,92 @@
     console.log(
       TAG,
       "Player parsed — cipher:",
-      cipher ? (cipher.cipherCode ? "code" : "unknown") : "FAILED",
+      cipherActions
+        ? "actions(direct)"
+        : cipher
+          ? cipher.cipherCode
+            ? "code"
+            : "helper-code"
+          : "FAILED",
       "| nSig:",
-      nSig ? (nSig.nSigCode ? "code" : "unknown") : "FAILED",
+      nSigFn
+        ? "direct"
+        : nSig
+          ? nSig.nSigCode
+            ? "code"
+            : "unknown"
+          : "FAILED",
       "| STS:",
       sts || "none",
     );
     return result;
   }
 
+  /**
+   * Normalize and resolve streaming formats from a player response, applying decipher and N-signature transforms when available.
+   *
+   * @param {Object} playerResponse - YouTube player response object; expected to contain `streamingData` with `formats` and/or `adaptiveFormats`.
+   * @param {Object} playerData - Parsed player data providing decipher information (e.g., `cipherActions`, `cipher`, `nSigFn`, `nSig`).
+   * @returns {Array<Object>} An array of resolved format objects. Each object contains:
+   * - `itag`: format identifier,
+   * - `url`: fully resolved URL with deciphered signature and applied N-signature if available,
+   * - `mimeType`: original MIME type string,
+   * - `quality` / `qualityLabel`: human-readable quality fields,
+   * - `width`, `height`, `fps`, `bitrate`, `audioBitrate`, `audioQuality`, `contentLength`,
+   * - `codecs`: extracted codecs string,
+   * - `isVideo`, `isAudio`, `isMuxed`: boolean flags describing the stream.
+   */
   function resolveFormats(playerResponse, playerData) {
     var sd = playerResponse.streamingData;
     if (!sd) return [];
 
     var raw = [].concat(sd.formats || [], sd.adaptiveFormats || []);
     var resolved = [];
-    var cipherFn =
-      typeof playerData.cipher === "function" ? playerData.cipher : null;
-    var nSigFn = typeof playerData.nSig === "function" ? playerData.nSig : null;
+
+    // === Cipher function resolution ===
+    var cipherFn = null;
+    // Priority 1: Direct cipher actions from global access (2025+)
+    if (playerData.cipherActions) {
+      cipherFn = function (sig) {
+        return applyCipherActions(playerData.cipherActions, sig);
+      };
+      console.log(TAG, "Using direct cipher actions for format resolution");
+    }
+    // Priority 2: Legacy code-based cipher
+    if (!cipherFn && playerData.cipher) {
+      if (typeof playerData.cipher === "function") {
+        cipherFn = playerData.cipher;
+      } else if (playerData.cipher.cipherCode) {
+        try {
+          cipherFn = new Function(
+            playerData.cipher.argName || "a",
+            playerData.cipher.cipherCode,
+          );
+        } catch (e) {
+          console.warn(TAG, "Failed to compile cipher code:", e.message);
+        }
+      }
+    }
+
+    // === N-sig function resolution ===
+    var nSigFn = null;
+    // Priority 1: Direct N-sig function from global access (2025+)
+    if (playerData.nSigFn && typeof playerData.nSigFn === "function") {
+      nSigFn = playerData.nSigFn;
+      console.log(TAG, "Using direct N-sig function for format resolution");
+    }
+    // Priority 2: Legacy code-based N-sig
+    if (!nSigFn && playerData.nSig) {
+      if (typeof playerData.nSig === "function") {
+        nSigFn = playerData.nSig;
+      } else if (playerData.nSig.nSigCode) {
+        try {
+          nSigFn = new Function("return " + playerData.nSig.nSigCode)();
+        } catch (e) {
+          console.warn(TAG, "Failed to compile N-sig code:", e.message);
+        }
+      }
+    }
 
     for (var i = 0; i < raw.length; i++) {
       var fmt = raw[i];
@@ -910,6 +1624,27 @@
     }
   }
 
+  /**
+   * Orchestrates page analysis to resolve video formats and sends the enriched data to the content script.
+   *
+   * Extracts page-level player data, fetches and parses the player JS when available, resolves streaming formats
+   * (applying cipher and N-sig transformations when possible), and posts a message to the content script with the
+   * resulting payload.
+   *
+   * The function populates or augments the page data object with fields such as:
+   * - resolvedFormats: array of normalized format objects
+   * - formatSource: "page_deciphered" or "page_code_only"
+   * - sts: signature timestamp (if found)
+   * - cipherActions: direct cipher action list (when available)
+   * - cipherCode / cipherArgName: legacy cipher code fallback
+   * - nSigCode: legacy N-sig code fallback
+   * - directCipher / directNSig: booleans indicating direct-function availability
+   * - extractionErrors: array of extraction error messages (when present)
+   * - resolveError: error message if format resolution failed
+   *
+   * Side effects:
+   * - Posts the assembled data to the page via sendToContentScript().
+   */
   async function processVideo() {
     console.log(TAG, "Processing video...");
     var data = extractPageData();
@@ -938,6 +1673,12 @@
         formats.length > 0 ? "page_deciphered" : "page_code_only";
       data.sts = data.sts || playerData.sts;
 
+      // Send cipher action list for background.js to use in Tier 2/3
+      if (playerData.cipherActions) {
+        data.cipherActions = playerData.cipherActions;
+      }
+
+      // Legacy cipher code (fallback for background.js)
       if (
         playerData.cipher &&
         typeof playerData.cipher === "object" &&
@@ -946,6 +1687,8 @@
         data.cipherCode = playerData.cipher.cipherCode;
         data.cipherArgName = playerData.cipher.argName;
       }
+
+      // Legacy N-sig code (fallback for background.js)
       if (
         playerData.nSig &&
         typeof playerData.nSig === "object" &&
@@ -953,6 +1696,10 @@
       ) {
         data.nSigCode = playerData.nSig.nSigCode;
       }
+
+      // Flag whether direct functions were used (background.js may not need sandbox)
+      data.directCipher = !!playerData.cipherActions;
+      data.directNSig = !!playerData.nSigFn;
 
       if (
         playerData.extractionErrors &&
@@ -963,13 +1710,17 @@
 
       console.log(
         TAG,
-        "Extracted code for",
+        "Resolved",
         formats.length,
         "formats |",
         "cipher:",
-        data.cipherCode ? "✓" : "✗",
+        playerData.cipherActions
+          ? "✓(direct)"
+          : data.cipherCode
+            ? "✓(code)"
+            : "✗",
         "| nSig:",
-        data.nSigCode ? "✓" : "✗",
+        playerData.nSigFn ? "✓(direct)" : data.nSigCode ? "✓(code)" : "✗",
       );
     } catch (e) {
       console.warn(TAG, "Format resolution failed:", e.message);

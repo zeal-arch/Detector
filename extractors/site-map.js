@@ -1,5 +1,4 @@
 const SITE_EXTRACTOR_MAP = {
-
   "vimeo.com": "vimeo.js",
   "dailymotion.com": "dailymotion.js",
   "rutube.ru": "rutube.js",
@@ -58,6 +57,7 @@ const SITE_EXTRACTOR_MAP = {
   "therokuchannel.roku.com": "roku.js",
   "crackle.com": "crackle.js",
   "popcornflix.com": "popcornflix.js",
+  "popcornmovies.org": "popcornmovies.js",
   "flixtor.to": "flixtor.js",
   "vudu.com": "vudu.js",
   "amcplus.com": "amcplus.js",

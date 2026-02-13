@@ -47,9 +47,793 @@ const pendingRequests = new Map();
 const sniffedStreams = new Map();
 const contentHashes = new Map();
 const mergeProgress = new Map();
+const sniffedYouTubeUrls = new Map(); // tabId → Map(itag → {url, mime, clen, expire, ts})
 const REFERER_RULE_ID = 1;
 let activeMergeId = null;
 let mergeKeepaliveTimer = null; // Keeps SW alive during merge
+
+// ========== YouTube itag → format metadata lookup (IDM-style sniffing) ==========
+// When YouTube's player.js fetches a videoplayback URL, cipher & N-sig are already
+// applied. We capture those URLs and use this table to reconstruct format metadata.
+const ITAG_MAP = {
+  // Muxed (video + audio)
+  18: {
+    quality: "360p",
+    w: 640,
+    h: 360,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: "mp4a",
+    V: 1,
+    A: 0,
+    M: 1,
+  },
+  22: {
+    quality: "720p",
+    w: 1280,
+    h: 720,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: "mp4a",
+    V: 1,
+    A: 0,
+    M: 1,
+  },
+  // Video-only MP4 (H.264)
+  160: {
+    quality: "144p",
+    w: 256,
+    h: 144,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  133: {
+    quality: "240p",
+    w: 426,
+    h: 240,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  134: {
+    quality: "360p",
+    w: 640,
+    h: 360,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  135: {
+    quality: "480p",
+    w: 854,
+    h: 480,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  136: {
+    quality: "720p",
+    w: 1280,
+    h: 720,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  137: {
+    quality: "1080p",
+    w: 1920,
+    h: 1080,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  138: {
+    quality: "4320p",
+    w: 7680,
+    h: 4320,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  264: {
+    quality: "1440p",
+    w: 2560,
+    h: 1440,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  266: {
+    quality: "2160p",
+    w: 3840,
+    h: 2160,
+    fps: 30,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  298: {
+    quality: "720p60",
+    w: 1280,
+    h: 720,
+    fps: 60,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  299: {
+    quality: "1080p60",
+    w: 1920,
+    h: 1080,
+    fps: 60,
+    ct: "mp4",
+    vc: "avc1",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  // Video-only WebM (VP9)
+  278: {
+    quality: "144p",
+    w: 256,
+    h: 144,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  242: {
+    quality: "240p",
+    w: 426,
+    h: 240,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  243: {
+    quality: "360p",
+    w: 640,
+    h: 360,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  244: {
+    quality: "480p",
+    w: 854,
+    h: 480,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  247: {
+    quality: "720p",
+    w: 1280,
+    h: 720,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  248: {
+    quality: "1080p",
+    w: 1920,
+    h: 1080,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  271: {
+    quality: "1440p",
+    w: 2560,
+    h: 1440,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  302: {
+    quality: "720p60",
+    w: 1280,
+    h: 720,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  303: {
+    quality: "1080p60",
+    w: 1920,
+    h: 1080,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  308: {
+    quality: "1440p60",
+    w: 2560,
+    h: 1440,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  313: {
+    quality: "2160p",
+    w: 3840,
+    h: 2160,
+    fps: 30,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  315: {
+    quality: "2160p60",
+    w: 3840,
+    h: 2160,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  // Video-only WebM VP9.2 HDR
+  330: {
+    quality: "144p60 HDR",
+    w: 256,
+    h: 144,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  331: {
+    quality: "240p60 HDR",
+    w: 426,
+    h: 240,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  332: {
+    quality: "360p60 HDR",
+    w: 640,
+    h: 360,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  333: {
+    quality: "480p60 HDR",
+    w: 854,
+    h: 480,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  334: {
+    quality: "720p60 HDR",
+    w: 1280,
+    h: 720,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  335: {
+    quality: "1080p60 HDR",
+    w: 1920,
+    h: 1080,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  336: {
+    quality: "1440p60 HDR",
+    w: 2560,
+    h: 1440,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  337: {
+    quality: "2160p60 HDR",
+    w: 3840,
+    h: 2160,
+    fps: 60,
+    ct: "webm",
+    vc: "vp9.2",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  // Video-only MP4 (AV1)
+  394: {
+    quality: "144p",
+    w: 256,
+    h: 144,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  395: {
+    quality: "240p",
+    w: 426,
+    h: 240,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  396: {
+    quality: "360p",
+    w: 640,
+    h: 360,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  397: {
+    quality: "480p",
+    w: 854,
+    h: 480,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  398: {
+    quality: "720p",
+    w: 1280,
+    h: 720,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  399: {
+    quality: "1080p",
+    w: 1920,
+    h: 1080,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  400: {
+    quality: "1440p",
+    w: 2560,
+    h: 1440,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  401: {
+    quality: "2160p",
+    w: 3840,
+    h: 2160,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  571: {
+    quality: "4320p",
+    w: 7680,
+    h: 4320,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  // Video-only MP4 AV1 HDR
+  694: {
+    quality: "144p HDR",
+    w: 256,
+    h: 144,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  695: {
+    quality: "240p HDR",
+    w: 426,
+    h: 240,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  696: {
+    quality: "360p HDR",
+    w: 640,
+    h: 360,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  697: {
+    quality: "480p HDR",
+    w: 854,
+    h: 480,
+    fps: 30,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  698: {
+    quality: "720p HDR",
+    w: 1280,
+    h: 720,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  699: {
+    quality: "1080p HDR",
+    w: 1920,
+    h: 1080,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  700: {
+    quality: "1440p HDR",
+    w: 2560,
+    h: 1440,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  701: {
+    quality: "2160p HDR",
+    w: 3840,
+    h: 2160,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  702: {
+    quality: "4320p HDR",
+    w: 7680,
+    h: 4320,
+    fps: 60,
+    ct: "mp4",
+    vc: "av01",
+    ac: null,
+    V: 1,
+    A: 0,
+    M: 0,
+  },
+  // Audio-only MP4 (AAC)
+  139: {
+    quality: "48kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 48000,
+  },
+  140: {
+    quality: "128kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 128000,
+  },
+  141: {
+    quality: "256kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 256000,
+  },
+  256: {
+    quality: "192kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 192000,
+  },
+  258: {
+    quality: "384kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 384000,
+  },
+  327: {
+    quality: "256kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "mp4",
+    vc: null,
+    ac: "mp4a",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 256000,
+  },
+  // Audio-only WebM (Vorbis)
+  171: {
+    quality: "128kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "vorbis",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 128000,
+  },
+  172: {
+    quality: "192kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "vorbis",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 192000,
+  },
+  // Audio-only WebM (Opus)
+  249: {
+    quality: "50kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "opus",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 50000,
+  },
+  250: {
+    quality: "70kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "opus",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 70000,
+  },
+  251: {
+    quality: "160kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "opus",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 160000,
+  },
+  338: {
+    quality: "480kbps",
+    w: 0,
+    h: 0,
+    fps: 0,
+    ct: "webm",
+    vc: null,
+    ac: "opus",
+    V: 0,
+    A: 1,
+    M: 0,
+    abr: 480000,
+  },
+};
 
 // Import DRM detection utility
 importScripts("lib/drm-detection.js");
@@ -205,11 +989,16 @@ bcIn.onmessage = (e) => {
       if (msg.downloadId) {
         chrome.storage.session.get("activeDownloads", (result) => {
           const downloads = result?.activeDownloads || {};
+          const existing = downloads[msg.downloadId] || {};
           downloads[msg.downloadId] = {
+            // Preserve video metadata from initial entry
+            videoTitle: existing.videoTitle || null,
+            videoThumbnail: existing.videoThumbnail || null,
+            // Update progress fields
             phase: msg.phase,
             message: msg.message,
             percent: msg.percent,
-            filename: msg.filename,
+            filename: msg.filename || existing.filename,
             ts: Date.now(),
           };
           chrome.storage.session
@@ -622,11 +1411,16 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       if (msg.downloadId) {
         chrome.storage.session.get("activeDownloads", (result) => {
           const downloads = result?.activeDownloads || {};
+          const existing = downloads[msg.downloadId] || {};
           downloads[msg.downloadId] = {
+            // Preserve video metadata from initial entry
+            videoTitle: existing.videoTitle || null,
+            videoThumbnail: existing.videoThumbnail || null,
+            // Update completion fields
             phase: msg.success ? "complete" : "error",
             message: msg.success ? "Download complete" : msg.error,
             percent: msg.success ? 100 : 0,
-            filename: msg.filename,
+            filename: msg.filename || existing.filename,
             ts: Date.now(),
           };
           chrome.storage.session
@@ -657,6 +1451,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
     case "SPECIALIST_DETECTED":
       onSpecialistDetected(msg, sender.tab?.id)
+        .then(respond)
+        .catch((e) => respond({ success: false, error: e.message }));
+      return true;
+
+    case "IFRAME_STREAM_DETECTED":
+      onIframeStreamDetected(msg, sender.tab?.id)
         .then(respond)
         .catch((e) => respond({ success: false, error: e.message }));
       return true;
@@ -696,7 +1496,7 @@ function extractVideoIdFromUrl(url) {
 async function onVideoDetected(msg, tabId) {
   console.log("[BG] Video detected:", msg.videoId, "tab:", tabId);
   try {
-    const info = await getFormats(msg.videoId, msg.pageData || {});
+    const info = await getFormats(msg.videoId, msg.pageData || {}, tabId);
 
     // Check for DRM protection
     const drmCheck = DRMDetection.checkVideoData({
@@ -775,17 +1575,17 @@ async function onGetVideoInfo(tabId, videoId) {
     return cached.info;
   }
   if (!videoId) return { error: "No video ID" };
-  const info = await getFormats(videoId, {});
+  const info = await getFormats(videoId, {}, tabId);
   tabData.set(tabId, { videoId, info, ts: Date.now() });
   persistTabData();
   return info;
 }
 
-async function getFormats(videoId, pageData) {
+async function getFormats(videoId, pageData, tabId = null) {
   if (pendingRequests.has(videoId)) {
     return pendingRequests.get(videoId);
   }
-  const promise = getFormatsInner(videoId, pageData);
+  const promise = getFormatsInner(videoId, pageData, tabId);
   pendingRequests.set(videoId, promise);
   try {
     return await promise;
@@ -794,7 +1594,7 @@ async function getFormats(videoId, pageData) {
   }
 }
 
-async function getFormatsInner(videoId, pageData) {
+async function getFormatsInner(videoId, pageData, tabId = null) {
   if (pageData.resolvedFormats && pageData.resolvedFormats.length > 0) {
     console.log(
       "[BG] ★ Tier 1: Using",
@@ -810,41 +1610,70 @@ async function getFormatsInner(videoId, pageData) {
       }
     }
 
-    // Apply N-sig transformation — inject.js extracts code but cannot eval it
-    // (CSP blocks eval in MAIN world), so background must always apply n-sig
-    const hasUntransformedN = pageData.resolvedFormats.some(
-      (f) => f.url && /[?&]n=([^&]{15,})/.test(f.url),
-    );
+    // Apply N-sig transformation — inject.js may have already applied it
+    // via direct global access (2025+ architecture). If directNSig is true,
+    // the URLs already have correct N-sig values.
+    if (!pageData.directNSig) {
+      const hasUntransformedN = pageData.resolvedFormats.some(
+        (f) => f.url && /[?&]n=([^&]{15,})/.test(f.url),
+      );
 
-    if (hasUntransformedN) {
-      let nSigCode = pageData.nSigCode || null;
-      let sig = null;
+      if (hasUntransformedN) {
+        let nSigCode = pageData.nSigCode || null;
+        let nSigBundled = pageData.nSigBundled || null;
+        let sig = null;
 
-      // Try to load signature data from player.js (background can fetch without CSP issues)
-      const playerUrl = pageData.playerUrl || null;
-      if (playerUrl) {
-        try {
-          sig = await loadSignatureData(playerUrl);
-          nSigCode = nSigCode || sig?.nSigCode || null;
+        // Try to load signature data from player.js (background can fetch without CSP issues)
+        const playerUrl = pageData.playerUrl || null;
+        if (playerUrl) {
+          try {
+            sig = await loadSignatureData(playerUrl, videoId);
+            nSigCode = nSigCode || sig?.nSigCode || null;
+            nSigBundled = nSigBundled || sig?.nSigBundled || null;
+            console.log(
+              "[BG] Tier 1: Loaded sig data for n-sig transform — nSig:",
+              nSigCode ? "yes" : "none",
+              nSigBundled ? "(bundled)" : "",
+            );
+          } catch (e) {
+            console.warn("[BG] Tier 1: Failed to load sig data:", e.message);
+          }
+        }
+
+        if (nSigCode) {
           console.log(
-            "[BG] Tier 1: Loaded sig data for n-sig transform — nSig:",
-            nSigCode ? "yes" : "none",
+            "[BG] Tier 1: Applying N-sig transform to",
+            pageData.resolvedFormats.length,
+            "formats",
           );
-        } catch (e) {
-          console.warn("[BG] Tier 1: Failed to load sig data:", e.message);
+          await applyNSig(
+            pageData.resolvedFormats,
+            sig || { nSigCode, nSigBundled },
+          );
+        } else {
+          console.warn(
+            "[BG] Tier 1: No N-sig code available — downloads may be throttled",
+          );
         }
       }
+    } else {
+      console.log("[BG] Tier 1: N-sig already applied by inject.js (direct)");
+    }
 
-      if (nSigCode) {
+    // Enrich Tier 1 formats with sniffed URLs (IDM-style) — replaces any
+    // URLs where cipher/N-sig may have been applied incorrectly with the
+    // fully-decrypted URLs captured from YouTube's own player requests.
+    const resolveTabId = tabId || findTabIdForVideoId(videoId);
+    if (resolveTabId) {
+      const enriched = enrichFormatsWithSniffed(
+        pageData.resolvedFormats,
+        resolveTabId,
+      );
+      if (enriched > 0) {
         console.log(
-          "[BG] Tier 1: Applying N-sig transform to",
-          pageData.resolvedFormats.length,
-          "formats",
-        );
-        await applyNSig(pageData.resolvedFormats, sig || { nSigCode });
-      } else {
-        console.warn(
-          "[BG] Tier 1: No N-sig code available — downloads may fail with 403",
+          "[BG] Tier 1: Enriched",
+          enriched,
+          "format URLs from sniffed googlevideo.com requests",
         );
       }
     }
@@ -859,6 +1688,7 @@ async function getFormatsInner(videoId, pageData) {
         vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || pageData.thumbnail || "",
       formats: pageData.resolvedFormats,
       clientUsed: pageData.formatSource || "page_deciphered",
+      loggedIn: pageData.loggedIn || false,
     };
   }
 
@@ -876,6 +1706,7 @@ async function getFormatsInner(videoId, pageData) {
   let nSigCode = pageData.nSigCode || null;
   let cipherCode = pageData.cipherCode || null;
   let cipherArgName = pageData.cipherArgName || null;
+  let cipherActionsFromPage = pageData.cipherActions || null;
 
   if (!visitorData || !playerUrl) {
     try {
@@ -891,7 +1722,7 @@ async function getFormatsInner(videoId, pageData) {
   let sig = null;
   if (playerUrl) {
     try {
-      sig = await loadSignatureData(playerUrl);
+      sig = await loadSignatureData(playerUrl, videoId);
       console.log(
         "[BG] Signature data loaded from background fetch —",
         "cipher:",
@@ -911,6 +1742,16 @@ async function getFormatsInner(videoId, pageData) {
   if (cipherCode && sig && !sig.cipherCode) {
     sig.cipherCode = cipherCode;
     sig.cipherArgName = cipherArgName;
+  }
+
+  // Use cipher actions extracted by inject.js via direct global access
+  if (cipherActionsFromPage && sig && !sig.actionList) {
+    sig.actionList = cipherActionsFromPage;
+    console.log(
+      "[BG] Using cipher actions from inject.js (direct global):",
+      cipherActionsFromPage.length,
+      "ops",
+    );
   }
 
   // Client cascade order — yt-dlp defaults: android_vr, web, web_safari
@@ -1070,6 +1911,20 @@ async function getFormatsInner(videoId, pageData) {
     );
 
     const mergedFormats = deduplicateFormats(allFormats);
+
+    // Enrich Tier 2 formats with sniffed URLs (IDM-style)
+    const resolveTabId2 = tabId || findTabIdForVideoId(videoId);
+    if (resolveTabId2) {
+      const enriched = enrichFormatsWithSniffed(mergedFormats, resolveTabId2);
+      if (enriched > 0) {
+        console.log(
+          "[BG] Tier 2: Enriched",
+          enriched,
+          "format URLs from sniffed googlevideo.com requests",
+        );
+      }
+    }
+
     const vd = bestVideoDetails || {};
 
     return {
@@ -1080,7 +1935,52 @@ async function getFormatsInner(videoId, pageData) {
       thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
       formats: mergedFormats,
       clientUsed: successfulClients.join("+"),
+      loggedIn: pageData.loggedIn || false,
     };
+  }
+
+  // ============ Tier S: Sniffed URLs (IDM-style fallback) ============
+  // If cipher/N-sig extraction AND API clients all failed, but the user has
+  // already played the video, we have captured fully-working googlevideo.com
+  // URLs from the player's own network requests. Use these as a last resort.
+  const sniffTabId = tabId || findTabIdForVideoId(videoId);
+  if (sniffTabId) {
+    const sniffedFormats = buildSniffedFormats(sniffTabId);
+    if (sniffedFormats.length > 0) {
+      console.log(
+        "[BG] ★ Tier S: Using",
+        sniffedFormats.length,
+        "sniffed googlevideo.com URLs (IDM-style bypass)",
+      );
+
+      // Try to get video metadata from pageData or tabData
+      const td = tabData.get(sniffTabId);
+      const vd = pageData.playerResponse?.videoDetails || {};
+      const title =
+        vd.title || pageData.title || td?.info?.title || "YouTube Video";
+      const author = vd.author || pageData.author || td?.info?.author || "";
+      const lengthSeconds =
+        parseInt(vd.lengthSeconds) ||
+        pageData.duration ||
+        td?.info?.lengthSeconds ||
+        0;
+      const thumbnail =
+        vd.thumbnail?.thumbnails?.slice(-1)[0]?.url ||
+        pageData.thumbnail ||
+        td?.info?.thumbnail ||
+        "";
+
+      return {
+        videoId,
+        title,
+        author,
+        lengthSeconds,
+        thumbnail,
+        formats: sniffedFormats,
+        clientUsed: "sniffed",
+        loggedIn: pageData.loggedIn || false,
+      };
+    }
   }
 
   console.log("[BG] API clients exhausted, trying Tier 3 (page scrape)...");
@@ -1092,6 +1992,7 @@ async function getFormatsInner(videoId, pageData) {
     lastErr,
     cipherCode,
     cipherArgName,
+    pageData.loggedIn || false,
   );
 }
 
@@ -1517,26 +2418,69 @@ async function applyNSig(formats, sig) {
   if (!entries.length) return;
 
   console.log("[BG] Transforming", entries.length, "N-params via sandbox...");
-  try {
-    const results = await sandboxEval(
-      sig.nSigCode,
-      entries.map((e) => e.decoded),
-    );
 
-    for (let i = 0; i < entries.length; i++) {
-      const e = entries[i];
-      const r = results[i];
-      if (r && typeof r === "string" && r !== e.decoded) {
-        const fmt = formats.find((f) => f.itag === e.itag);
-        if (fmt)
-          fmt.url = fmt.url.replace("n=" + e.raw, "n=" + encodeURIComponent(r));
-      }
+  const decodedParams = entries.map((e) => e.decoded);
+  let results = null;
+  let succeeded = false;
+
+  // Try 1: Plain N-sig code (original extraction)
+  try {
+    results = await sandboxEval(sig.nSigCode, decodedParams);
+    // Validate: check if at least one value actually changed
+    const anyChanged = results.some(
+      (r, i) => r && typeof r === "string" && r !== decodedParams[i],
+    );
+    if (anyChanged) {
+      succeeded = true;
+      console.log("[BG] N-sig transform succeeded (plain code)");
+    } else {
+      console.warn(
+        "[BG] N-sig plain code returned unchanged values — trying bundled...",
+      );
     }
   } catch (err) {
     console.warn(
-      "[BG] N-sig transform failed, downloads may be throttled:",
+      "[BG] N-sig plain code failed:",
       err.message,
+      "— trying bundled...",
     );
+  }
+
+  // Try 2: yt-dlp bundled N-sig (includes all dependencies)
+  if (!succeeded && sig.nSigBundled) {
+    try {
+      results = await sandboxEval(sig.nSigBundled, decodedParams);
+      const anyChanged = results.some(
+        (r, i) => r && typeof r === "string" && r !== decodedParams[i],
+      );
+      if (anyChanged) {
+        succeeded = true;
+        console.log("[BG] ★ N-sig transform succeeded (yt-dlp bundled code)");
+      } else {
+        console.warn("[BG] N-sig bundled code also returned unchanged values");
+      }
+    } catch (err2) {
+      console.warn("[BG] N-sig bundled code also failed:", err2.message);
+    }
+  }
+
+  if (!succeeded) {
+    console.warn(
+      "[BG] All N-sig transforms failed — downloads may be throttled. " +
+        "Sniffed URLs (IDM-style) will be used if available.",
+    );
+    return;
+  }
+
+  // Apply successful results
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const r = results[i];
+    if (r && typeof r === "string" && r !== e.decoded) {
+      const fmt = formats.find((f) => f.itag === e.itag);
+      if (fmt)
+        fmt.url = fmt.url.replace("n=" + e.raw, "n=" + encodeURIComponent(r));
+    }
   }
 }
 
@@ -1658,6 +2602,7 @@ async function pageScrapeWithCipher(
   prevErr,
   cipherCode,
   cipherArgName,
+  loggedIn,
 ) {
   if (!pageResp) {
     const pd = await fetchPageData(videoId);
@@ -1665,7 +2610,7 @@ async function pageScrapeWithCipher(
     playerUrl = playerUrl || pd.playerUrl;
     if (playerUrl && !sig) {
       try {
-        sig = await loadSignatureData(playerUrl);
+        sig = await loadSignatureData(playerUrl, videoId);
       } catch (e) {}
     }
   }
@@ -1827,10 +2772,11 @@ async function pageScrapeWithCipher(
     thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
     formats,
     clientUsed: "page_scrape",
+    loggedIn: loggedIn || false,
   };
 }
 
-async function loadSignatureData(playerUrl) {
+async function loadSignatureData(playerUrl, videoId = null) {
   if (sigCache.has(playerUrl)) {
     const c = sigCache.get(playerUrl);
     if (Date.now() < c.expiresAt) return c;
@@ -1870,8 +2816,54 @@ async function loadSignatureData(playerUrl) {
     throw lastFetchErr || new Error("Player.js load failed");
   }
 
-  const actionList = extractCipherActions(js);
+  // Also try to fetch the YouTube watch-page HTML to find cipher helper
+  // (2025+ architecture: helper defined in inline <script> tags, not in base.js).
+  // The homepage (youtube.com/) does NOT contain these inline scripts —
+  // we need the actual watch page (youtube.com/watch?v=ID).
+  let pageHtml = null;
+  if (videoId) {
+    try {
+      const pageUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      const pageResp = await fetch(pageUrl, { cache: "force-cache" });
+      if (pageResp.ok) {
+        pageHtml = await pageResp.text();
+        console.log(
+          "[BG] Watch-page HTML loaded for cipher helper extraction:",
+          pageHtml.length,
+          "bytes",
+        );
+      }
+    } catch (e) {
+      console.warn(
+        "[BG] Could not fetch watch-page HTML for cipher helper:",
+        e.message,
+      );
+    }
+  }
+
+  const actionList = extractCipherActions(js, pageHtml);
   const nSigCode = extractNSigCode(js);
+
+  // yt-dlp style: bundle N-sig with all its dependencies for robust sandbox eval
+  let nSigBundled = null;
+  if (nSigCode) {
+    try {
+      nSigBundled = bundleNSigWithDeps(js);
+      if (nSigBundled && nSigBundled !== nSigCode) {
+        console.log(
+          "[BG] yt-dlp bundled N-sig available (" +
+            nSigBundled.length +
+            "ch vs " +
+            nSigCode.length +
+            "ch plain)",
+        );
+      } else {
+        nSigBundled = null; // No benefit, skip
+      }
+    } catch (e) {
+      console.warn("[BG] yt-dlp N-sig bundling failed:", e.message);
+    }
+  }
 
   let cipherCode = null;
   let cipherArgName = null;
@@ -1904,6 +2896,7 @@ async function loadSignatureData(playerUrl) {
   const data = {
     actionList,
     nSigCode,
+    nSigBundled,
     cipherCode,
     cipherArgName,
     sts,
@@ -1920,13 +2913,248 @@ async function loadSignatureData(playerUrl) {
         : "none",
     "| N-sig:",
     nSigCode ? nSigCode.length + "ch" : "none",
+    nSigBundled ? "(bundled: " + nSigBundled.length + "ch)" : "",
     "| STS:",
     sts,
   );
   return data;
 }
 
-function extractCipherActions(js) {
+// === New-style dispatch cipher extraction (2025+) ===
+// YouTube now uses a dispatch function with a lookup array and a helper
+// object containing reverse/splice/swap methods, all referenced via
+// array indices rather than literal property names.
+// The helper object (e.g., eO) is defined in inline <script> tags on
+// the YouTube page, NOT in player.js (base.js). We search both.
+function extractDispatchCipherActions(
+  js,
+  cipherFuncName,
+  dispatchValue,
+  pageHtml,
+) {
+  // Step 1: Find lookup array: var NAME = "...".split("DELIM") with 50+ elements
+  const lookupArrayRe =
+    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+  let lookupArray = null,
+    lookupName = null,
+    lm;
+  while ((lm = lookupArrayRe.exec(js)) !== null) {
+    const parts = lm[2].split(lm[3]);
+    if (parts.length > 50) {
+      lookupArray = parts;
+      lookupName = lm[1];
+      break;
+    }
+  }
+  if (!lookupArray || !lookupName) return null;
+
+  // Step 2: Find cipher function definition
+  const funcDefIdx = js.indexOf(cipherFuncName + "=function(");
+  if (funcDefIdx === -1) return null;
+  const braceIdx = js.indexOf("{", funcDefIdx);
+  const funcBody = extractBraceBlock(js, braceIdx);
+  if (!funcBody) return null;
+
+  // Step 3: Find calls to helper object via lookup: OBJ[LOOKUP[IDX]](VAR, NUM)
+  const lookupEsc = escRe(lookupName);
+  const helperCallRe = new RegExp(
+    `([a-zA-Z0-9$_]+)\\[${lookupEsc}\\[(\\d+)\\]\\]\\s*\\(\\s*([a-zA-Z0-9$_]+)\\s*,\\s*(\\d+)\\s*\\)`,
+    "g",
+  );
+  const calls = [];
+  let hm;
+  while ((hm = helperCallRe.exec(funcBody)) !== null) {
+    calls.push({
+      obj: hm[1],
+      methodName: lookupArray[parseInt(hm[2])],
+      arg: parseInt(hm[4]),
+    });
+  }
+  if (!calls.length) return null;
+
+  // Step 4: Find helper object definition — search BOTH player.js AND page HTML
+  const helperName = calls[0].obj;
+  let helperBlock = null;
+
+  // Try player.js first
+  const helperDefMatch = js.match(
+    new RegExp(`(?:var\\s+|[;,]\\s*)${escRe(helperName)}\\s*=\\s*\\{`),
+  );
+  if (helperDefMatch) {
+    const helperBraceIdx = js.indexOf(
+      "{",
+      helperDefMatch.index + helperDefMatch[0].lastIndexOf("=") + 1,
+    );
+    helperBlock = extractBraceBlock(js, helperBraceIdx);
+  }
+
+  // If not found in player.js, try page HTML (inline scripts)
+  if (!helperBlock && pageHtml) {
+    console.log(
+      "[BG] Cipher helper '" +
+        helperName +
+        "' not in player.js — searching page HTML",
+    );
+    const htmlHelperRe = new RegExp(
+      `(?:var\\s+)?${escRe(helperName)}\\s*=\\s*\\{`,
+    );
+    const htmlMatch = htmlHelperRe.exec(pageHtml);
+    if (htmlMatch) {
+      const htmlBraceIdx = htmlMatch.index + htmlMatch[0].lastIndexOf("{");
+      helperBlock = extractBraceBlock(pageHtml, htmlBraceIdx);
+      if (helperBlock) {
+        console.log(
+          "[BG] Cipher helper found in page HTML:",
+          helperBlock.length,
+          "chars",
+        );
+      }
+    }
+  }
+
+  if (!helperBlock) {
+    console.warn(
+      "[BG] Cipher helper '" +
+        helperName +
+        "' not found in player.js or page HTML",
+    );
+    return null;
+  }
+
+  // Step 5: Map method names to operation types by structural analysis
+  const types = {};
+  // Match all method patterns: traditional, shorthand, arrow
+  const methodPatterns = [
+    /([a-zA-Z0-9$_]+)\s*:\s*function\s*\([^)]*\)\s*\{/g,
+    /([a-zA-Z0-9$_]+)\s*\([^)]*\)\s*\{/g,
+    /([a-zA-Z0-9$_]+)\s*:\s*\([^)]*\)\s*=>\s*\{/g,
+  ];
+  for (const mre of methodPatterns) {
+    let mm;
+    while ((mm = mre.exec(helperBlock)) !== null) {
+      const localBraceIdx = mm.index + mm[0].lastIndexOf("{");
+      const methodBody = extractBraceBlock(helperBlock, localBraceIdx);
+      if (!methodBody) continue;
+      if (/\[\s*0\s*\]\s*=/.test(methodBody) && /\w+\s*%/.test(methodBody))
+        types[mm[1]] = "swap";
+      else if (
+        /\.splice\s*\(/.test(methodBody) ||
+        /\(0\s*,\s*\w+\)/.test(methodBody)
+      )
+        types[mm[1]] = "splice";
+      else if (/\.reverse\s*\(/.test(methodBody)) types[mm[1]] = "reverse";
+      else types[mm[1]] = "reverse"; // default: reverse doesn't have distinguishing patterns
+    }
+  }
+
+  // Step 6: Build action list
+  const actions = [];
+  for (const call of calls) {
+    const type = types[call.methodName];
+    if (type) actions.push([type, type === "reverse" ? null : call.arg]);
+  }
+  if (actions.length > 0) {
+    console.log(
+      "[BG] Cipher via dispatch:",
+      cipherFuncName + "(" + dispatchValue + ") →",
+      actions
+        .map((a) => a[0] + (a[1] != null ? "(" + a[1] + ")" : ""))
+        .join(", "),
+    );
+    return actions;
+  }
+  return null;
+}
+
+function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue) {
+  // Find lookup array raw definition
+  const lookupMatch = js.match(
+    /var\s+([a-zA-Z0-9$_]+)\s*=\s*("([^"]{200,})")\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/,
+  );
+  if (!lookupMatch) return null;
+  const lookupName = lookupMatch[1];
+  const parts = lookupMatch[3].split(lookupMatch[4]);
+  if (parts.length < 50) return null;
+
+  // Find cipher function definition
+  const funcDefIdx = js.indexOf(cipherFuncName + "=function(");
+  if (funcDefIdx === -1) return null;
+  const braceIdx = js.indexOf("{", funcDefIdx);
+  const funcBody = extractBraceBlock(js, braceIdx);
+  if (!funcBody) return null;
+
+  // Get param list
+  const paramMatch = js.slice(funcDefIdx).match(/=function\s*\(([^)]+)\)/);
+  if (!paramMatch) return null;
+
+  // Find helper object name from function body
+  const lookupEsc = escRe(lookupName);
+  const helperRefRe = new RegExp(`([a-zA-Z0-9$_]+)\\[${lookupEsc}\\[`);
+  const helperRefMatch = funcBody.match(helperRefRe);
+  if (!helperRefMatch) return null;
+  const helperName = helperRefMatch[1];
+
+  // Find helper object definition
+  const helperDefMatch = js.match(
+    new RegExp(`(?:var\\s+|[;,]\\s*)${escRe(helperName)}\\s*=\\s*\\{`),
+  );
+  if (!helperDefMatch) return null;
+  const helperBraceIdx = js.indexOf(
+    "{",
+    helperDefMatch.index + helperDefMatch[0].lastIndexOf("=") + 1,
+  );
+  const helperBlock = extractBraceBlock(js, helperBraceIdx);
+  if (!helperBlock) return null;
+
+  // Build self-contained code with a unique arg name
+  const argName = "_sig_";
+  const code =
+    "var " +
+    lookupName +
+    "=" +
+    lookupMatch[2] +
+    '.split("' +
+    lookupMatch[4] +
+    '");\n' +
+    "var " +
+    helperName +
+    "=" +
+    helperBlock +
+    ";\n" +
+    "var " +
+    cipherFuncName +
+    "=function" +
+    paramMatch[0].slice(paramMatch[0].indexOf("(")) +
+    funcBody +
+    ";\n" +
+    "return " +
+    cipherFuncName +
+    "(" +
+    dispatchValue +
+    ", " +
+    argName +
+    ");";
+
+  console.log("[BG] Raw dispatch cipher:", code.length, "chars");
+  return { code, argName };
+}
+
+function extractCipherActions(js, pageHtml) {
+  // === Try new-style dispatch cipher first (2025+) ===
+  const dispatchCallMatch = js.match(
+    /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
+  );
+  if (dispatchCallMatch) {
+    const actions = extractDispatchCipherActions(
+      js,
+      dispatchCallMatch[1],
+      parseInt(dispatchCallMatch[2]),
+      pageHtml,
+    );
+    if (actions) return actions;
+  }
+
+  // === Legacy patterns (pre-2025) ===
   let fn = null;
   const namePatterns = [
     /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
@@ -2043,6 +3271,20 @@ function extractCipherActions(js) {
 }
 
 function extractRawCipherCode(js) {
+  // === Try new-style dispatch cipher first (2025+) ===
+  const dispatchCallMatch = js.match(
+    /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
+  );
+  if (dispatchCallMatch) {
+    const raw = extractDispatchCipherRaw(
+      js,
+      dispatchCallMatch[1],
+      dispatchCallMatch[2],
+    );
+    if (raw) return raw;
+  }
+
+  // === Legacy patterns (pre-2025) ===
   // Try traditional function first, then arrow function
   const splitJoinPatterns = [
     /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
@@ -2165,45 +3407,89 @@ function extractNSigCode(js) {
   let fn = null,
     arrIdx = null;
 
-  const nPatterns = [
-    /\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\([a-zA-Z0-9]\)/,
+  // === 2025+ patterns: lookup-array-based references ===
+  // YouTube now uses l[33]="n", l[42]="get", l[20]="set" instead of literal strings
+  // Pattern: WRAPPER[0](x), VAR[l[SET_IDX]](l[N_IDX], x) or VAR.set("n", x)
+  const lookupArrayRe =
+    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/;
+  const lookupMatch = js.match(lookupArrayRe);
+  if (lookupMatch) {
+    const lookupArray = lookupMatch[2].split(lookupMatch[3]);
+    const nIdx = lookupArray.indexOf("n");
+    const setIdx = lookupArray.indexOf("set");
 
-    /[=(,&|]([a-zA-Z0-9$]+)\(\w+\),\w+\.set\("n",/,
-
-    /[=(,&|]([a-zA-Z0-9$]+)\[(\d+)\]\(\w+\),\w+\.set\("n",/,
-
-    /\.set\("n",\s*([a-zA-Z0-9$]+)\(\s*\w+\s*\)/,
-
-    // Only match decodeURIComponent patterns when near .get("n") context
-    /\.get\("n"\).*?&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/s,
-
-    /\w+=\w+\.get\("n"\)[^}]*\w+&&\(\w+=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(\w+\)/,
-
-    // Newer patterns (2025+)
-    /\.get\("n"\)\s*\)\s*[;,].*?\.set\("n"\s*,\s*([a-zA-Z0-9$]+)\s*\(/s,
-
-    /\.get\("n"\)\)&&.*?[=(,]([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(/,
-
-    /([a-zA-Z0-9$]+)\(\w+\.get\("n"\)\)[,;].*?\.set\("n"/,
-
-    // URL path /n/ replacement pattern (anchored to .set("n") context)
-    /\.set\("n"[^)]*\).*?\/n\/[^/]+.*?([a-zA-Z0-9$]+)\s*\(\s*\w+\s*\)/s,
-  ];
-
-  for (let idx = 0; idx < nPatterns.length; idx++) {
-    const m = js.match(nPatterns[idx]);
-    if (m) {
-      fn = m[1];
-      arrIdx = m[2] != null ? parseInt(m[2]) : null;
-      console.log(
-        "[BG] N-sig name found with pattern",
-        idx,
-        ":",
-        fn,
-        "arrIdx:",
-        arrIdx,
+    if (nIdx !== -1 && setIdx !== -1) {
+      // Search for: WRAPPER[0](x) near l[nIdx] context
+      const lookupName = lookupMatch[1];
+      const wrapperRe = new RegExp(
+        "([a-zA-Z0-9$_]+)\\[0\\]\\s*\\(\\s*(\\w+)\\s*\\)",
+        "g",
       );
-      break;
+      let wm;
+      while ((wm = wrapperRe.exec(js)) !== null) {
+        const ctx = js.substring(
+          Math.max(0, wm.index - 100),
+          Math.min(js.length, wm.index + 200),
+        );
+        if (
+          ctx.indexOf(lookupName + "[" + nIdx + "]") !== -1 ||
+          ctx.indexOf('"n"') !== -1
+        ) {
+          fn = wm[1];
+          arrIdx = 0;
+          console.log(
+            "[BG] N-sig wrapper found via lookup pattern:",
+            fn,
+            "[0]",
+          );
+          break;
+        }
+      }
+    }
+  }
+
+  // === Legacy patterns (pre-2025) ===
+  if (!fn) {
+    const nPatterns = [
+      /\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\([a-zA-Z0-9]\)/,
+
+      /[=(,&|]([a-zA-Z0-9$]+)\(\w+\),\w+\.set\("n",/,
+
+      /[=(,&|]([a-zA-Z0-9$]+)\[(\d+)\]\(\w+\),\w+\.set\("n",/,
+
+      /\.set\("n",\s*([a-zA-Z0-9$]+)\(\s*\w+\s*\)/,
+
+      // Only match decodeURIComponent patterns when near .get("n") context
+      /\.get\("n"\).*?&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/s,
+
+      /\w+=\w+\.get\("n"\)[^}]*\w+&&\(\w+=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(\w+\)/,
+
+      // Newer patterns (2025+)
+      /\.get\("n"\)\s*\)\s*[;,].*?\.set\("n"\s*,\s*([a-zA-Z0-9$]+)\s*\(/s,
+
+      /\.get\("n"\)\)&&.*?[=(,]([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(/,
+
+      /([a-zA-Z0-9$]+)\(\w+\.get\("n"\)\)[,;].*?\.set\("n"/,
+
+      // URL path /n/ replacement pattern (anchored to .set("n") context)
+      /\.set\("n"[^)]*\).*?\/n\/[^/]+.*?([a-zA-Z0-9$]+)\s*\(\s*\w+\s*\)/s,
+    ];
+
+    for (let idx = 0; idx < nPatterns.length; idx++) {
+      const m = js.match(nPatterns[idx]);
+      if (m) {
+        fn = m[1];
+        arrIdx = m[2] != null ? parseInt(m[2]) : null;
+        console.log(
+          "[BG] N-sig name found with pattern",
+          idx,
+          ":",
+          fn,
+          "arrIdx:",
+          arrIdx,
+        );
+        break;
+      }
     }
   }
 
@@ -2372,6 +3658,499 @@ function extractNSigCode(js) {
   return null;
 }
 
+// ============================================================
+// yt-dlp-style N-sig dependency bundler
+// ============================================================
+// When YouTube's N-sig function references helper functions and variables
+// defined elsewhere in player.js (inside the IIFE), sandbox eval fails with
+// "X is not defined" errors. This function extracts the N-sig function AND
+// all its dependencies (helper functions, internal lookup arrays, constants)
+// into a single self-contained code string that the sandbox can execute.
+//
+// This mirrors yt-dlp's _extract_n_function_code() approach, which:
+// 1. Finds the N-sig function
+// 2. Identifies free variables (references to IIFE-scoped identifiers)
+// 3. Recursively extracts their definitions from player.js
+// 4. Bundles everything into a standalone script
+// ============================================================
+
+function bundleNSigWithDeps(js) {
+  // Step 1: Find N-sig function name the same way extractNSigCode does
+  const nSigCode = extractNSigCode(js);
+  if (!nSigCode) return null;
+
+  // Step 2: Find the N-sig function name again (we need it for the dependency scan)
+  let nSigFuncName = null;
+  const lookupArrayRe =
+    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/;
+  const lookupMatch = js.match(lookupArrayRe);
+
+  // Try to find the function name from the lookup-based pattern first
+  if (lookupMatch) {
+    const lookupArray = lookupMatch[2].split(lookupMatch[3]);
+    const nIdx = lookupArray.indexOf("n");
+    const lookupName = lookupMatch[1];
+    if (nIdx !== -1) {
+      const wrapperRe = new RegExp(
+        "([a-zA-Z0-9$_]+)\\[0\\]\\s*\\(\\s*(\\w+)\\s*\\)",
+        "g",
+      );
+      let wm;
+      while ((wm = wrapperRe.exec(js)) !== null) {
+        const ctx = js.substring(
+          Math.max(0, wm.index - 100),
+          Math.min(js.length, wm.index + 200),
+        );
+        if (
+          ctx.indexOf(lookupName + "[" + nIdx + "]") !== -1 ||
+          ctx.indexOf('"n"') !== -1
+        ) {
+          // Found wrapper name, resolve to actual function name
+          const wrapperName = wm[1];
+          const arrMatch = js.match(
+            new RegExp(
+              `[,;\\n]\\s*${escRe(wrapperName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
+            ),
+          );
+          if (arrMatch) {
+            nSigFuncName = arrMatch[1].split(",")[0].trim();
+          } else {
+            nSigFuncName = wrapperName;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Fallback: try to find it from the nSigCode by matching function definitions
+  if (!nSigFuncName) {
+    // The nSigCode string is "function(a){...}" — find which named function matches
+    const nPatterns = [
+      /\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\([a-zA-Z0-9]\)/,
+      /[=(,&|]([a-zA-Z0-9$]+)\(\w+\),\w+\.set\("n",/,
+      /\.set\("n",\s*([a-zA-Z0-9$]+)\(\s*\w+\s*\)/,
+    ];
+    for (const re of nPatterns) {
+      const m = js.match(re);
+      if (m) {
+        nSigFuncName = m[1];
+        // Resolve array wrapper
+        if (m[2] != null) {
+          const arrMatch = js.match(
+            new RegExp(
+              `[,;\\n]\\s*${escRe(nSigFuncName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
+            ),
+          );
+          if (arrMatch) {
+            const items = arrMatch[1].split(",");
+            nSigFuncName = items[parseInt(m[2])]?.trim() || nSigFuncName;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  if (!nSigFuncName) {
+    console.warn("[BG] yt-dlp bundler: Could not identify N-sig function name");
+    return nSigCode; // Fall back to unbundled code
+  }
+
+  console.log(
+    "[BG] yt-dlp bundler: N-sig function is",
+    nSigFuncName,
+    "— scanning dependencies...",
+  );
+
+  // Step 3: Find the N-sig function's definition position and body in player.js
+  const funcBodyResult = findFunctionDefinition(js, nSigFuncName);
+  if (!funcBodyResult) {
+    console.warn(
+      "[BG] yt-dlp bundler: Could not locate",
+      nSigFuncName,
+      "definition in player.js",
+    );
+    return nSigCode;
+  }
+
+  // Step 4: Collect all dependencies recursively
+  // Build a set of JS builtins and known names to skip
+  const BUILTINS = new Set([
+    "undefined",
+    "null",
+    "true",
+    "false",
+    "NaN",
+    "Infinity",
+    "Math",
+    "String",
+    "Array",
+    "Object",
+    "Number",
+    "Boolean",
+    "RegExp",
+    "Date",
+    "JSON",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "encodeURIComponent",
+    "decodeURIComponent",
+    "atob",
+    "btoa",
+    "console",
+    "window",
+    "self",
+    "globalThis",
+    "this",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "Promise",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Symbol",
+    "Proxy",
+    "Reflect",
+    "arguments",
+    "eval",
+    "Function",
+    "Uint8Array",
+    "Int32Array",
+    "Float64Array",
+    "ArrayBuffer",
+    "DataView",
+    "TextEncoder",
+    "TextDecoder",
+    // JS keywords
+    "var",
+    "let",
+    "const",
+    "function",
+    "return",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "new",
+    "delete",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "void",
+    "with",
+    "yield",
+    "async",
+    "await",
+    "class",
+    "extends",
+    "super",
+    "import",
+    "export",
+    "default",
+    "from",
+    "as",
+  ]);
+
+  const extracted = new Map(); // name → { code, startIdx, endIdx }
+  const visited = new Set();
+  const extractionOrder = [];
+
+  // Recursive dependency extraction
+  function extractDeps(funcName, depth) {
+    if (depth > 15) return; // Prevent infinite recursion
+    if (visited.has(funcName)) return;
+    visited.add(funcName);
+
+    const def = findFunctionDefinition(js, funcName);
+    if (!def) {
+      // Try to find as a variable/object definition instead
+      const varDef = findVarDefinition(js, funcName);
+      if (varDef) {
+        extracted.set(funcName, varDef);
+        extractionOrder.push(funcName);
+        // Scan variable value for further dependencies
+        scanAndExtractDeps(varDef.code, funcName, depth + 1);
+      }
+      return;
+    }
+
+    extracted.set(funcName, def);
+    extractionOrder.push(funcName);
+
+    // Scan function body for references to other functions/variables
+    scanAndExtractDeps(def.body, funcName, depth + 1);
+  }
+
+  function scanAndExtractDeps(code, parentName, depth) {
+    // Find all identifier references that could be IIFE-scoped dependencies
+    // Pattern: identifiers used as function calls or property accesses
+    const identRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]*)\s*(?:\(|\[|\.\w)/g;
+    let im;
+    const candidates = new Set();
+    while ((im = identRe.exec(code)) !== null) {
+      const name = im[1];
+      if (BUILTINS.has(name)) continue;
+      if (name === parentName) continue; // self-reference
+      if (name.length === 1 && /[a-z]/.test(name)) continue; // single lowercase = likely param
+      candidates.add(name);
+    }
+
+    // Also find plain identifier assignments/references
+    const assignRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]{1,})\b/g;
+    let am;
+    while ((am = assignRe.exec(code)) !== null) {
+      const name = am[1];
+      if (BUILTINS.has(name)) continue;
+      if (name === parentName) continue;
+      // Only consider names that appear as function calls or assignments
+      if (
+        code.includes(name + "(") ||
+        code.includes(name + "[") ||
+        code.includes(name + ".")
+      ) {
+        candidates.add(name);
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (!visited.has(candidate)) {
+        extractDeps(candidate, depth);
+      }
+    }
+  }
+
+  // Start recursive extraction from the N-sig function
+  extractDeps(nSigFuncName, 0);
+
+  if (extracted.size <= 1) {
+    // Only the function itself, no deps found — bundle won't help
+    console.log(
+      "[BG] yt-dlp bundler: No additional dependencies found — using plain extraction",
+    );
+    return nSigCode;
+  }
+
+  // Step 5: Build the bundled self-contained code
+  const depDeclarations = [];
+  for (const name of extractionOrder) {
+    if (name === nSigFuncName) continue; // Main function goes last
+    const dep = extracted.get(name);
+    if (dep) depDeclarations.push(dep.code);
+  }
+
+  // The main N-sig function, wrapped so it can be called standalone
+  const mainDef = extracted.get(nSigFuncName);
+  const mainFuncCode = mainDef
+    ? mainDef.code
+    : `var ${nSigFuncName} = ${nSigCode};`;
+
+  // Build the bundle:
+  // (function(){
+  //   var dep1 = ...;
+  //   var dep2 = function(){...};
+  //   var nSigFunc = function(a){...};
+  //   return nSigFunc;
+  // })()
+  const bundled =
+    "(function(){\n" +
+    depDeclarations.join("\n") +
+    "\n" +
+    mainFuncCode +
+    "\n" +
+    "return " +
+    nSigFuncName +
+    ";\n" +
+    "})()";
+
+  console.log(
+    "[BG] yt-dlp bundler: Bundled N-sig with",
+    extracted.size - 1,
+    "dependencies (",
+    bundled.length,
+    "chars)",
+  );
+
+  return bundled;
+}
+
+// Find a function definition in player.js by name.
+// Returns { code, body, startIdx, endIdx } or null.
+function findFunctionDefinition(js, name) {
+  const esc = escRe(name);
+  const patterns = [
+    // var X = function(a) {
+    new RegExp(
+      `(?:var|let|const)\\s+${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+      "g",
+    ),
+    // X = function(a) {
+    new RegExp(
+      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+      "gm",
+    ),
+    // function X(a) {
+    new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
+    // var X = (a) => {
+    new RegExp(
+      `(?:var|let|const)\\s+${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
+      "g",
+    ),
+    // X = (a) => {
+    new RegExp(
+      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
+      "gm",
+    ),
+    // var X = a => {
+    new RegExp(
+      `(?:var|let|const)\\s+${esc}\\s*=\\s*([a-zA-Z_$]\\w*)\\s*=>\\s*\\{`,
+      "g",
+    ),
+    // X = a => {
+    new RegExp(
+      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*([a-zA-Z_$]\\w*)\\s*=>\\s*\\{`,
+      "gm",
+    ),
+  ];
+
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(js)) !== null) {
+      const braceIdx = m.index + m[0].lastIndexOf("{");
+      const body = extractBraceBlock(js, braceIdx);
+      if (!body) continue;
+      // Skip very tiny matches (likely false positives)
+      if (body.length < 10) continue;
+
+      const params = m[1];
+      const fullCode = `var ${name} = function(${params})${body};`;
+      return {
+        code: fullCode,
+        body,
+        params,
+        startIdx: m.index,
+        endIdx: braceIdx + body.length,
+      };
+    }
+  }
+  return null;
+}
+
+// Find a variable/constant/object definition in player.js by name.
+// Returns { code } or null.
+function findVarDefinition(js, name) {
+  const esc = escRe(name);
+
+  // Pattern 1: Object literal — var X = { ... }
+  const objRe = new RegExp(
+    `(?:var|let|const|[;,\\n])\\s*${esc}\\s*=\\s*\\{`,
+    "gm",
+  );
+  let m = objRe.exec(js);
+  if (m) {
+    const braceIdx = m.index + m[0].lastIndexOf("{");
+    const block = extractBraceBlock(js, braceIdx);
+    if (block && block.length > 2) {
+      return { code: `var ${name} = ${block};` };
+    }
+  }
+
+  // Pattern 2: Array literal — var X = [ ... ]
+  const arrRe = new RegExp(
+    `(?:var|let|const|[;,\\n])\\s*${esc}\\s*=\\s*\\[`,
+    "gm",
+  );
+  m = arrRe.exec(js);
+  if (m) {
+    const bracketIdx = m.index + m[0].lastIndexOf("[");
+    // Extract bracket block (similar to brace block but for [])
+    const block = extractBracketBlock(js, bracketIdx);
+    if (block) {
+      return { code: `var ${name} = ${block};` };
+    }
+  }
+
+  // Pattern 3: Simple value — var X = EXPR;
+  const valRe = new RegExp(
+    `(?:var|let|const)\\s+${esc}\\s*=\\s*([^;{\\n]+);`,
+    "gm",
+  );
+  m = valRe.exec(js);
+  if (m) {
+    const value = m[1].trim();
+    // Skip if value is too long (likely a false match)
+    if (value.length < 500) {
+      return { code: `var ${name} = ${value};` };
+    }
+  }
+
+  // Pattern 4: Comma-separated in var statement — var ..., X = EXPR, ...
+  const commaRe = new RegExp(`[,]\\s*${esc}\\s*=\\s*([^,;{\\n]+)[,;]`, "gm");
+  m = commaRe.exec(js);
+  if (m) {
+    const value = m[1].trim();
+    if (value.length < 500) {
+      return { code: `var ${name} = ${value};` };
+    }
+  }
+
+  return null;
+}
+
+// Extract a balanced bracket block [...] from code starting at pos
+function extractBracketBlock(code, pos) {
+  if (code[pos] !== "[") return null;
+  let d = 0,
+    inStr = false,
+    sc = "",
+    esc = false;
+  for (let i = pos; i < code.length && i < pos + 100000; i++) {
+    const c = code[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (c === "\\") {
+      esc = true;
+      continue;
+    }
+    if (inStr) {
+      if (c === sc) inStr = false;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = true;
+      sc = c;
+      continue;
+    }
+    if (c === "[") d++;
+    if (c === "]") {
+      d--;
+      if (d === 0) return code.substring(pos, i + 1);
+    }
+  }
+  return null;
+}
+
 function extractBraceBlock(code, pos) {
   if (code[pos] !== "{") return null;
   let d = 0,
@@ -2445,7 +4224,8 @@ async function resumeMergeFromState(mergeState) {
   );
 
   // Re-fetch fresh formats — old URLs will have expired
-  const info = await getFormats(videoId, {});
+  const resumeTabId = findTabIdForVideoId(videoId);
+  const info = await getFormats(videoId, {}, resumeTabId);
   if (!info?.formats?.length) {
     throw new Error("Could not re-fetch video formats");
   }
@@ -2480,7 +4260,16 @@ async function resumeMergeFromState(mergeState) {
 }
 
 async function doMergedDownload(msg) {
-  const { videoUrl, audioUrl, filename, videoItag, audioItag, videoId } = msg;
+  const {
+    videoUrl,
+    audioUrl,
+    filename,
+    videoItag,
+    audioItag,
+    videoId,
+    videoTitle,
+    videoThumbnail,
+  } = msg;
 
   if (!videoUrl || !audioUrl) {
     throw new Error("Both video and audio URLs required");
@@ -2509,6 +4298,9 @@ async function doMergedDownload(msg) {
         status: "active",
         phase: "starting",
         percent: 0,
+        // Store video metadata for persistent display
+        videoTitle: videoTitle || null,
+        videoThumbnail: videoThumbnail || null,
       },
     })
     .catch(() => {});
@@ -2752,8 +4544,12 @@ const MIN_MEDIA_SIZE = 100 * 1024;
 
 function isYouTubeTab(tabId) {
   const data = tabData.get(tabId);
-  if (data?.videoId) return true;
-  return false;
+  if (!data?.videoId) return false;
+  // Specialist/generic extractor tabs are NOT YouTube — don't block sniffer
+  if (injectedTabs.has(tabId)) return false;
+  const client = data.info?.clientUsed || '';
+  if (client && client !== 'inject.js' && client !== 'page_deciphered') return false;
+  return true;
 }
 
 function getTabHost(tabId) {
@@ -2800,18 +4596,49 @@ chrome.webRequest.onResponseStarted.addListener(
     let streamType = null;
     const baseType = contentType.split(";")[0].trim();
 
+    // Known proxy/CDN domains used by streaming sites
+    const PROXY_STREAM_DOMAINS = [
+      "vodvidl.site",
+      "rabbitstream",
+      "megacloud",
+      "vidplay",
+      "filemoon",
+      "dokicloud",
+      "rapid-cloud",
+      "vidstreaming",
+      "trueparadise.workers.dev",
+      "tigerflare",
+      "videasy.net",
+    ];
+    const isProxyDomain = PROXY_STREAM_DOMAINS.some((d) =>
+      details.url.includes(d),
+    );
+
     if (
       baseType === "application/vnd.apple.mpegurl" ||
       baseType === "application/x-mpegurl" ||
       baseType === "video/m3u8" ||
-      details.url.match(/\.m3u8(\?|$)/i)
+      details.url.match(/\.m3u8(\?|#|$)/i) ||
+      (details.url.match(/m3u8/i) && isProxyDomain) ||
+      (isProxyDomain &&
+        /proxy|stream|video|manifest|playlist|master|hls/i.test(details.url))
     ) {
       streamType = "hls";
     } else if (
       baseType === "application/dash+xml" ||
-      details.url.match(/\.mpd(\?|$)/i)
+      details.url.match(/\.mpd(\?|#|$)/i) ||
+      (isProxyDomain && /dash|\.mpd/i.test(details.url))
     ) {
       streamType = "dash";
+    } else if (
+      isProxyDomain &&
+      (baseType === "text/plain" ||
+        baseType === "application/octet-stream" ||
+        baseType === "binary/octet-stream" ||
+        baseType === "application/binary")
+    ) {
+      // Proxy CDNs may serve HLS manifests with non-standard content types
+      streamType = "hls";
     } else if (SNIFF_MEDIA_TYPES.has(baseType)) {
       if (contentLength > 0 && contentLength < MIN_MEDIA_SIZE) return;
       streamType = "direct";
@@ -2898,19 +4725,169 @@ chrome.webRequest.onResponseStarted.addListener(
       `[SNIFFER] ${streamType} detected on tab ${details.tabId}:`,
       details.url.substring(0, 120),
     );
+
+    // Auto-merge HLS/DASH streams into specialist tabData when present
+    if (
+      (streamType === "hls" || streamType === "dash") &&
+      (tabData.has(details.tabId) || injectedTabs.has(details.tabId))
+    ) {
+      mergeSniffedStreamIntoTabData(details.tabId, stream);
+    }
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"],
 );
 
+// ============ YouTube URL Sniffing (IDM-style) ============
+// Captures fully-decrypted googlevideo.com/videoplayback URLs that YouTube's
+// player.js generates. These URLs already have cipher & N-sig applied, so we
+// bypass the fragile extraction logic entirely when cipher/N-sig breaks.
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    if (!details.url.includes("/videoplayback")) return;
+
+    try {
+      const url = new URL(details.url);
+      const itag = parseInt(url.searchParams.get("itag"));
+      if (!itag) return;
+
+      // Only capture for YouTube tabs (tabData has videoId set)
+      if (!isYouTubeTab(details.tabId)) return;
+
+      const mime = decodeURIComponent(url.searchParams.get("mime") || "");
+      const clen = parseInt(url.searchParams.get("clen")) || 0;
+      const dur = parseFloat(url.searchParams.get("dur")) || 0;
+      const expire = parseInt(url.searchParams.get("expire")) || 0;
+
+      // Build a clean full-file URL (strip range= so we can download the whole thing)
+      const cleanUrl = new URL(details.url);
+      cleanUrl.searchParams.delete("range");
+      if (!cleanUrl.searchParams.has("ratebypass")) {
+        cleanUrl.searchParams.set("ratebypass", "yes");
+      }
+
+      if (!sniffedYouTubeUrls.has(details.tabId)) {
+        sniffedYouTubeUrls.set(details.tabId, new Map());
+      }
+
+      const tabSniffed = sniffedYouTubeUrls.get(details.tabId);
+      tabSniffed.set(itag, {
+        url: cleanUrl.toString(),
+        mime,
+        clen,
+        dur,
+        expire,
+        ts: Date.now(),
+      });
+
+      console.log(
+        `[YT-SNIFF] Captured itag ${itag} (${mime}) on tab ${details.tabId}`,
+        `— ${tabSniffed.size} URLs total`,
+      );
+    } catch {
+      // ignore parse errors
+    }
+  },
+  { urls: ["*://*.googlevideo.com/*"] },
+);
+
+// Build format objects from sniffed YouTube URLs using ITAG_MAP metadata.
+// Returns an array of format objects compatible with the existing format pipeline.
+function buildSniffedFormats(tabId) {
+  const tabSniffed = sniffedYouTubeUrls.get(tabId);
+  if (!tabSniffed || tabSniffed.size === 0) return [];
+
+  const formats = [];
+  const now = Math.floor(Date.now() / 1000);
+
+  for (const [itag, data] of tabSniffed) {
+    // Skip expired URLs
+    if (data.expire && data.expire < now) continue;
+
+    const lk = ITAG_MAP[itag];
+
+    // Reconstruct MIME type
+    let mimeType = data.mime || "";
+    if (!mimeType && lk) {
+      mimeType = (lk.V ? "video/" : "audio/") + lk.ct;
+    }
+    const codecs = lk ? [lk.vc, lk.ac].filter(Boolean).join(", ") : "";
+    if (codecs && !mimeType.includes("codecs")) {
+      mimeType += `; codecs="${codecs}"`;
+    }
+
+    const isVideo = lk ? !!lk.V : mimeType.startsWith("video/");
+    const isAudio = lk ? !!lk.A : mimeType.startsWith("audio/");
+
+    formats.push({
+      itag,
+      url: data.url,
+      mimeType,
+      quality: lk?.quality || `itag-${itag}`,
+      qualityLabel: lk?.quality || "",
+      width: lk?.w || 0,
+      height: lk?.h || 0,
+      fps: lk?.fps || 0,
+      bitrate: lk?.abr || 0,
+      audioBitrate: lk?.abr || 0,
+      audioQuality: isAudio ? "AUDIO_QUALITY_MEDIUM" : "",
+      contentLength: data.clen || null,
+      codecs,
+      isVideo,
+      isAudio,
+      isMuxed: lk ? !!lk.M : false,
+      clientUsed: "sniffed",
+    });
+  }
+
+  return formats;
+}
+
+// Replace format URLs with sniffed ones where itag matches.
+// This fixes formats that have correct metadata but broken URLs
+// (e.g. cipher worked but N-sig failed, leaving throttled n= values).
+function enrichFormatsWithSniffed(formats, tabId) {
+  const tabSniffed = sniffedYouTubeUrls.get(tabId);
+  if (!tabSniffed || tabSniffed.size === 0) return 0;
+
+  const now = Math.floor(Date.now() / 1000);
+  let replaced = 0;
+
+  for (const fmt of formats) {
+    const sniffed = tabSniffed.get(fmt.itag);
+    if (!sniffed) continue;
+    if (sniffed.expire && sniffed.expire < now) continue;
+
+    // Replace URL with sniffed version (already has correct cipher + N-sig)
+    fmt.url = sniffed.url;
+    if (sniffed.clen && !fmt.contentLength) {
+      fmt.contentLength = sniffed.clen;
+    }
+    replaced++;
+  }
+
+  return replaced;
+}
+
+// Helper: find tabId for a given videoId (for callers that don't have tabId)
+function findTabIdForVideoId(videoId) {
+  for (const [tabId, data] of tabData) {
+    if (data.videoId === videoId) return tabId;
+  }
+  return null;
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   sniffedStreams.delete(tabId);
+  sniffedYouTubeUrls.delete(tabId);
   contentHashes.delete(tabId);
 });
 
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0 && details.tabId >= 0) {
     sniffedStreams.delete(details.tabId);
+    sniffedYouTubeUrls.delete(details.tabId);
     contentHashes.delete(details.tabId);
   }
 });
@@ -2974,6 +4951,7 @@ const SITE_EXTRACTOR_MAP = {
   "therokuchannel.roku.com": "roku.js",
   "crackle.com": "crackle.js",
   "popcornflix.com": "popcornflix.js",
+  "popcornmovies.org": "popcornmovies.js",
   "flixtor.to": "flixtor.js",
   "vudu.com": "vudu.js",
   "amcplus.com": "amcplus.js",
@@ -3156,6 +5134,10 @@ async function injectSpecialist(tabId, scriptFile) {
     });
     injectedTabs.set(tabId, scriptFile);
     console.log(`[BG] Specialist injected: ${scriptFile} → tab ${tabId}`);
+
+    // Also inject network hooks into ALL frames (including cross-origin iframes)
+    // so we can catch m3u8/mpd requests from embed players like videasy.net
+    injectIframeHooks(tabId).catch(() => {});
   } catch (e) {
     if (
       !e.message?.includes("Cannot access") &&
@@ -3168,6 +5150,86 @@ async function injectSpecialist(tabId, scriptFile) {
     }
   }
 }
+
+/**
+ * Inject network hooks + relay into ALL frames of a tab.
+ * The MAIN-world hook intercepts XHR/fetch for m3u8/mpd URLs.
+ * The ISOLATED-world relay forwards detected URLs to background.js.
+ */
+async function injectIframeHooks(tabId) {
+  try {
+    // 1. Inject the generic network hook into ALL frames (MAIN world)
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ["hooks/generic-network-hook.js"],
+      world: "MAIN",
+      injectImmediately: true,
+    });
+
+    // 2. Inject a relay script into ALL frames (ISOLATED world)
+    //    Listens for postMessages from the MAIN-world hook and sends to background
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "ISOLATED",
+      func: function iframeStreamRelay() {
+        if (window.__iframeStreamRelayLoaded) return;
+        window.__iframeStreamRelayLoaded = true;
+
+        window.addEventListener("message", (event) => {
+          if (!event.data || event.source !== window) return;
+
+          // Relay generic network hook detections
+          if (event.data.type === "__generic_extractor__" && event.data.url) {
+            try {
+              chrome.runtime.sendMessage({
+                action: "IFRAME_STREAM_DETECTED",
+                url: event.data.url,
+                direct: event.data.direct || false,
+                mseDetected: event.data.mseDetected || false,
+                hlsContent: event.data.hlsContent || false,
+                proxyDetected: event.data.proxyDetected || false,
+                blobUrl: event.data.blobUrl || null,
+                frameUrl: window.location.href,
+              });
+            } catch {}
+          }
+
+          // Also relay MAGIC_M3U8_DETECTION from iframes
+          if (
+            event.data.type === "MAGIC_M3U8_DETECTION" &&
+            event.data.source === "SITE_SPECIALIST"
+          ) {
+            try {
+              chrome.runtime.sendMessage({
+                action: "SPECIALIST_DETECTED",
+                protocol: "MAGIC_M3U8",
+                payload: event.data.data,
+                pageUrl: window.location.href,
+              });
+            } catch {}
+          }
+        });
+      },
+    });
+
+    console.log(`[BG] Iframe hooks injected into all frames of tab ${tabId}`);
+  } catch (e) {
+    if (
+      !e.message?.includes("Cannot access") &&
+      !e.message?.includes("No tab")
+    ) {
+      console.debug(`[BG] Iframe hook injection note:`, e.message);
+    }
+  }
+}
+
+// Re-inject iframe hooks when new sub-frames start loading on specialist tabs
+// onCommitted fires earlier than onCompleted, so hooks are in place before JS runs
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId === 0) return; // only sub-frames
+  if (!injectedTabs.has(details.tabId)) return; // only specialist tabs
+  injectIframeHooks(details.tabId).catch(() => {});
+});
 
 chrome.webNavigation.onCommitted.addListener(
   (details) => {
@@ -3386,10 +5448,461 @@ async function onSpecialistDetected(msg, tabId) {
     });
   }
 
+  // For HLS formats, try to parse the master playlist to extract quality variants
+  const hlsFormats = formats.filter((f) => f.isHLS && f.url);
+  if (hlsFormats.length > 0) {
+    for (const hlsFmt of hlsFormats) {
+      try {
+        const variants = await parseHLSMasterPlaylist(hlsFmt.url);
+        if (variants && variants.length > 1) {
+          console.log(`[BG] Parsed ${variants.length} HLS quality variants`);
+          // Remove the original "auto" HLS entry and replace with variants
+          const hlsIdx = formats.indexOf(hlsFmt);
+          if (hlsIdx >= 0) formats.splice(hlsIdx, 1);
+
+          // Add auto/best quality entry first
+          formats.unshift({
+            url: hlsFmt.url,
+            mimeType: hlsFmt.mimeType,
+            quality: "auto",
+            qualityLabel: "Auto (Best)",
+            isVideo: true,
+            isMuxed: true,
+            ext: "mp4",
+            isHLS: true,
+            itag: syntheticItag++,
+          });
+
+          // Add each variant as a separate format
+          for (const v of variants) {
+            formats.push({
+              url: v.url,
+              mimeType: "application/x-mpegurl",
+              quality: v.quality,
+              qualityLabel: v.qualityLabel,
+              width: v.width || 0,
+              height: v.height || 0,
+              bitrate: v.bandwidth || 0,
+              isVideo: true,
+              isMuxed: true,
+              ext: "mp4",
+              isHLS: true,
+              itag: syntheticItag++,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("[BG] Failed to parse HLS master playlist:", e.message);
+      }
+    }
+    // Re-store with updated formats
+    info.formats = formats;
+    tabData.set(tabId, { videoId, info, ts: Date.now() });
+    persistTabData();
+  }
+
   console.log(
     `[BG] Specialist stored ${formats.length} format(s) for tab ${tabId} (${platform})`,
   );
   return { success: true, info };
+}
+
+/**
+ * Fetch and parse an HLS master playlist to extract quality variant streams.
+ * Returns an array of { url, quality, qualityLabel, width, height, bandwidth } or null.
+ */
+async function parseHLSMasterPlaylist(masterUrl) {
+  try {
+    const resp = await fetch(masterUrl);
+    if (!resp.ok) return null;
+    const text = await resp.text();
+
+    // Check if this is a master playlist (contains #EXT-X-STREAM-INF)
+    if (!text.includes("#EXT-X-STREAM-INF")) return null;
+
+    const lines = text.split("\n").map((l) => l.trim());
+    const variants = [];
+    const baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
+    // Preserve query parameters from master URL for relative variant URLs
+    let masterQuery = "";
+    try {
+      const parsed = new URL(masterUrl);
+      masterQuery = parsed.search || "";
+    } catch {}
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+
+      // Parse attributes from the STREAM-INF line
+      const attrs = line.substring("#EXT-X-STREAM-INF:".length);
+      let bandwidth = 0;
+      let width = 0;
+      let height = 0;
+      let resolution = "";
+      let codecs = "";
+      let name = "";
+
+      const bwMatch = attrs.match(/BANDWIDTH=(\d+)/i);
+      if (bwMatch) bandwidth = parseInt(bwMatch[1]);
+
+      const resMatch = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
+      if (resMatch) {
+        width = parseInt(resMatch[1]);
+        height = parseInt(resMatch[2]);
+        resolution = `${width}x${height}`;
+      }
+
+      const codecMatch = attrs.match(/CODECS="([^"]+)"/i);
+      if (codecMatch) codecs = codecMatch[1];
+
+      const nameMatch = attrs.match(/NAME="([^"]+)"/i);
+      if (nameMatch) name = nameMatch[1];
+
+      // Next non-empty, non-comment line is the variant URL
+      let variantUrl = "";
+      for (let j = i + 1; j < lines.length; j++) {
+        if (lines[j] && !lines[j].startsWith("#")) {
+          variantUrl = lines[j];
+          break;
+        }
+      }
+
+      if (!variantUrl) continue;
+
+      // Resolve the variant URL
+      if (!variantUrl.startsWith("http")) {
+        // Relative URL — resolve against master playlist base
+        variantUrl = baseUrl + variantUrl;
+        // Add master query params if the variant doesn't have its own
+        if (masterQuery && !variantUrl.includes("?")) {
+          variantUrl += masterQuery;
+        }
+      }
+
+      const qualityLabel = height
+        ? `${height}p`
+        : name || `${Math.round(bandwidth / 1000)}kbps`;
+      const quality = height
+        ? `${height}p`
+        : `${Math.round(bandwidth / 1000)}kbps`;
+
+      variants.push({
+        url: variantUrl,
+        quality,
+        qualityLabel: `${qualityLabel}${codecs ? " · " + (codecs.includes("avc1") ? "H.264" : codecs.includes("hevc") || codecs.includes("hvc1") ? "HEVC" : codecs.split(",")[0]) : ""}${bandwidth ? " · " + Math.round(bandwidth / 1000) + "kbps" : ""}`,
+        width,
+        height,
+        bandwidth,
+        codecs,
+      });
+    }
+
+    // Sort by height descending (highest quality first)
+    variants.sort(
+      (a, b) => (b.height || b.bandwidth) - (a.height || a.bandwidth),
+    );
+    return variants.length > 0 ? variants : null;
+  } catch (e) {
+    console.warn("[BG] HLS master playlist parse error:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Handle video stream detected from an iframe relay.
+ * Merges the found stream into the specialist's tabData if available.
+ */
+async function onIframeStreamDetected(msg, tabId) {
+  if (!tabId || tabId < 0) return { success: false };
+
+  const url = msg.url;
+  if (!url || typeof url !== "string") return { success: false };
+
+  const isM3u8 = /\.m3u8(\?|#|$)/i.test(url) || /m3u8/i.test(url);
+  const isMpd = /\.mpd(\?|#|$)/i.test(url);
+  const isDirect = msg.direct || false;
+  const isHlsContent = msg.hlsContent || false;
+  const isProxyDetected = msg.proxyDetected || false;
+
+  // Accept if URL pattern matches, or if response body confirmed HLS, or if proxy domain detected
+  if (!isM3u8 && !isMpd && !isDirect && !isHlsContent && !isProxyDetected)
+    return { success: false };
+
+  console.log(
+    `[BG] Iframe stream detected on tab ${tabId} from ${msg.frameUrl || "unknown"}: ${url.substring(0, 120)}`,
+  );
+
+  // Treat hlsContent and proxyDetected as HLS
+  const streamType =
+    isM3u8 || isHlsContent || isProxyDetected
+      ? "hls"
+      : isMpd
+        ? "dash"
+        : "direct";
+
+  // Try to merge into existing specialist tabData
+  const existing = tabData.get(tabId);
+  if (existing) {
+    const info = existing.info;
+    const formats = info.formats || [];
+
+    // Check if this URL is already stored
+    const normalizedUrl = url.split("?")[0];
+    const alreadyExists = formats.some(
+      (f) => f.url && f.url.split("?")[0] === normalizedUrl,
+    );
+    if (alreadyExists) return { success: true, alreadyKnown: true };
+
+    // Remove image-only formats (from generic extractor) if we found a real video
+    const videoFormats = formats.filter(
+      (f) => f.isVideo !== false && !f.isImage,
+    );
+    const imageFormats = formats.filter((f) => f.isImage);
+
+    let syntheticItag = 90000 + formats.length;
+
+    const newFormat = {
+      url,
+      mimeType: isM3u8
+        ? "application/x-mpegurl"
+        : isMpd
+          ? "application/dash+xml"
+          : "video/mp4",
+      quality: "auto",
+      qualityLabel: isM3u8 ? "HLS" : isMpd ? "DASH" : "Direct",
+      isVideo: true,
+      isMuxed: true,
+      ext: "mp4",
+      isHLS: isM3u8,
+      isDASH: isMpd,
+      itag: syntheticItag++,
+    };
+
+    // If we had only image formats, replace them; otherwise add
+    if (videoFormats.length === 0 && imageFormats.length > 0) {
+      info.formats = [newFormat];
+    } else {
+      info.formats = [...videoFormats, newFormat];
+    }
+
+    info.source = "specialist+iframe";
+    tabData.set(tabId, { videoId: existing.videoId, info, ts: Date.now() });
+    persistTabData();
+
+    chrome.action.setBadgeText({ text: "✓", tabId });
+    chrome.action.setBadgeBackgroundColor({ color: "#4CAF50", tabId });
+
+    // Try to parse HLS quality variants
+    if (isM3u8) {
+      try {
+        const variants = await parseHLSMasterPlaylist(url);
+        if (variants && variants.length > 1) {
+          console.log(
+            `[BG] Parsed ${variants.length} quality variants from iframe m3u8`,
+          );
+          const updatedFormats = info.formats.filter(
+            (f) => f.url !== url || f.quality !== "auto",
+          );
+          updatedFormats.unshift({
+            url,
+            mimeType: "application/x-mpegurl",
+            quality: "auto",
+            qualityLabel: "Auto (Best)",
+            isVideo: true,
+            isMuxed: true,
+            ext: "mp4",
+            isHLS: true,
+            itag: syntheticItag++,
+          });
+          for (const v of variants) {
+            updatedFormats.push({
+              url: v.url,
+              mimeType: "application/x-mpegurl",
+              quality: v.quality,
+              qualityLabel: v.qualityLabel,
+              width: v.width || 0,
+              height: v.height || 0,
+              bitrate: v.bandwidth || 0,
+              isVideo: true,
+              isMuxed: true,
+              ext: "mp4",
+              isHLS: true,
+              itag: syntheticItag++,
+            });
+          }
+          info.formats = updatedFormats;
+          tabData.set(tabId, {
+            videoId: existing.videoId,
+            info,
+            ts: Date.now(),
+          });
+          persistTabData();
+        }
+      } catch (e) {
+        console.warn("[BG] Failed to parse iframe HLS master:", e.message);
+      }
+    }
+
+    console.log(
+      `[BG] Merged iframe stream into specialist data: ${info.formats.length} format(s)`,
+    );
+    return { success: true };
+  }
+
+  // No existing specialist data — create new entry
+  const info = {
+    formats: [
+      {
+        url,
+        mimeType: isM3u8
+          ? "application/x-mpegurl"
+          : isMpd
+            ? "application/dash+xml"
+            : "video/mp4",
+        quality: "auto",
+        qualityLabel: isM3u8 ? "HLS" : isMpd ? "DASH" : "Direct",
+        isVideo: true,
+        isMuxed: true,
+        ext: "mp4",
+        isHLS: isM3u8,
+        isDASH: isMpd,
+        itag: 90000,
+      },
+    ],
+    title: "Video",
+    source: "iframe_detection",
+  };
+
+  try {
+    const meta = await captureMetadata(tabId);
+    if (meta?.title) info.title = meta.title;
+    if (meta?.thumbnail) info.thumbnail = meta.thumbnail;
+  } catch {}
+
+  const videoId = `iframe_${tabId}_${Date.now()}`;
+  tabData.set(tabId, { videoId, info, ts: Date.now() });
+  persistTabData();
+
+  chrome.action.setBadgeText({ text: "✓", tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#4CAF50", tabId });
+
+  console.log(`[BG] Created new entry from iframe stream on tab ${tabId}`);
+  return { success: true };
+}
+
+/**
+ * Merge a webRequest-sniffed HLS/DASH stream into specialist tabData.
+ */
+function mergeSniffedStreamIntoTabData(tabId, stream) {
+  const existing = tabData.get(tabId);
+  if (!existing) return false;
+
+  const info = existing.info;
+  const formats = info.formats || [];
+
+  const normalizedUrl = stream.url.split("?")[0];
+  const alreadyExists = formats.some(
+    (f) => f.url && f.url.split("?")[0] === normalizedUrl,
+  );
+  if (alreadyExists) return false;
+
+  const isHLS = stream.type === "hls";
+  const isDASH = stream.type === "dash";
+
+  const videoFormats = formats.filter((f) => f.isVideo !== false && !f.isImage);
+  const hadOnlyImages =
+    videoFormats.length === 0 && formats.some((f) => f.isImage);
+
+  const newFormat = {
+    url: stream.url,
+    mimeType: isHLS
+      ? "application/x-mpegurl"
+      : isDASH
+        ? "application/dash+xml"
+        : stream.contentType || "video/mp4",
+    quality: "auto",
+    qualityLabel: isHLS ? "HLS" : isDASH ? "DASH" : "Direct",
+    isVideo: true,
+    isMuxed: true,
+    ext: "mp4",
+    isHLS,
+    isDASH,
+    itag: 90000 + formats.length,
+  };
+
+  if (hadOnlyImages) {
+    info.formats = [newFormat];
+  } else {
+    formats.push(newFormat);
+    info.formats = formats;
+  }
+
+  info.source = (info.source || "specialist") + "+sniffed";
+  tabData.set(tabId, { videoId: existing.videoId, info, ts: Date.now() });
+  persistTabData();
+
+  console.log(
+    `[BG] Merged sniffed ${stream.type} stream into specialist data for tab ${tabId}`,
+  );
+
+  // Parse HLS quality variants asynchronously
+  if (isHLS) {
+    parseHLSMasterPlaylist(stream.url)
+      .then((variants) => {
+        if (!variants || variants.length <= 1) return;
+        const current = tabData.get(tabId);
+        if (!current) return;
+        const curInfo = current.info;
+        const curFormats = curInfo.formats.filter(
+          (f) => f.url !== stream.url || f.quality !== "auto",
+        );
+        let itag = 90000 + curFormats.length + 100;
+
+        curFormats.unshift({
+          url: stream.url,
+          mimeType: "application/x-mpegurl",
+          quality: "auto",
+          qualityLabel: "Auto (Best)",
+          isVideo: true,
+          isMuxed: true,
+          ext: "mp4",
+          isHLS: true,
+          itag: itag++,
+        });
+
+        for (const v of variants) {
+          curFormats.push({
+            url: v.url,
+            mimeType: "application/x-mpegurl",
+            quality: v.quality,
+            qualityLabel: v.qualityLabel,
+            width: v.width || 0,
+            height: v.height || 0,
+            bitrate: v.bandwidth || 0,
+            isVideo: true,
+            isMuxed: true,
+            ext: "mp4",
+            isHLS: true,
+            itag: itag++,
+          });
+        }
+
+        curInfo.formats = curFormats;
+        tabData.set(tabId, {
+          videoId: current.videoId,
+          info: curInfo,
+          ts: Date.now(),
+        });
+        persistTabData();
+        console.log(
+          `[BG] Expanded sniffed HLS to ${variants.length} quality variants`,
+        );
+      })
+      .catch(() => {});
+  }
+
+  return true;
 }
 
 const SESSION_HEADER_BASE = 1000000;
@@ -3435,7 +5948,8 @@ async function removeSessionHeaders(ruleId) {
 }
 
 async function handleWorkerDownload(msg) {
-  const { url, type, filename, headers, tabId } = msg;
+  const { url, type, filename, headers, tabId, videoTitle, videoThumbnail } =
+    msg;
 
   if (!url) throw new Error("URL required for worker download");
 
@@ -3483,6 +5997,9 @@ async function handleWorkerDownload(msg) {
       percent: 0,
       filename: sanitize(filename || "video.mp4"),
       ts: Date.now(),
+      // Store video metadata for persistent display
+      videoTitle: videoTitle || null,
+      videoThumbnail: videoThumbnail || null,
     };
     chrome.storage.session.set({ activeDownloads: downloads }).catch(() => {});
   });

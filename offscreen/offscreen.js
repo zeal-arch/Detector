@@ -306,19 +306,28 @@ async function cleanupMergeOPFS() {
   }
 }
 
+/**
+ * Remove common MEMFS input and output files created during merge/download operations.
+ *
+ * Attempts to unlink both MP4 and WebM variants of input_video, input_audio, and output files
+ * from the libav instance's MEMFS and ignores any unlink errors (e.g., file not present).
+ */
 function cleanupMEMFS() {
   if (!libavInstance) return;
-  try {
-    libavInstance.unlink("input_video.mp4");
-  } catch (e) {}
-  try {
-    libavInstance.unlink("input_audio.mp4");
-  } catch (e) {}
-  try {
-    libavInstance.unlink("output.mp4");
-  } catch (e) {}
+  // Clean up all possible input/output filenames (both MP4 and WebM variants)
+  for (const f of [
+    "input_video.mp4", "input_video.webm",
+    "input_audio.mp4", "input_audio.webm",
+    "output.mp4", "output.webm",
+  ]) {
+    try { libavInstance.unlink(f); } catch (e) {}
+  }
 }
 
+/**
+ * Cancels any in-progress merge operation, cleans up partial in-memory files, and reports the outcome.
+ * @param {function(Object): void} sendResponse - Callback invoked with the result object: `{ success: true }` on successful cancellation, or `{ success: false, error: string }` if no active merge exists.
+ */
 function handleCancelMerge(sendResponse) {
   if (activeMergeAbort) {
     console.log("[OFFSCREEN] Cancelling active merge...");
@@ -332,6 +341,21 @@ function handleCancelMerge(sendResponse) {
   }
 }
 
+/**
+ * Download video and audio streams, merge them into a single media file, and trigger a background download.
+ *
+ * Orchestrates parallel downloads of the provided video and audio URLs, writes them to libav.js MEMFS, runs an FFmpeg merge
+ * (copying streams, using WebM when both inputs are WebM), produces a Blob URL for the merged output, and asks the background
+ * script to start the actual file download. Progress updates are emitted via the broadcast channel; the operation can be
+ * cancelled (AbortController) and cleans up MEMFS and temporary buffers on completion or error.
+ *
+ * @param {Object} msg - Message payload containing merge parameters.
+ * @param {string} msg.videoUrl - URL of the video track to download.
+ * @param {string} msg.audioUrl - URL of the audio track to download.
+ * @param {string} [msg.filename] - Preferred filename for the merged output; extension will be ensured.
+ * @param {string} [msg.mergeId] - Optional identifier used for progress reporting.
+ * @param {Function} sendResponse - Callback to send the result back (called with an object describing success or error).
+ */
 async function handleMergeAndDownload(msg, sendResponse) {
   const { videoUrl, audioUrl, filename, mergeId } = msg;
   const progressKey = mergeId || Date.now().toString();
@@ -424,21 +448,27 @@ async function handleMergeAndDownload(msg, sendResponse) {
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
+    // Name input files with correct extensions so FFmpeg picks the right
+    // demuxer (WebM data in a .mp4 file could confuse format probing).
+    const videoInputFile = isWebMVideo ? "input_video.webm" : "input_video.mp4";
+    const audioInputFile = isWebMAudio ? "input_audio.webm" : "input_audio.mp4";
+
     // Write audio to MEMFS first (small) then free it
     const audioSize = audioData.byteLength;
-    libav.writeFile("input_audio.mp4", audioData, { canOwn: true });
+    libav.writeFile(audioInputFile, audioData, { canOwn: true });
     audioData = null;
 
     // Write video to MEMFS and free it
     const videoSize = videoData.byteLength;
-    libav.writeFile("input_video.mp4", videoData, { canOwn: true });
+    libav.writeFile(videoInputFile, videoData, { canOwn: true });
     videoData = null;
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
     // --- Auto-detect output container ---
-    // VP9/VP8 + Opus/Vorbis → WebM (natural container, better compatibility)
-    // H.264/AV1 + AAC/MP3  → MP4  (universal playback)
+    // This only activates when BOTH inputs are WebM (VP9/Opus), so H.264/AAC
+    // never enters the WebM path.  With -c:v copy -c:a copy, no codec
+    // decoders/encoders are needed — only muxer/demuxer support matters.
     const isWebMVideo =
       /mime=video(%2F|\/)webm/i.test(videoUrl) ||
       /webm/i.test((videoUrl.match(/[?&]type=([^&]+)/) || [])[1] || "");
@@ -459,19 +489,23 @@ async function handleMergeAndDownload(msg, sendResponse) {
     sendProgress(progressKey, "merge", "Running FFmpeg merge...", 75);
 
     // Build FFmpeg args — skip -movflags +faststart for WebM (not applicable)
+    // WebM requires explicit -f matroska since libav.js doesn't auto-detect .webm extension
     const ffmpegArgs = [
       "-y",
       "-i",
-      "input_video.mp4",
+      videoInputFile,
       "-i",
-      "input_audio.mp4",
+      audioInputFile,
       "-c:v",
       "copy",
       "-c:a",
       "copy",
       "-shortest",
     ];
-    if (!useWebM) {
+    if (useWebM) {
+      // WebM is a subset of Matroska — use explicit format
+      ffmpegArgs.push("-f", "matroska");
+    } else {
       ffmpegArgs.push("-movflags", "+faststart");
     }
     ffmpegArgs.push(outputFile);
@@ -484,10 +518,10 @@ async function handleMergeAndDownload(msg, sendResponse) {
 
     // Free input files from MEMFS BEFORE reading output — reduces peak memory
     try {
-      libav.unlink("input_video.mp4");
+      libav.unlink(videoInputFile);
     } catch (e) {}
     try {
-      libav.unlink("input_audio.mp4");
+      libav.unlink(audioInputFile);
     } catch (e) {}
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");

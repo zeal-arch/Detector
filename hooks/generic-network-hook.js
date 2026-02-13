@@ -5,15 +5,73 @@
   const seen = new Set();
   const blobMap = new Map();
 
-  function checkUrl(url, extraData = {}) {
+  // Known proxy/CDN domains used by pirated streaming sites
+  const PROXY_DOMAINS = [
+    "vodvidl.site",
+    "trueparadise.workers.dev",
+    "tigerflare",
+    "videasy.net",
+    "rabbitstream",
+    "megacloud",
+    "vidplay",
+    "filemoon",
+    "dokicloud",
+    "rapid-cloud",
+    "vidstreaming",
+  ];
+
+  /**
+   * Detects whether a URL contains any known proxy or CDN domain substring.
+   * @param {string} url - The URL or string to inspect for proxy domain substrings.
+   * @returns {boolean} `true` if any entry from PROXY_DOMAINS is found in `url`, `false` otherwise (also returns `false` on error).
+   */
+  function isProxyDomain(url) {
+    try {
+      return PROXY_DOMAINS.some(function (d) {
+        return url.includes(d);
+      });
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Inspect a URL for streaming/manifest/video patterns and notify the page when a relevant resource is found.
+   *
+   * Marks the URL as seen to avoid duplicate reports and posts a window.postMessage with type `MAGIC` and the inspected `url`.
+   * The optional `extraData` object is merged into the posted message. Depending on the match, the posted message may
+   * include detection flags such as `proxyDetected` (proxy/CDN streaming indicators) or `direct` (direct video file).
+   *
+   * @param {string} url - The URL to inspect.
+   * @param {Object} [extraData] - Optional additional data to include in the posted message.
+   */
+  function checkUrl(url, extraData) {
+    extraData = extraData || {};
     if (!url || typeof url !== "string") return;
     if (seen.has(url)) return;
-    if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
+
+    // Standard extension matching
+    if (/\.(m3u8|mpd)(\?|#|$)/i.test(url)) {
       seen.add(url);
       window.postMessage({ type: MAGIC, url: url, ...extraData }, "*");
+      return;
     }
 
-    if (/\/video\/|\.(mp4|webm)(\?|$)/i.test(url) && url.length < 500) {
+    // Proxy domain matching — any request to a known proxy with stream-like path
+    if (isProxyDomain(url)) {
+      if (
+        /m3u8|proxy|stream|video|manifest|playlist|master|hls|dash/i.test(url)
+      ) {
+        seen.add(url);
+        window.postMessage(
+          { type: MAGIC, url: url, proxyDetected: true, ...extraData },
+          "*",
+        );
+        return;
+      }
+    }
+
+    if (/\/video\/|\.(mp4|webm)(\?|#|$)/i.test(url) && url.length < 500) {
       if (/cdn|media|stream|video|content/i.test(url)) {
         seen.add(url);
         window.postMessage(
@@ -24,17 +82,106 @@
     }
   }
 
+  /**
+   * Detects whether a response body contains an HLS (M3U8) manifest and signals detection.
+   * Adds the URL to the internal seen set and posts a window message with `{ type: MAGIC, url, hlsContent: true }` when an HLS manifest is found.
+   * @param {string} url - The response URL associated with the provided text.
+   * @param {string} text - The response body to inspect for HLS manifest markers.
+   */
+  function checkResponseForHLS(url, text) {
+    if (!text || typeof text !== "string") return;
+    if (seen.has(url)) return;
+    var trimmed = text.trimStart();
+    if (trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-")) {
+      seen.add(url);
+      window.postMessage({ type: MAGIC, url: url, hlsContent: true }, "*");
+    }
+  }
+
   const origOpen = XMLHttpRequest.prototype.open;
+  const origSend = XMLHttpRequest.prototype.send;
+
   XMLHttpRequest.prototype.open = function (method, url) {
-    checkUrl(url?.toString());
+    this.__hookUrl = url?.toString();
+    checkUrl(this.__hookUrl);
     return origOpen.apply(this, arguments);
   };
 
+  XMLHttpRequest.prototype.send = function () {
+    var xhr = this;
+    var hookUrl = xhr.__hookUrl;
+    if (hookUrl && !seen.has(hookUrl)) {
+      xhr.addEventListener("load", function () {
+        try {
+          if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 400) {
+            var ct = (
+              xhr.getResponseHeader("content-type") || ""
+            ).toLowerCase();
+            // Check response body for HLS content if content-type suggests text.
+            // Guard with Content-Length to avoid pulling multi-MB binary payloads
+            // (e.g. video segments from proxy domains) into memory as text.
+            if (
+              ct.includes("mpegurl") ||
+              ct.includes("text") ||
+              ct.includes("json") ||
+              ct.includes("octet") ||
+              ct.includes("binary") ||
+              ct === "" ||
+              isProxyDomain(hookUrl)
+            ) {
+              var len = parseInt(xhr.getResponseHeader("content-length") || "0", 10);
+              if (!len || len <= 1048576) {
+                checkResponseForHLS(hookUrl, xhr.responseText);
+              }
+            }
+          }
+        } catch (e) {}
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+
   const origFetch = window.fetch;
-  window.fetch = function (input) {
+  window.fetch = function (input, init) {
     const url = typeof input === "string" ? input : input?.url;
     checkUrl(url);
-    return origFetch.apply(this, arguments);
+
+    var result = origFetch.apply(this, arguments);
+
+    // Inspect response body for HLS manifests
+    if (url && !seen.has(url)) {
+      result
+        .then(function (response) {
+          try {
+            var ct = (response.headers.get("content-type") || "").toLowerCase();
+            if (
+              ct.includes("mpegurl") ||
+              ct.includes("text") ||
+              ct.includes("json") ||
+              ct.includes("octet") ||
+              ct.includes("binary") ||
+              ct === "" ||
+              isProxyDomain(url)
+            ) {
+              // Skip large binary payloads (video segments) to avoid freezing the page
+              var len = parseInt(response.headers.get("content-length") || "0", 10);
+              if (len && len > 1048576) return response;
+              // Clone to avoid consuming the body
+              response
+                .clone()
+                .text()
+                .then(function (text) {
+                  checkResponseForHLS(url, text);
+                })
+                .catch(function () {});
+            }
+          } catch (e) {}
+          return response;
+        })
+        .catch(function () {});
+    }
+
+    return result;
   };
 
   const origSetAttribute = Element.prototype.setAttribute;
@@ -113,7 +260,6 @@
       AudioCtx.prototype.createMediaElementSource;
 
     AudioCtx.prototype.createMediaElementSource = function (mediaElement) {
-
       if (mediaElement && mediaElement.src) {
         checkUrl(mediaElement.src, { webAudioDetected: true });
       }

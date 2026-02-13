@@ -276,6 +276,27 @@
             font-size: 11px;
         }
 
+        .login-hint {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 6px;
+            padding: 6px 8px;
+            background: rgba(154, 171, 221, 0.1);
+            border: 1px solid rgba(154, 171, 221, 0.25);
+            border-radius: 4px;
+            font-size: 11px;
+        }
+
+        .login-hint-icon {
+            font-size: 12px;
+        }
+
+        .login-hint-text {
+            color: var(--secondary);
+            font-weight: 500;
+        }
+
         .drm-icon {
             font-size: 12px;
         }
@@ -858,6 +879,53 @@
             border-radius: 3px;
             transition: width 0.3s ease;
             box-shadow: 0 0 8px var(--primary-glow);
+        }
+
+        /* Video card in download banner */
+        .banner-video-row {
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+        }
+
+        .banner-thumb {
+            width: 64px;
+            height: 36px;
+            object-fit: cover;
+            border-radius: 4px;
+            flex-shrink: 0;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .banner-video-info {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .banner-title {
+            font-size: 11px;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.9);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            line-height: 1.3;
+        }
+
+        .banner-status {
+            font-size: 11px;
+            opacity: 0.9;
+        }
+
+        .banner-video-info .banner-row {
+            margin-top: 2px;
+        }
+
+        .banner-video-info .banner-bar-bg {
+            margin-top: 4px;
         }
 
         /* ═══════════════════════════════════════
