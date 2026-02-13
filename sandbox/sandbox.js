@@ -5,25 +5,59 @@ function createMockEnv() {
     const store = {};
     return {
       getItem: (key) => store[key] || null,
-      setItem: (key, value) => { store[key] = String(value); },
-      removeItem: (key) => { delete store[key]; },
-      clear: () => { for (const k in store) delete store[k]; },
-      get length() { return Object.keys(store).length; },
+      setItem: (key, value) => {
+        store[key] = String(value);
+      },
+      removeItem: (key) => {
+        delete store[key];
+      },
+      clear: () => {
+        for (const k in store) delete store[k];
+      },
+      get length() {
+        return Object.keys(store).length;
+      },
       key: (i) => Object.keys(store)[i] || null,
     };
   };
 
   const mockWindow = {
-    location: { href: "https://www.youtube.com/", hostname: "www.youtube.com", protocol: "https:" },
-    navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
-    document: { createElement: () => ({ style: {} }), documentElement: { style: {} } },
+    location: {
+      href: "https://www.youtube.com/",
+      hostname: "www.youtube.com",
+      protocol: "https:",
+    },
+    navigator: {
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
+    document: {
+      createElement: () => ({ style: {} }),
+      documentElement: { style: {} },
+    },
     localStorage: createMockStorage(),
     sessionStorage: createMockStorage(),
-    Math, String, Array, Object, Number, Boolean, RegExp, Date, JSON,
-    parseInt, parseFloat, isNaN, isFinite,
-    encodeURIComponent, decodeURIComponent,
-    atob, btoa, console,
-    setTimeout, clearTimeout, setInterval, clearInterval,
+    Math,
+    String,
+    Array,
+    Object,
+    Number,
+    Boolean,
+    RegExp,
+    Date,
+    JSON,
+    parseInt,
+    parseFloat,
+    isNaN,
+    isFinite,
+    encodeURIComponent,
+    decodeURIComponent,
+    atob,
+    btoa,
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
     Promise,
   };
   mockWindow.window = mockWindow;
@@ -54,8 +88,20 @@ function handleEvalNSig(e, id, fnCode, params) {
     if (!fn) {
       const mockEnv = createMockEnv();
 
-      const wrapped = "with(this) { return (" + fnCode + ")(sig); }";
-      fn = new Function("sig", wrapped);
+      // Detect bundled IIFE format: (function(){...deps...return func;})()
+      // vs plain function format: function(a){...}
+      const isBundled = fnCode.trimStart().startsWith("(function()");
+
+      if (isBundled) {
+        // yt-dlp bundled: IIFE returns the N-sig function with all deps included
+        const wrapped =
+          "with(this) { var __nSigFn = " + fnCode + "; return __nSigFn(sig); }";
+        fn = new Function("sig", wrapped);
+      } else {
+        // Plain: single function body
+        const wrapped = "with(this) { return (" + fnCode + ")(sig); }";
+        fn = new Function("sig", wrapped);
+      }
       fn = fn.bind(mockEnv);
       fnCache.set("nsig:" + fnCode, fn);
     }

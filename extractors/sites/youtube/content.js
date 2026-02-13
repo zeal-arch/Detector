@@ -153,6 +153,12 @@
       cipherCode: payload.cipherCode || null,
       cipherArgName: payload.cipherArgName || null,
       resolveError: payload.resolveError || null,
+      loggedIn: payload.loggedIn ?? scriptData.loggedIn ?? null,
+      // 2025+ direct cipher/N-sig data from inject.js
+      cipherActions: payload.cipherActions || null,
+      directCipher: payload.directCipher || false,
+      directNSig: payload.directNSig || false,
+      extractionErrors: payload.extractionErrors || null,
     };
 
     console.log("[YT-DL] Sending VIDEO_DETECTED:", videoId, {

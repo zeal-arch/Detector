@@ -459,6 +459,7 @@ async function handleMergeAndDownload(msg, sendResponse) {
     sendProgress(progressKey, "merge", "Running FFmpeg merge...", 75);
 
     // Build FFmpeg args — skip -movflags +faststart for WebM (not applicable)
+    // WebM requires explicit -f matroska since libav.js doesn't auto-detect .webm extension
     const ffmpegArgs = [
       "-y",
       "-i",
@@ -471,7 +472,10 @@ async function handleMergeAndDownload(msg, sendResponse) {
       "copy",
       "-shortest",
     ];
-    if (!useWebM) {
+    if (useWebM) {
+      // WebM is a subset of Matroska — use explicit format
+      ffmpegArgs.push("-f", "matroska");
+    } else {
       ffmpegArgs.push("-movflags", "+faststart");
     }
     ffmpegArgs.push(outputFile);

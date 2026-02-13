@@ -5,15 +5,58 @@
   const seen = new Set();
   const blobMap = new Map();
 
-  function checkUrl(url, extraData = {}) {
+  // Known proxy/CDN domains used by pirated streaming sites
+  const PROXY_DOMAINS = [
+    "vodvidl.site",
+    "trueparadise.workers.dev",
+    "tigerflare",
+    "videasy.net",
+    "rabbitstream",
+    "megacloud",
+    "vidplay",
+    "filemoon",
+    "dokicloud",
+    "rapid-cloud",
+    "vidstreaming",
+  ];
+
+  function isProxyDomain(url) {
+    try {
+      return PROXY_DOMAINS.some(function (d) {
+        return url.includes(d);
+      });
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function checkUrl(url, extraData) {
+    extraData = extraData || {};
     if (!url || typeof url !== "string") return;
     if (seen.has(url)) return;
-    if (/\.(m3u8|mpd)(\?|$)/i.test(url)) {
+
+    // Standard extension matching
+    if (/\.(m3u8|mpd)(\?|#|$)/i.test(url)) {
       seen.add(url);
       window.postMessage({ type: MAGIC, url: url, ...extraData }, "*");
+      return;
     }
 
-    if (/\/video\/|\.(mp4|webm)(\?|$)/i.test(url) && url.length < 500) {
+    // Proxy domain matching — any request to a known proxy with stream-like path
+    if (isProxyDomain(url)) {
+      if (
+        /m3u8|proxy|stream|video|manifest|playlist|master|hls|dash/i.test(url)
+      ) {
+        seen.add(url);
+        window.postMessage(
+          { type: MAGIC, url: url, proxyDetected: true, ...extraData },
+          "*",
+        );
+        return;
+      }
+    }
+
+    if (/\/video\/|\.(mp4|webm)(\?|#|$)/i.test(url) && url.length < 500) {
       if (/cdn|media|stream|video|content/i.test(url)) {
         seen.add(url);
         window.postMessage(
@@ -24,17 +67,93 @@
     }
   }
 
+  // Check if response text is an HLS manifest
+  function checkResponseForHLS(url, text) {
+    if (!text || typeof text !== "string") return;
+    if (seen.has(url)) return;
+    var trimmed = text.trimStart();
+    if (trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-")) {
+      seen.add(url);
+      window.postMessage({ type: MAGIC, url: url, hlsContent: true }, "*");
+    }
+  }
+
   const origOpen = XMLHttpRequest.prototype.open;
+  const origSend = XMLHttpRequest.prototype.send;
+
   XMLHttpRequest.prototype.open = function (method, url) {
-    checkUrl(url?.toString());
+    this.__hookUrl = url?.toString();
+    checkUrl(this.__hookUrl);
     return origOpen.apply(this, arguments);
   };
 
+  XMLHttpRequest.prototype.send = function () {
+    var xhr = this;
+    var hookUrl = xhr.__hookUrl;
+    if (hookUrl && !seen.has(hookUrl)) {
+      xhr.addEventListener("load", function () {
+        try {
+          if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 400) {
+            var ct = (
+              xhr.getResponseHeader("content-type") || ""
+            ).toLowerCase();
+            // Check response body for HLS content if content-type suggests text
+            if (
+              ct.includes("mpegurl") ||
+              ct.includes("text") ||
+              ct.includes("json") ||
+              ct.includes("octet") ||
+              ct.includes("binary") ||
+              ct === "" ||
+              isProxyDomain(hookUrl)
+            ) {
+              checkResponseForHLS(hookUrl, xhr.responseText);
+            }
+          }
+        } catch (e) {}
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+
   const origFetch = window.fetch;
-  window.fetch = function (input) {
+  window.fetch = function (input, init) {
     const url = typeof input === "string" ? input : input?.url;
     checkUrl(url);
-    return origFetch.apply(this, arguments);
+
+    var result = origFetch.apply(this, arguments);
+
+    // Inspect response body for HLS manifests
+    if (url && !seen.has(url)) {
+      result
+        .then(function (response) {
+          try {
+            var ct = (response.headers.get("content-type") || "").toLowerCase();
+            if (
+              ct.includes("mpegurl") ||
+              ct.includes("text") ||
+              ct.includes("json") ||
+              ct.includes("octet") ||
+              ct.includes("binary") ||
+              ct === "" ||
+              isProxyDomain(url)
+            ) {
+              // Clone to avoid consuming the body
+              response
+                .clone()
+                .text()
+                .then(function (text) {
+                  checkResponseForHLS(url, text);
+                })
+                .catch(function () {});
+            }
+          } catch (e) {}
+          return response;
+        })
+        .catch(function () {});
+    }
+
+    return result;
   };
 
   const origSetAttribute = Element.prototype.setAttribute;
@@ -113,7 +232,6 @@
       AudioCtx.prototype.createMediaElementSource;
 
     AudioCtx.prototype.createMediaElementSource = function (mediaElement) {
-
       if (mediaElement && mediaElement.src) {
         checkUrl(mediaElement.src, { webAudioDetected: true });
       }
