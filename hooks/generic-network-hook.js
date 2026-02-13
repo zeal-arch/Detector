@@ -20,6 +20,11 @@
     "vidstreaming",
   ];
 
+  /**
+   * Detects whether a URL contains any known proxy or CDN domain substring.
+   * @param {string} url - The URL or string to inspect for proxy domain substrings.
+   * @returns {boolean} `true` if any entry from PROXY_DOMAINS is found in `url`, `false` otherwise (also returns `false` on error).
+   */
   function isProxyDomain(url) {
     try {
       return PROXY_DOMAINS.some(function (d) {
@@ -30,6 +35,16 @@
     }
   }
 
+  /**
+   * Inspect a URL for streaming/manifest/video patterns and notify the page when a relevant resource is found.
+   *
+   * Marks the URL as seen to avoid duplicate reports and posts a window.postMessage with type `MAGIC` and the inspected `url`.
+   * The optional `extraData` object is merged into the posted message. Depending on the match, the posted message may
+   * include detection flags such as `proxyDetected` (proxy/CDN streaming indicators) or `direct` (direct video file).
+   *
+   * @param {string} url - The URL to inspect.
+   * @param {Object} [extraData] - Optional additional data to include in the posted message.
+   */
   function checkUrl(url, extraData) {
     extraData = extraData || {};
     if (!url || typeof url !== "string") return;
@@ -67,7 +82,12 @@
     }
   }
 
-  // Check if response text is an HLS manifest
+  /**
+   * Detects whether a response body contains an HLS (M3U8) manifest and signals detection.
+   * Adds the URL to the internal seen set and posts a window message with `{ type: MAGIC, url, hlsContent: true }` when an HLS manifest is found.
+   * @param {string} url - The response URL associated with the provided text.
+   * @param {string} text - The response body to inspect for HLS manifest markers.
+   */
   function checkResponseForHLS(url, text) {
     if (!text || typeof text !== "string") return;
     if (seen.has(url)) return;

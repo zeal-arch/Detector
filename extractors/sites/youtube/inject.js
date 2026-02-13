@@ -10,10 +10,21 @@
     "Running in hybrid mode (direct global access + code extraction fallback)",
   );
 
+  /**
+   * Escape special characters in a string for use in a regular expression.
+   * @param {string} s - The input string to escape.
+   * @returns {string} The input with regex metacharacters escaped so it can be safely used in a RegExp.
+   */
   function escRe(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
+  /**
+   * Extracts a balanced `{ ... }` block starting at the given position, respecting string literals and escape sequences.
+   * @param {string} code - Source code to scan.
+   * @param {number} pos - Index of an opening `{` in `code`.
+   * @returns {string|null} The substring containing the balanced `{ ... }` block including braces, or `null` if `pos` is not an opening brace or a matching closing brace is not found within 500000 characters.
+   */
   function extractBraceBlock(code, pos) {
     if (code[pos] !== "{") return null;
     var depth = 0,
@@ -48,7 +59,15 @@
     return null;
   }
 
-  /** Extract bracket-delimited block (for arrays like [...]). */
+  /**
+   * Extracts a balanced bracket-delimited block (array or similar) starting at the given position.
+   *
+   * The extraction correctly handles nested brackets, string literals (single, double, template),
+   * and escaped characters so that brackets inside strings are ignored.
+   * @param {string} code - The source text to scan.
+   * @param {number} pos - Index of the opening `[` in `code`.
+   * @returns {string|null} The substring from `pos` through the matching closing `]`, or `null` if no balanced block is found.
+   */
   function extractBracketBlock(code, pos) {
     if (code[pos] !== "[") return null;
     var depth = 0,
@@ -84,10 +103,24 @@
   }
 
   /**
-   * Find external dependency names from player.js code.
-   * YouTube 2025+ splits key functions between player.js (base.js) and inline scripts.
-   * The cipher helper (e.g., eO) and N-sig wrapper (e.g., R8K) are defined as
-   * GLOBAL variables in inline <script> tags, then referenced inside the player IIFE.
+   * Detects external dependency identifiers and the large lookup array used by player.js
+   * for cipher dispatch and N-signature handling.
+   *
+   * @param {string} js - The player.js source code to analyze.
+   * @returns {{
+   *   cipherHelper: (string|null),
+   *   cipherOps: Array<{methodName: string, arg: number}>,
+   *   cipherDispatchValue: (number|null),
+   *   nSigWrapper: (string|null),
+   *   lookupArray: (string[]|null),
+   *   lookupName: (string|null)
+   * }} An object describing discovered external dependencies:
+   * - `cipherHelper`: name of the global helper object referenced by the dispatch cipher, or `null`.
+   * - `cipherOps`: ordered list of cipher operations inferred from the dispatch function; each entry has `methodName` (lookup value) and `arg` (numeric argument).
+   * - `cipherDispatchValue`: numeric dispatch value passed to the cipher dispatch call, or `null`.
+   * - `nSigWrapper`: name of the global wrapper (array/object) that contains the N-signature transform, or `null`.
+   * - `lookupArray`: the extracted lookup array (split string) with 50+ entries when found, or `null`.
+   * - `lookupName`: variable name of the lookup array in the code, or `null`.
    */
   function findExternalDeps(js) {
     var result = {
@@ -187,11 +220,11 @@
   }
 
   /**
-   * Classify a cipher helper method by testing it with known input.
-   * The classic YouTube cipher uses three operations:
-   *   - reverse: reverses the array
-   *   - splice: removes first N elements
-   *   - swap: swaps element 0 with element at position N % length
+   * Determine which cipher operation a helper function performs by invoking it on test arrays.
+   *
+   * The function calls the provided helper with sample inputs and infers one of: `"reverse"`, `"splice"`, `"swap"`, or `"unknown"`.
+   * @param {Function} method - A cipher helper function that mutates an array in-place and accepts (array, index) arguments.
+   * @returns {string} One of `"reverse"`, `"splice"`, `"swap"`, or `"unknown"` indicating the inferred operation.
    */
   function classifyCipherMethod(method) {
     try {
@@ -213,8 +246,14 @@
   }
 
   /**
-   * Build cipher action list by accessing the global cipher helper object
-   * and classify each method. Returns action list compatible with applyCipher().
+   * Construct a sequence of cipher actions by inspecting a global cipher helper object and classifying its methods.
+   *
+   * For each operation in `ops`, looks up the corresponding function on `window[helperName]`, classifies it
+   * into a known action type (`"reverse"`, `"splice"`, or `"swap"`), and produces an actions array compatible
+   * with applyCipherActions.
+   * @param {string} helperName - Name of the global helper object (property on `window`) that implements cipher methods.
+   * @param {Array<{methodName: string, arg: number}>} ops - Ordered list of operations where `methodName` names a helper method and `arg` is its numeric argument (if any).
+   * @returns {Array<[string, number|null]>|null} An array of actions where each item is `[type, arg]` (use `null` for `reverse`'s arg), or `null` if the helper or any method cannot be found or classified.
    */
   function buildCipherActionsFromGlobal(helperName, ops) {
     try {
@@ -261,8 +300,17 @@
   }
 
   /**
-   * Apply cipher action list to a signature string.
-   */
+   * Transform a signature string by applying a sequence of cipher actions.
+   *
+   * Each action is a two-element array [type, arg] where `type` is one of:
+   * - `"reverse"`: reverse the characters.
+   * - `"splice"`: remove `arg` characters from the start.
+   * - `"swap"`: swap the first character with the character at index `arg % length`.
+   * - `"slice"`: return the substring starting at `arg`.
+   *
+   * @param {Array.<Array>} actions - List of actions to apply in order.
+   * @param {string} sig - The signature string to transform.
+   * @returns {string} The transformed signature. */
   function applyCipherActions(actions, sig) {
     var a = sig.split("");
     for (var i = 0; i < actions.length; i++) {
@@ -289,8 +337,9 @@
   }
 
   /**
-   * Get the N-sig transform function by accessing the global wrapper.
-   * YouTube stores it in a global array like R8K = [transformFunc].
+   * Retrieve the N-signature transformation function from a global wrapper array.
+   * @param {string} wrapperName - The global variable name that should reference an array containing the transform function at index 0 (e.g., `R8K = [fn]`).
+   * @returns {Function|null} The transform function if present at `window[wrapperName][0]`, `null` otherwise.
    */
   function getNSigFromGlobal(wrapperName) {
     try {
@@ -312,9 +361,13 @@
   }
 
   /**
-   * Extract cipher helper definition from inline <script> tags on the page.
-   * Used as fallback when direct global access is available but we also
-   * need to send the code to background.js for Tier 2/3 use.
+   * Locate and extract a cipher helper object definition from inline script tags.
+   *
+   * Searches non-external <script> elements for a declaration like `var HELPER = { ... }`
+   * or `HELPER = { ... }` and returns a self-contained snippet that redefines the helper.
+   *
+   * @param {string} helperName - The global helper object name to find.
+   * @returns {string|null} `string` containing `var <helperName> = { ... };` if found, `null` otherwise.
    */
   function extractCipherHelperFromPage(helperName) {
     try {
@@ -343,8 +396,14 @@
   }
 
   /**
-   * Extract N-sig wrapper definition from inline <script> tags.
-   * Used as fallback for sending N-sig code to background.js.
+   * Locate and extract a page-defined N-sig wrapper array from inline script tags.
+   *
+   * Searches inline <script> elements for a variable named by wrapperName that is
+   * assigned to an array and returns a self-contained `var NAME = [ ... ];` code
+   * snippet suitable for evaluation. Returns `null` if no such wrapper is found.
+   *
+   * @param {string} wrapperName - The global wrapper variable name to locate.
+   * @returns {string|null} `string` containing `var <wrapperName> = [ ... ];` when found, `null` otherwise.
    */
   function extractNSigWrapperFromPage(wrapperName) {
     try {
@@ -371,6 +430,21 @@
     return null;
   }
 
+  /**
+   * Collects available YouTube page data useful for player/script analysis and deciphering.
+   *
+   * Gathers the in-page player response, player JS URL, visitor and session identifiers, API/client metadata, signed-timestamp (STS), logged-in state, and videoId when present; normalizes the playerUrl to an absolute https URL when possible.
+   *
+   * @returns {Object} An object containing any of the following properties found on the page:
+   *  - playerResponse: The parsed player response object (e.g., ytInitialPlayerResponse or movie_player.getPlayerResponse()).
+   *  - playerUrl: The resolved PLAYER_JS_URL or equivalent URL for the player script, normalized to start with `https://` if detected.
+   *  - visitorData: Visitor identifier (VISITOR_DATA) when available.
+   *  - sts: Signature timestamp (STS) when available.
+   *  - apiKey: INNERTUBE_API_KEY when available.
+   *  - clientVersion: INNERTUBE_CLIENT_VERSION when available.
+   *  - loggedIn: Boolean indicating logged-in state when available.
+   *  - videoId: Video identifier from the player element when available.
+   */
   function extractPageData() {
     var data = {};
 
@@ -567,6 +641,15 @@
     );
   }
 
+  /**
+   * Locate the name of the signature decipher function within YouTube player JavaScript.
+   *
+   * Scans the provided player JS source for known invocation and definition patterns (including common
+   * set/encodeURIComponent usages, split/join function forms, and signature-transform heuristics) and
+   * returns the first matching function name.
+   * @param {string} js - The player JavaScript source code to search.
+   * @returns {string|null} The decipher function name if found, `null` otherwise.
+   */
   function findCipherFunctionName(js) {
     var patterns = [
       /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
@@ -623,6 +706,20 @@
     return null;
   }
 
+  /**
+   * Attempts to extract a new-style "dispatch" cipher implementation from a YouTube player JS blob.
+   *
+   * Searches the provided player JS for a dispatch-based cipher call and, if found, builds a self-contained
+   * JavaScript snippet that defines the lookup array, helper object, and cipher function and then invokes
+   * the cipher with a placeholder argument name.
+   *
+   * @param {string} js - The source text of player.js to analyze.
+   * @returns {{cipherCode: string, argName: string}|null} An object containing:
+   *   - `cipherCode`: a self-contained JS snippet that, when evaluated with a variable named as `argName`,
+   *     will return the deciphered signature; and
+   *   - `argName`: the placeholder parameter name the snippet expects for the signature value.
+   *   Returns `null` if no dispatch cipher could be located or extracted.
+   */
   function extractDispatchCipher(js) {
     // New-style dispatch cipher (2025+): funcName(dispatchValue, decodeURIComponent(p.s))
     var callMatch = js.match(
@@ -764,6 +861,14 @@
     return { cipherCode: code, argName: argName };
   }
 
+  /**
+   * Extracts a self-contained cipher code snippet and the cipher function's argument name from YouTube player JavaScript.
+   *
+   * Attempts a new-style dispatch cipher extraction first, then falls back to legacy function patterns; when successful returns a runnable snippet that defines any helper object, splits the input argument into an array, includes the cipher function body (ensuring it returns the transformed string), and the argument name used by the function.
+   *
+   * @param {string} js - The full player JavaScript source to analyze.
+   * @returns {{cipherCode: string, argName: string}|null} An object with `cipherCode` (the reconstructed code snippet) and `argName` (the cipher function's parameter name) when extraction succeeds, or `null` if no cipher could be extracted.
+   */
   function extractCipher(js) {
     // === Try new-style dispatch cipher first (2025+) ===
     var dispatchResult = extractDispatchCipher(js);
@@ -1177,6 +1282,26 @@
     return null;
   }
 
+  /**
+   * Parse a YouTube player.js URL to extract decipher (cipher) and N-sig resolution data.
+   *
+   * Parses and caches analysis of the player JavaScript referenced by playerUrl, attempting
+   * multiple strategies: direct global inspection for runtime helpers, and fallback code
+   * extraction from the fetched player.js. Also extracts a signature timestamp (STS) when present.
+   *
+   * @param {string} playerUrl - The full URL of the player.js to fetch and analyze.
+   * @returns {Object} An object with parsing results:
+   *   - cipher: null or an object describing extracted cipher code or helper info.
+   *   - nSig: null or an object describing extracted N-sig code or wrapper info.
+   *   - sts: number|null — the extracted signature timestamp, or null if not found.
+   *   - cipherActions: null or Array — direct list of cipher actions derived from runtime globals.
+   *   - nSigFn: null or Function — direct N-sig transform function obtained from runtime globals.
+   *   - externalDeps: Object — detected external dependency names/metadata used during analysis.
+   *   - extractionErrors: Array<string> — present when extraction attempts failed (optional).
+   *   - fetchFailed: true when the player.js could not be fetched after retries (optional).
+   *
+   * The function caches the returned result keyed by playerUrl.
+   */
   async function parsePlayerJs(playerUrl) {
     if (playerCache[playerUrl]) {
       console.log(TAG, "Using cached player data for", playerUrl);
@@ -1318,6 +1443,20 @@
     return result;
   }
 
+  /**
+   * Normalize and resolve streaming formats from a player response, applying decipher and N-signature transforms when available.
+   *
+   * @param {Object} playerResponse - YouTube player response object; expected to contain `streamingData` with `formats` and/or `adaptiveFormats`.
+   * @param {Object} playerData - Parsed player data providing decipher information (e.g., `cipherActions`, `cipher`, `nSigFn`, `nSig`).
+   * @returns {Array<Object>} An array of resolved format objects. Each object contains:
+   * - `itag`: format identifier,
+   * - `url`: fully resolved URL with deciphered signature and applied N-signature if available,
+   * - `mimeType`: original MIME type string,
+   * - `quality` / `qualityLabel`: human-readable quality fields,
+   * - `width`, `height`, `fps`, `bitrate`, `audioBitrate`, `audioQuality`, `contentLength`,
+   * - `codecs`: extracted codecs string,
+   * - `isVideo`, `isAudio`, `isMuxed`: boolean flags describing the stream.
+   */
   function resolveFormats(playerResponse, playerData) {
     var sd = playerResponse.streamingData;
     if (!sd) return [];
@@ -1485,6 +1624,27 @@
     }
   }
 
+  /**
+   * Orchestrates page analysis to resolve video formats and sends the enriched data to the content script.
+   *
+   * Extracts page-level player data, fetches and parses the player JS when available, resolves streaming formats
+   * (applying cipher and N-sig transformations when possible), and posts a message to the content script with the
+   * resulting payload.
+   *
+   * The function populates or augments the page data object with fields such as:
+   * - resolvedFormats: array of normalized format objects
+   * - formatSource: "page_deciphered" or "page_code_only"
+   * - sts: signature timestamp (if found)
+   * - cipherActions: direct cipher action list (when available)
+   * - cipherCode / cipherArgName: legacy cipher code fallback
+   * - nSigCode: legacy N-sig code fallback
+   * - directCipher / directNSig: booleans indicating direct-function availability
+   * - extractionErrors: array of extraction error messages (when present)
+   * - resolveError: error message if format resolution failed
+   *
+   * Side effects:
+   * - Posts the assembled data to the page via sendToContentScript().
+   */
   async function processVideo() {
     console.log(TAG, "Processing video...");
     var data = extractPageData();
