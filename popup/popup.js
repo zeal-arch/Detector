@@ -167,7 +167,7 @@ let currentVideoTitle = "";
 let currentVideoId = null;
 let currentVideoInfo = null;
 let activeMergeInProgress = false;
-let tabVideoId = null;  // videoId extracted directly from the tab URL (ground truth)
+let tabVideoId = null; // videoId extracted directly from the tab URL (ground truth)
 let mergePollTimer = null;
 let downloadPollTimer = null;
 
@@ -259,7 +259,14 @@ function renderVideo(info) {
   currentFormats = formats;
   currentVideoTitle = title || "Video";
   currentVideoId = videoId || null;
-  console.log("[POPUP] renderVideo — videoId from response:", videoId, "| tabVideoId:", tabVideoId, "| title:", title?.substring(0, 40));
+  console.log(
+    "[POPUP] renderVideo — videoId from response:",
+    videoId,
+    "| tabVideoId:",
+    tabVideoId,
+    "| title:",
+    title?.substring(0, 40),
+  );
 
   // DRM Warning
   const drmWarning = drmDetected
@@ -934,8 +941,9 @@ function startMergePoll() {
         const titleHtml = merge.videoTitle
           ? `<div class="banner-title">${escapeHtml(merge.videoTitle)}</div>`
           : "";
-        const bannerHtml = (merge.videoTitle || merge.videoThumbnail)
-          ? `<div class="banner-video-row">
+        const bannerHtml =
+          merge.videoTitle || merge.videoThumbnail
+            ? `<div class="banner-video-row">
               ${thumbHtml}
               <div class="banner-video-info">
                 ${titleHtml}
@@ -949,7 +957,7 @@ function startMergePoll() {
                 </div>
               </div>
             </div>`
-          : `<div class="banner-row">
+            : `<div class="banner-row">
               <span class="banner-spinner"></span>
               <span class="banner-msg">${escapeHtml(msg)}</span>
               <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
@@ -1249,7 +1257,9 @@ async function init() {
       // for non-YouTube pages.
       const pageVideoId = tabVideoId || currentVideoId;
       const isSameVideo =
-        pageVideoId && activeMerge.videoId && pageVideoId === activeMerge.videoId;
+        pageVideoId &&
+        activeMerge.videoId &&
+        pageVideoId === activeMerge.videoId;
       console.log(
         "[POPUP] Merge active — tabVideoId:",
         tabVideoId,
@@ -1433,8 +1443,13 @@ async function checkAndShowUpdate() {
     };
 
     document.getElementById("updateDismissBtn").onclick = async () => {
-      banner.style.display = "none";
-      await chrome.runtime.sendMessage({ action: "DISMISS_UPDATE" });
+      try {
+        await chrome.runtime.sendMessage({ action: "DISMISS_UPDATE" });
+        banner.style.display = "none";
+      } catch (e) {
+        console.warn("[UpdateBanner] Dismiss failed:", e);
+        banner.style.display = "none"; // Hide anyway for UX
+      }
     };
   } catch (e) {
     console.warn("[UpdateBanner]", e);

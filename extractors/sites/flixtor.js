@@ -51,10 +51,9 @@
   const originalXHRSend = XMLHttpRequest.prototype.send;
 
   XMLHttpRequest.prototype.open = function (method, url, ...args) {
-    this._requestUrl = url;
+    this._requestUrl = typeof url === "string" ? url : url?.toString?.() || "";
     return originalXHROpen.call(this, method, url, ...args);
   };
-
   XMLHttpRequest.prototype.send = function (body) {
     this.addEventListener("load", function () {
       try {
@@ -74,10 +73,7 @@
         if (response && typeof response === "string") {
           // Check if the response body itself is an HLS manifest
           const trimmed = response.trimStart();
-          if (
-            trimmed.startsWith("#EXTM3U") ||
-            trimmed.startsWith("#EXT-X-")
-          ) {
+          if (trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-")) {
             notifyVideo({
               url: _url,
               type: "HLS",
@@ -108,6 +104,13 @@
                   if (/\.mpd(\?|#|$)/i.test(obj)) return obj;
                 }
                 if (typeof obj === "object" && obj !== null) {
+                  if (Array.isArray(obj)) {
+                    for (const item of obj) {
+                      const found = findStreamUrl(item, depth + 1);
+                      if (found) return found;
+                    }
+                    return null;
+                  }
                   const priorityKeys = [
                     "url",
                     "src",
@@ -135,12 +138,6 @@
                   });
                   for (const [, value] of sorted) {
                     const found = findStreamUrl(value, depth + 1);
-                    if (found) return found;
-                  }
-                }
-                if (Array.isArray(obj)) {
-                  for (const item of obj) {
-                    const found = findStreamUrl(item, depth + 1);
                     if (found) return found;
                   }
                 }
@@ -193,10 +190,7 @@
 
           // Check if the response itself is an HLS manifest
           const trimmed = text.trimStart();
-          if (
-            trimmed.startsWith("#EXTM3U") ||
-            trimmed.startsWith("#EXT-X-")
-          ) {
+          if (trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-")) {
             notifyVideo({
               url: url,
               type: "HLS",
@@ -245,10 +239,7 @@
   URL.createObjectURL = function (obj) {
     const blobUrl = originalCreateObjectURL.call(this, obj);
     if (obj instanceof MediaSource) {
-      console.log(
-        "[Flixtor] MSE blob URL created:",
-        blobUrl.substring(0, 60),
-      );
+      console.log("[Flixtor] MSE blob URL created:", blobUrl.substring(0, 60));
       setTimeout(() => scanForBlobVideo(), 1500);
     }
     return blobUrl;

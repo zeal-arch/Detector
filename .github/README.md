@@ -70,9 +70,8 @@ That's it. The extension detects media on the page automatically.
 **The downloaded video has no audio (or no video)**
 
 - This usually means the merging step failed. Try the download again.
-- If it keeps happening, try picking a lower quality. The higher quality streams are sometimes in separate video/audio tracks that need merging.
-
-**Video quality is low / doesn't match what I selected**
+- If it keeps happening, try picking a lower quality. The higher-quality streams are sometimes in separate video/audio tracks that need merging.
+  **Video quality is low / doesn't match what I selected**
 
 - Some sites only serve certain qualities based on your account, region, or whether you're logged in.
 - Make sure you're selecting the right option in the quality picker.
