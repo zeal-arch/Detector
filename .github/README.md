@@ -20,8 +20,6 @@ Please respect copyright laws and terms of service when using this.
 
 **Social media:** Facebook, Instagram, Twitter/X, TikTok, Reddit, Snapchat, Pinterest, LinkedIn, Tumblr, VK, Bluesky, and more
 
-**Streaming:** Netflix, Disney+, HBO Max, Hulu, Amazon Prime Video, Peacock, Paramount+, Crunchyroll, Tubi, Pluto TV, and more
-
 **Live streaming:** Twitch, Kick, DLive, Trovo, and more
 
 **Music/Audio:** SoundCloud, Spotify, Deezer, Bandcamp, Audiomack, Mixcloud, and more
