@@ -1231,8 +1231,16 @@ async function addMergeHeaders(videoUrl, audioUrl) {
     action: {
       type: "modifyHeaders",
       requestHeaders: [
-        { header: "Origin", operation: "set", value: "https://www.youtube.com" },
-        { header: "Referer", operation: "set", value: "https://www.youtube.com/" },
+        {
+          header: "Origin",
+          operation: "set",
+          value: "https://www.youtube.com",
+        },
+        {
+          header: "Referer",
+          operation: "set",
+          value: "https://www.youtube.com/",
+        },
       ],
     },
     condition: {
@@ -1801,6 +1809,17 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let bestVideoDetails = null;
   let triedWebEmbedded = false;
 
+  // Build a merged sig object that fills in nSigBundled / nSigCode from
+  // pageData when the player-derived sig is missing those fields.
+  const mergedSig =
+    sig || nSigCode
+      ? {
+          ...sig,
+          nSigCode: sig?.nSigCode ?? nSigCode ?? null,
+          nSigBundled: sig?.nSigBundled ?? pageData.nSigBundled ?? null,
+        }
+      : null;
+
   for (const key of order) {
     try {
       console.log("[BG] Trying InnerTube client:", key);
@@ -1868,8 +1887,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         allFormats.push(...info.formats);
         successfulClients.push(key);
 
-        if (sig?.nSigCode || nSigCode) {
-          await applyNSig(info.formats, sig || { nSigCode, nSigBundled: pageData.nSigBundled || null });
+        if (mergedSig?.nSigCode) {
+          await applyNSig(info.formats, mergedSig);
         }
 
         if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -1892,8 +1911,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (sig?.nSigCode || nSigCode) {
-            await applyNSig(ciphered.formats, sig || { nSigCode, nSigBundled: pageData.nSigBundled || null });
+          if (mergedSig?.nSigCode) {
+            await applyNSig(ciphered.formats, mergedSig);
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -1923,8 +1942,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (sig?.nSigCode || nSigCode) {
-            await applyNSig(ciphered.formats, sig || { nSigCode, nSigBundled: pageData.nSigBundled || null });
+          if (mergedSig?.nSigCode) {
+            await applyNSig(ciphered.formats, mergedSig);
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -2861,7 +2880,10 @@ async function loadSignatureData(playerUrl) {
   try {
     let pageVideoId = null;
     for (const [, td] of tabData) {
-      if (td?.videoId) { pageVideoId = td.videoId; break; }
+      if (td?.videoId) {
+        pageVideoId = td.videoId;
+        break;
+      }
     }
     const pageUrl = pageVideoId
       ? `https://www.youtube.com/watch?v=${pageVideoId}`
@@ -3152,7 +3174,9 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
   // 2025+ architecture: helper may live in inline <script> in page HTML
   if (!helperBlock && pageHtml) {
     console.log(
-      "[BG] Raw cipher helper '" + helperName + "' not in player.js — searching page HTML",
+      "[BG] Raw cipher helper '" +
+        helperName +
+        "' not in player.js — searching page HTML",
     );
     const htmlHelperRe = new RegExp(
       `(?:var\\s+)?${escRe(helperName)}\\s*=\\s*\\{`,
@@ -4407,7 +4431,13 @@ async function doMergedDownload(msg) {
             console.error("[BG] Merge message error:", errMsg);
             // Offscreen document was likely destroyed (DevTools, Chrome GC, etc.)
             // If we have resume data, try to auto-retry with fresh URLs
-            if (videoId && videoItag && audioItag && !msg.isResume && !msg.isRetry403) {
+            if (
+              videoId &&
+              videoItag &&
+              audioItag &&
+              !msg.isResume &&
+              !msg.isRetry403
+            ) {
               console.log(
                 "[BG] Offscreen died — will auto-retry with fresh URLs",
               );
@@ -4922,6 +4952,22 @@ chrome.webRequest.onResponseStarted.addListener(
   ["responseHeaders"],
 );
 
+// Helper: returns true when an origin string belongs to any YouTube domain
+// (www.youtube.com, m.youtube.com, music.youtube.com, youtu.be, etc.).
+function isYouTubeOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const host = new URL(origin).hostname;
+    return (
+      host === "youtu.be" ||
+      host.endsWith(".youtube.com") ||
+      host === "youtube.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
 // ============ YouTube URL Sniffing (IDM-style) ============
 // Captures fully-decrypted googlevideo.com/videoplayback URLs that YouTube's
 // player.js generates. These URLs already have cipher & N-sig applied, so we
@@ -4940,11 +4986,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       // to the request's initiator origin so we capture URLs even before the
       // content script has fired VIDEO_DETECTED (the player starts fetching
       // media segments very early in the page lifecycle).
-      if (
-        !isYouTubeTab(details.tabId) &&
-        details.initiator !== "https://www.youtube.com" &&
-        details.initiator !== "https://music.youtube.com"
-      )
+      if (!isYouTubeTab(details.tabId) && !isYouTubeOrigin(details.initiator))
         return;
 
       const mime = decodeURIComponent(url.searchParams.get("mime") || "");
