@@ -1204,31 +1204,42 @@ async function fetchWithDNRHeaders(url, headers, fetchOptions = {}) {
 }
 
 const MERGE_UA_RULE_ID = 50000;
+const MERGE_ORIGIN_RULE_ID = 50001;
 
 async function addMergeHeaders(videoUrl, audioUrl) {
-  // Only ANDROID_VR URLs need User-Agent spoofing for downloads.
-  // YouTube has progressively blocked ios/android client direct downloads (403),
-  // so we match the extension-youtube approach: only spoof UA for ANDROID_VR,
-  // and use a simple urlFilter (proven to work) instead of regexFilter.
-  const isVR =
-    /[?&]c=ANDROID_VR/i.test(videoUrl || "") ||
-    /[?&]c=ANDROID_VR/i.test(audioUrl || "");
+  // YouTube CDN requires Origin + Referer headers from youtube.com for ALL
+  // client types.  Without them the offscreen fetch sends
+  // Origin: chrome-extension://... which yields HTTP 403.
+  // Additionally, ANDROID_VR URLs need a matching User-Agent.
 
-  if (!isVR) {
-    console.log("[BG] No ANDROID_VR URLs in merge — skipping UA rule");
+  const isYouTube =
+    /googlevideo\.com\//i.test(videoUrl || "") ||
+    /googlevideo\.com\//i.test(audioUrl || "");
+
+  if (!isYouTube) {
+    console.log("[BG] Non-YouTube merge — skipping header rules");
     return [];
   }
 
-  const rule = {
-    id: MERGE_UA_RULE_ID,
+  const ruleIds = [];
+  const rules = [];
+
+  // --- Rule 1: Always set Origin + Referer for googlevideo.com ---
+  rules.push({
+    id: MERGE_ORIGIN_RULE_ID,
     priority: 3,
     action: {
       type: "modifyHeaders",
       requestHeaders: [
         {
-          header: "User-Agent",
+          header: "Origin",
           operation: "set",
-          value: CLIENTS.android_vr.userAgent,
+          value: "https://www.youtube.com",
+        },
+        {
+          header: "Referer",
+          operation: "set",
+          value: "https://www.youtube.com/",
         },
       ],
     },
@@ -1236,20 +1247,53 @@ async function addMergeHeaders(videoUrl, audioUrl) {
       urlFilter: "||googlevideo.com/",
       resourceTypes: ["xmlhttprequest", "media", "other"],
     },
-  };
+  });
+  ruleIds.push(MERGE_ORIGIN_RULE_ID);
+
+  // --- Rule 2: ANDROID_VR also needs User-Agent spoofing ---
+  const isVR =
+    /[?&]c=ANDROID_VR/i.test(videoUrl || "") ||
+    /[?&]c=ANDROID_VR/i.test(audioUrl || "");
+
+  if (isVR) {
+    rules.push({
+      id: MERGE_UA_RULE_ID,
+      priority: 4, // higher priority so UA also applies
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          {
+            header: "User-Agent",
+            operation: "set",
+            value: CLIENTS.android_vr.userAgent,
+          },
+        ],
+      },
+      condition: {
+        urlFilter: "||googlevideo.com/",
+        resourceTypes: ["xmlhttprequest", "media", "other"],
+      },
+    });
+    ruleIds.push(MERGE_UA_RULE_ID);
+  }
 
   await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [MERGE_UA_RULE_ID],
-    addRules: [rule],
+    removeRuleIds: [MERGE_ORIGIN_RULE_ID, MERGE_UA_RULE_ID],
+    addRules: rules,
   });
-  console.log("[BG] Added ANDROID_VR User-Agent DNR rule for merge");
-  return [MERGE_UA_RULE_ID];
+  console.log(
+    `[BG] Added merge DNR rules: Origin/Referer${isVR ? " + ANDROID_VR UA" : ""}`,
+  );
+  return ruleIds;
 }
 
 async function removeMergeHeaders(ruleIds) {
-  if (!ruleIds || !ruleIds.length) return;
+  // Always attempt to remove both possible rule IDs to avoid stale rules
+  const ids = Array.from(
+    new Set([...(ruleIds || []), MERGE_ORIGIN_RULE_ID, MERGE_UA_RULE_ID]),
+  );
   await chrome.declarativeNetRequest
-    .updateSessionRules({ removeRuleIds: ruleIds })
+    .updateSessionRules({ removeRuleIds: ids })
     .catch(() => {});
   console.log("[BG] Removed merge DNR rules");
 }
@@ -1765,6 +1809,17 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let bestVideoDetails = null;
   let triedWebEmbedded = false;
 
+  // Build a merged sig object that fills in nSigBundled / nSigCode from
+  // pageData when the player-derived sig is missing those fields.
+  const mergedSig =
+    sig || nSigCode
+      ? {
+          ...sig,
+          nSigCode: sig?.nSigCode ?? nSigCode ?? null,
+          nSigBundled: sig?.nSigBundled ?? pageData.nSigBundled ?? null,
+        }
+      : null;
+
   for (const key of order) {
     try {
       console.log("[BG] Trying InnerTube client:", key);
@@ -1832,8 +1887,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         allFormats.push(...info.formats);
         successfulClients.push(key);
 
-        if (sig?.nSigCode || nSigCode) {
-          await applyNSig(info.formats, sig || { nSigCode });
+        if (mergedSig?.nSigCode) {
+          await applyNSig(info.formats, mergedSig);
         }
 
         if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -1856,8 +1911,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (sig?.nSigCode || nSigCode) {
-            await applyNSig(ciphered.formats, sig || { nSigCode });
+          if (mergedSig?.nSigCode) {
+            await applyNSig(ciphered.formats, mergedSig);
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -1887,8 +1942,8 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (sig?.nSigCode || nSigCode) {
-            await applyNSig(ciphered.formats, sig || { nSigCode });
+          if (mergedSig?.nSigCode) {
+            await applyNSig(ciphered.formats, mergedSig);
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -2818,10 +2873,22 @@ async function loadSignatureData(playerUrl) {
 
   // Also try to fetch the YouTube page HTML to find cipher helper
   // (2025+ architecture: helper defined in inline scripts, not in base.js)
+  // The helper (e.g. eO) and N-sig wrapper (e.g. R8K) are only present on
+  // watch pages, NOT on the homepage.  Try to find a videoId from cached
+  // tab data so we fetch the right page.
   let pageHtml = null;
   try {
-    // Extract video ID from any cached tab data to build the page URL
-    const pageUrl = "https://www.youtube.com/";
+    let pageVideoId = null;
+    for (const [, td] of tabData) {
+      if (td?.videoId) {
+        pageVideoId = td.videoId;
+        break;
+      }
+    }
+    const pageUrl = pageVideoId
+      ? `https://www.youtube.com/watch?v=${pageVideoId}`
+      : "https://www.youtube.com/";
+    console.log("[BG] Fetching page HTML for cipher helper:", pageUrl);
     const pageResp = await fetch(pageUrl, { cache: "force-cache" });
     if (pageResp.ok) {
       pageHtml = await pageResp.text();
@@ -2865,7 +2932,7 @@ async function loadSignatureData(playerUrl) {
   let cipherCode = null;
   let cipherArgName = null;
   if (!actionList) {
-    const extracted = extractRawCipherCode(js);
+    const extracted = extractRawCipherCode(js, pageHtml);
     if (extracted) {
       cipherCode = extracted.code;
       cipherArgName = extracted.argName;
@@ -3063,7 +3130,7 @@ function extractDispatchCipherActions(
   return null;
 }
 
-function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue) {
+function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
   // Find lookup array raw definition
   const lookupMatch = js.match(
     /var\s+([a-zA-Z0-9$_]+)\s*=\s*("([^"]{200,})")\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/,
@@ -3091,16 +3158,43 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue) {
   if (!helperRefMatch) return null;
   const helperName = helperRefMatch[1];
 
-  // Find helper object definition
+  // Find helper object definition — search player.js first, then page HTML
+  let helperBlock = null;
   const helperDefMatch = js.match(
     new RegExp(`(?:var\\s+|[;,]\\s*)${escRe(helperName)}\\s*=\\s*\\{`),
   );
-  if (!helperDefMatch) return null;
-  const helperBraceIdx = js.indexOf(
-    "{",
-    helperDefMatch.index + helperDefMatch[0].lastIndexOf("=") + 1,
-  );
-  const helperBlock = extractBraceBlock(js, helperBraceIdx);
+  if (helperDefMatch) {
+    const helperBraceIdx = js.indexOf(
+      "{",
+      helperDefMatch.index + helperDefMatch[0].lastIndexOf("=") + 1,
+    );
+    helperBlock = extractBraceBlock(js, helperBraceIdx);
+  }
+
+  // 2025+ architecture: helper may live in inline <script> in page HTML
+  if (!helperBlock && pageHtml) {
+    console.log(
+      "[BG] Raw cipher helper '" +
+        helperName +
+        "' not in player.js — searching page HTML",
+    );
+    const htmlHelperRe = new RegExp(
+      `(?:var\\s+)?${escRe(helperName)}\\s*=\\s*\\{`,
+    );
+    const htmlMatch = htmlHelperRe.exec(pageHtml);
+    if (htmlMatch) {
+      const htmlBraceIdx = htmlMatch.index + htmlMatch[0].lastIndexOf("{");
+      helperBlock = extractBraceBlock(pageHtml, htmlBraceIdx);
+      if (helperBlock) {
+        console.log(
+          "[BG] Raw cipher helper found in page HTML:",
+          helperBlock.length,
+          "chars",
+        );
+      }
+    }
+  }
+
   if (!helperBlock) return null;
 
   // Build self-contained code with a unique arg name
@@ -3267,7 +3361,7 @@ function extractCipherActions(js, pageHtml) {
   return list.length ? list : null;
 }
 
-function extractRawCipherCode(js) {
+function extractRawCipherCode(js, pageHtml) {
   // === Try new-style dispatch cipher first (2025+) ===
   const dispatchCallMatch = js.match(
     /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
@@ -3277,6 +3371,7 @@ function extractRawCipherCode(js) {
       js,
       dispatchCallMatch[1],
       dispatchCallMatch[2],
+      pageHtml,
     );
     if (raw) return raw;
   }
@@ -4250,6 +4345,8 @@ async function resumeMergeFromState(mergeState) {
     videoItag,
     audioItag,
     videoId,
+    videoTitle: mergeState.videoTitle || null,
+    videoThumbnail: mergeState.videoThumbnail || null,
     isResume: true,
   });
 
@@ -4266,6 +4363,7 @@ async function doMergedDownload(msg) {
     videoId,
     videoTitle,
     videoThumbnail,
+    isRetry403,
   } = msg;
 
   if (!videoUrl || !audioUrl) {
@@ -4333,7 +4431,13 @@ async function doMergedDownload(msg) {
             console.error("[BG] Merge message error:", errMsg);
             // Offscreen document was likely destroyed (DevTools, Chrome GC, etc.)
             // If we have resume data, try to auto-retry with fresh URLs
-            if (videoId && videoItag && audioItag && !msg.isResume) {
+            if (
+              videoId &&
+              videoItag &&
+              audioItag &&
+              !msg.isResume &&
+              !msg.isRetry403
+            ) {
               console.log(
                 "[BG] Offscreen died — will auto-retry with fresh URLs",
               );
@@ -4410,6 +4514,123 @@ async function doMergedDownload(msg) {
           })
           .catch(() => {});
         return { success: false, error: "Retry failed: " + retryErr.message };
+      }
+    }
+
+    // ===============================================================
+    // 403 Fallback — re-fetch fresh URLs with full tier cascade
+    // (N-sig transform, yt-dlp bundled, sniffed IDM-style URLs)
+    // ===============================================================
+    if (
+      !result.success &&
+      result.error &&
+      result.error.includes("403") &&
+      videoId &&
+      videoItag &&
+      audioItag &&
+      !msg.isRetry403
+    ) {
+      console.log(
+        "[BG] ★ Download got 403 — retrying with fresh URLs",
+        "(N-sig + sniffed fallback)...",
+      );
+
+      // Clean up for retry
+      await removeMergeHeaders(mergeRuleIds);
+      activeMergeId = null;
+      stopMergeKeepalive();
+
+      try {
+        // Re-resolve formats through the full tier cascade:
+        //   Tier 1 (inject.js) → Tier 2 (InnerTube API) → Tier S (sniffed) → Tier 3 (scrape)
+        // Each tier applies N-sig transform (plain → yt-dlp bundled fallback)
+        // and enriches with sniffed googlevideo.com URLs when available.
+        const resumeTabId = findTabIdForVideoId(videoId);
+        const info = await getFormats(videoId, {}, resumeTabId);
+
+        if (!info?.formats?.length) {
+          throw new Error("No formats available on retry");
+        }
+
+        // Try the same itags first
+        let vFmt = info.formats.find(
+          (f) => String(f.itag) === String(videoItag),
+        );
+        let aFmt = info.formats.find(
+          (f) => String(f.itag) === String(audioItag),
+        );
+
+        // If exact itags unavailable, pick the best available alternatives
+        if (!vFmt?.url) {
+          vFmt = info.formats
+            .filter((f) => f.isVideo && !f.isMuxed && f.url)
+            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+          if (vFmt) {
+            console.log(
+              "[BG] 403 retry: original video itag not found, using itag",
+              vFmt.itag,
+              vFmt.qualityLabel || vFmt.quality,
+            );
+          }
+        }
+        if (!aFmt?.url) {
+          aFmt = info.formats
+            .filter((f) => f.isAudio && f.url)
+            .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+          if (aFmt) {
+            console.log(
+              "[BG] 403 retry: original audio itag not found, using itag",
+              aFmt.itag,
+            );
+          }
+        }
+
+        if (!vFmt?.url || !aFmt?.url) {
+          throw new Error("Could not find working video+audio URLs on retry");
+        }
+
+        console.log(
+          "[BG] 403 retry: got fresh URLs — video itag",
+          vFmt.itag,
+          "audio itag",
+          aFmt.itag,
+          "client:",
+          vFmt.clientUsed || "unknown",
+        );
+
+        const retryResult = await doMergedDownload({
+          videoUrl: vFmt.url,
+          audioUrl: aFmt.url,
+          filename,
+          videoItag: vFmt.itag,
+          audioItag: aFmt.itag,
+          videoId,
+          videoTitle,
+          videoThumbnail,
+          isRetry403: true, // Prevent infinite retry loop
+        });
+        return retryResult;
+      } catch (retryErr) {
+        console.error("[BG] 403 retry failed:", retryErr.message);
+        chrome.storage.session
+          .set({
+            activeMerge: {
+              mergeId,
+              filename,
+              videoId,
+              videoItag,
+              audioItag,
+              status: "failed",
+              error: "403 retry failed: " + retryErr.message,
+              phase: "error",
+              percent: 0,
+            },
+          })
+          .catch(() => {});
+        return {
+          success: false,
+          error: "403 retry failed: " + retryErr.message,
+        };
       }
     }
 
@@ -4731,6 +4952,22 @@ chrome.webRequest.onResponseStarted.addListener(
   ["responseHeaders"],
 );
 
+// Helper: returns true when an origin string belongs to any YouTube domain
+// (www.youtube.com, m.youtube.com, music.youtube.com, youtu.be, etc.).
+function isYouTubeOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const host = new URL(origin).hostname;
+    return (
+      host === "youtu.be" ||
+      host.endsWith(".youtube.com") ||
+      host === "youtube.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
 // ============ YouTube URL Sniffing (IDM-style) ============
 // Captures fully-decrypted googlevideo.com/videoplayback URLs that YouTube's
 // player.js generates. These URLs already have cipher & N-sig applied, so we
@@ -4745,8 +4982,12 @@ chrome.webRequest.onBeforeRequest.addListener(
       const itag = parseInt(url.searchParams.get("itag"));
       if (!itag) return;
 
-      // Only capture for YouTube tabs (tabData has videoId set)
-      if (!isYouTubeTab(details.tabId)) return;
+      // Capture for YouTube tabs.  Check tabData first (fast), then fall back
+      // to the request's initiator origin so we capture URLs even before the
+      // content script has fired VIDEO_DETECTED (the player starts fetching
+      // media segments very early in the page lifecycle).
+      if (!isYouTubeTab(details.tabId) && !isYouTubeOrigin(details.initiator))
+        return;
 
       const mime = decodeURIComponent(url.searchParams.get("mime") || "");
       const clen = parseInt(url.searchParams.get("clen")) || 0;
