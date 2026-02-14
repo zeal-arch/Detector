@@ -167,6 +167,7 @@ let currentVideoTitle = "";
 let currentVideoId = null;
 let currentVideoInfo = null;
 let activeMergeInProgress = false;
+let tabVideoId = null;  // videoId extracted directly from the tab URL (ground truth)
 let mergePollTimer = null;
 let downloadPollTimer = null;
 
@@ -258,6 +259,7 @@ function renderVideo(info) {
   currentFormats = formats;
   currentVideoTitle = title || "Video";
   currentVideoId = videoId || null;
+  console.log("[POPUP] renderVideo — videoId from response:", videoId, "| tabVideoId:", tabVideoId, "| title:", title?.substring(0, 40));
 
   // DRM Warning
   const drmWarning = drmDetected
@@ -916,10 +918,46 @@ function startMergePoll() {
       const pct = Math.round(merge.percent || 0);
       const msg = merge.message || merge.phase || "Merging...";
 
-      // Check if we have video card elements (progressWrap exists)
-      const hasProgressUI = document.getElementById("progressWrap");
-      if (hasProgressUI) {
+      // Only update inline progress when the merge belongs to the displayed video;
+      // otherwise update the banner so the new video card stays independent.
+      // Use tabVideoId (URL ground truth) as primary identifier.
+      const pageVideoId = tabVideoId || currentVideoId;
+      const isSameVideo =
+        pageVideoId && merge.videoId && pageVideoId === merge.videoId;
+      if (isSameVideo) {
         showProgress(pct, `${msg} · ${pct}%`);
+      } else if (!isSameVideo && !document.getElementById("activeBanner")) {
+        // Banner was never created (edge case) — create it now
+        const thumbHtml = merge.videoThumbnail
+          ? `<img src="${escapeHtml(merge.videoThumbnail)}" class="banner-thumb" alt="" />`
+          : "";
+        const titleHtml = merge.videoTitle
+          ? `<div class="banner-title">${escapeHtml(merge.videoTitle)}</div>`
+          : "";
+        const bannerHtml = (merge.videoTitle || merge.videoThumbnail)
+          ? `<div class="banner-video-row">
+              ${thumbHtml}
+              <div class="banner-video-info">
+                ${titleHtml}
+                <div class="banner-row" style="margin-top:4px">
+                  <span class="banner-spinner"></span>
+                  <span class="banner-msg">${escapeHtml(msg)}</span>
+                  <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                </div>
+                <div class="banner-bar-bg">
+                  <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                </div>
+              </div>
+            </div>`
+          : `<div class="banner-row">
+              <span class="banner-spinner"></span>
+              <span class="banner-msg">${escapeHtml(msg)}</span>
+              <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+            </div>
+            <div class="banner-bar-bg">
+              <div class="banner-bar-fill" style="width: ${pct}%"></div>
+            </div>`;
+        showBanner("active", bannerHtml);
       } else {
         // Update the merge banner
         const banner = document.getElementById("activeBanner");
@@ -1127,6 +1165,7 @@ async function showActiveDownloads() {
 async function init() {
   if (currentView === "settings") return;
   renderLoading();
+  tabVideoId = null; // Reset on each init
 
   try {
     const mergeResult = await chrome.storage.session.get("activeMerge");
@@ -1148,6 +1187,7 @@ async function init() {
         tab.url.match(/\/shorts\/([\w-]{11})/)?.[1] ||
         tab.url.match(/\/embed\/([\w-]{11})/)?.[1] ||
         tab.url.match(/\/live\/([\w-]{11})/)?.[1];
+      tabVideoId = videoId || null; // Store URL-derived videoId as ground truth
 
       if (!videoId) {
         renderNoVideo();
@@ -1202,10 +1242,26 @@ async function init() {
     }
 
     if (activeMerge && activeMerge.status === "active") {
-      // Check if we have video card elements (progressWrap exists)
-      const hasProgressUI = document.getElementById("progressWrap");
-      if (hasProgressUI) {
-        // We're on the video page - use inline progress
+      // Show inline progress only when the current card IS the merging video;
+      // otherwise always show a banner on top so the new video card stays usable.
+      // Use tabVideoId (from URL) as primary check — it's the ground truth for
+      // what the user is currently viewing. Fall back to currentVideoId only
+      // for non-YouTube pages.
+      const pageVideoId = tabVideoId || currentVideoId;
+      const isSameVideo =
+        pageVideoId && activeMerge.videoId && pageVideoId === activeMerge.videoId;
+      console.log(
+        "[POPUP] Merge active — tabVideoId:",
+        tabVideoId,
+        "| currentVideoId:",
+        currentVideoId,
+        "| merge.videoId:",
+        activeMerge.videoId,
+        "| isSameVideo:",
+        isSameVideo,
+      );
+      if (isSameVideo) {
+        // Same video – use inline progress on this card
         showProgress(
           activeMerge.percent || 0,
           activeMerge.message || "Merging...",
@@ -1226,7 +1282,7 @@ async function init() {
         }
         if (select) select.disabled = true;
       } else {
-        // We're on a different tab - show merge as a banner with video card
+        // Different video or non-video page – show merge as a top banner
         const pct = Math.round(activeMerge.percent || 0);
         const hasMetadata =
           activeMerge.videoTitle || activeMerge.videoThumbnail;
@@ -1236,6 +1292,7 @@ async function init() {
         const titleHtml = activeMerge.videoTitle
           ? `<div class="banner-title">${escapeHtml(activeMerge.videoTitle)}</div>`
           : "";
+        const stopBtnHtml = `<button class="banner-stop-btn" id="bannerStopBtn" title="Cancel download">${ICONS.stop}</button>`;
         const bannerHtml = hasMetadata
           ? `<div class="banner-video-row">
               ${thumbHtml}
@@ -1245,6 +1302,7 @@ async function init() {
                   <span class="banner-spinner"></span>
                   <span class="banner-msg">${escapeHtml(activeMerge.message || "Merging...")}</span>
                   <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                  ${stopBtnHtml}
                 </div>
                 <div class="banner-bar-bg">
                   <div class="banner-bar-fill" style="width: ${pct}%"></div>
@@ -1255,11 +1313,23 @@ async function init() {
               <span class="banner-spinner"></span>
               <span class="banner-msg">${escapeHtml(activeMerge.message || "Merging...")}</span>
               <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+              ${stopBtnHtml}
             </div>
             <div class="banner-bar-bg">
               <div class="banner-bar-fill" style="width: ${pct}%"></div>
             </div>`;
         showBanner("active", bannerHtml);
+        // Attach stop handler to banner stop button
+        const bannerStopBtn = document.getElementById("bannerStopBtn");
+        if (bannerStopBtn) {
+          bannerStopBtn.onclick = async () => {
+            bannerStopBtn.disabled = true;
+            bannerStopBtn.textContent = "...";
+            try {
+              await chrome.runtime.sendMessage({ action: "CANCEL_MERGE" });
+            } catch {}
+          };
+        }
       }
       startMergePoll();
     } else if (activeMerge?.status === "complete") {
