@@ -101,4 +101,4 @@ That's it. The extension detects media on the page automatically.
 
 ## License
 
-[Unlicense](LICENSE) - public domain. Do whatever you want with it.
+[Unlicense](../LICENSE) - public domain. Do whatever you want with it.
