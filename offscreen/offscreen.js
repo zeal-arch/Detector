@@ -28,6 +28,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       handleEvalCipher(msg, sendResponse);
       return true;
 
+    case "SOLVE_PLAYER":
+      handleSolvePlayer(msg, sendResponse);
+      return true;
+
     case "MERGE_AND_DOWNLOAD":
       handleMergeAndDownload(msg, sendResponse);
       return true;
@@ -100,15 +104,57 @@ function handleEvalCipher(msg, sendResponse) {
   }, 10000);
 }
 
+function handleSolvePlayer(msg, sendResponse) {
+  const id = nextId++;
+  pending.set(id, sendResponse);
+
+  sandbox.contentWindow.postMessage(
+    {
+      id,
+      action: "SOLVE_PLAYER",
+      playerJs: msg.playerJs,
+      playerUrl: msg.playerUrl,
+      nChallenges: msg.nChallenges || [],
+      sigChallenges: msg.sigChallenges || [],
+    },
+    "*",
+  );
+
+  // Player.js parsing + execution can take a while on first run (~1-2s)
+  // Use a generous 30s timeout
+  setTimeout(() => {
+    if (pending.has(id)) {
+      console.warn("[OFFSCREEN] Player solver timed out after 30s");
+      pending.get(id)({
+        error: "Player solver timeout",
+        nResults: {},
+        sigResults: {},
+        timedOut: true,
+      });
+      pending.delete(id);
+    }
+  }, 30000);
+}
+
 window.addEventListener("message", (e) => {
   if (e.source !== sandbox.contentWindow) return;
-  const { id, results, error } = e.data || {};
+  const { id, results, error, nResults, sigResults, cached, elapsed } =
+    e.data || {};
   if (!id || !pending.has(id)) return;
 
   const respond = pending.get(id);
   pending.delete(id);
 
-  if (error) {
+  // SOLVE_PLAYER responses have nResults/sigResults instead of results
+  if (nResults !== undefined || sigResults !== undefined) {
+    respond({
+      nResults: nResults || {},
+      sigResults: sigResults || {},
+      cached,
+      elapsed,
+      error,
+    });
+  } else if (error) {
     respond({ error, results: [] });
   } else {
     respond({ results: results || [] });

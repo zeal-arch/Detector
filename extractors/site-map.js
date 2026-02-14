@@ -59,6 +59,10 @@ const SITE_EXTRACTOR_MAP = {
   "popcornflix.com": "popcornflix.js",
   "popcornmovies.org": "popcornmovies.js",
   "flixtor.to": "flixtor.js",
+  "flixtor.li": "flixtor.js",
+  "flixtor.id": "flixtor.js",
+  "flixtor.se": "flixtor.js",
+  "flixtor.is": "flixtor.js",
   "vudu.com": "vudu.js",
   "amcplus.com": "amcplus.js",
 

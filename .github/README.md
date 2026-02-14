@@ -1,166 +1,105 @@
-<div align="center">
+# Detector
 
-# 🎬 Detector
+A Chrome extension that detects and downloads videos, audio, and other media from websites. It works on 170+ sites including YouTube, Instagram, Twitter/X, TikTok, Netflix, and many more. It also has a generic mode that tries to grab media from any site not on the list.
 
-### Download videos and photos from ANYWHERE
+Please respect copyright laws and terms of service when using this.
 
-**Download videos, audio, and media from 170+ websites with one click.**\
-Chrome.
+## What it does
 
-[![Chrome](https://img.shields.io/badge/Chrome-Supported-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](#installation)
+- Finds video and audio on a page automatically (no need to paste URLs)
+- Downloads HLS (M3U8) and DASH (MPD) streams segment by segment
+- Merges separate video and audio tracks using built-in WASM (libav)
+- Lets you pick quality (360p, 720p, 1080p, etc.)
+- Handles large files up to 20GB using OPFS (disk-backed storage)
+- Downloads 4 segments at once with automatic retry
+- Shows download progress, speed, and ETA in real time
 
-[![Manifest V3](https://img.shields.io/badge/Manifest-V3-brightgreen?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/Version-1.1.0-blue?style=flat-square)](#)
-[![License](https://img.shields.io/badge/License-Unlicense-purple?style=flat-square)](LICENSE)
-[![Sites](https://img.shields.io/badge/Sites-170+-orange?style=flat-square)](#supported-websites)
+## Supported sites
 
----
+**Video:** YouTube, Vimeo, Dailymotion, Rutube, Rumble, Bitchute, Odysee, PeerTube, Streamable, and more
 
-<!-- Add your screenshot here -->
-<!-- ![Detector Screenshot](assets/screenshot.png) -->
+**Social media:** Facebook, Instagram, Twitter/X, TikTok, Reddit, Snapchat, Pinterest, LinkedIn, Tumblr, VK, Bluesky, and more
 
-</div>
+**Streaming:** Netflix, Disney+, HBO Max, Hulu, Amazon Prime Video, Peacock, Paramount+, Crunchyroll, Tubi, Pluto TV, and more
 
----
+**Live streaming:** Twitch, Kick, DLive, Trovo, and more
 
-## About
+**Music/Audio:** SoundCloud, Spotify, Deezer, Bandcamp, Audiomack, Mixcloud, and more
 
-Detector automatically finds and downloads video and audio on any webpage — from simple MP4 files to complex HLS/DASH streams. Just visit a page, click the icon, and download.
+**News:** CNN, BBC, Fox News, Reuters, Bloomberg, Al Jazeera, and more
 
-> **Note:** Please respect copyright laws and terms of service when using this extension.
+**Education:** Coursera, Udemy, Khan Academy, TED, and more
 
----
+**Asian platforms:** Bilibili, Niconico, Hotstar, Zee5, and more
 
-## ✨ Features
+**Embed players:** Brightcove, JW Player, Kaltura, Wistia, and more
 
-- **170+ supported sites** — YouTube, Instagram, Twitter/X, TikTok, Netflix, and many more
-- **HLS & DASH** — Downloads M3U8 and MPD streams segment-by-segment
-- **Stream merging** — Combines separate video + audio tracks via built-in WASM (libav)
-- **Quality selection** — Pick from 360p, 720p, 1080p, and more
-- **Auto-detection** — No URL pasting needed, media is found automatically
-- **Large files** — Disk-backed downloads up to 20GB using OPFS
-- **Parallel downloads** — 4 concurrent segments with automatic retry
-- **Real-time progress** — Speed, percentage, and ETA shown live
-- **Works everywhere** — Generic fallback catches media on any site
+If a site isn't on the list, the generic extractor will still try to find media on the page.
 
----
+## Installation
 
-## 🌐 Supported Websites
+1. Download or clone this repo
+2. Open Chrome and go to `chrome://extensions`
+3. Turn on "Developer mode" (toggle in the top right)
+4. Click "Load unpacked" and select the `Detector` folder
+5. Pin the extension to your toolbar so you can access it easily
 
-<details>
-<summary><strong>📺 Video Platforms (13+)</strong></summary>
+## How to use
 
-YouTube, Vimeo, Dailymotion, Rutube, Rumble, Bitchute, Odysee, PeerTube, DTube, Metacafe, Newgrounds, Streamable, Coub
+1. Go to a website that has video or audio
+2. Click the Detector icon in your toolbar
+3. Pick the quality you want and click download
 
-</details>
+That's it. The extension detects media on the page automatically.
 
-<details>
-<summary><strong>📱 Social Media (17+)</strong></summary>
+## Troubleshooting
 
-Facebook / FB Watch, Instagram, Twitter / X, TikTok, Reddit, Snapchat, Pinterest, LinkedIn, Tumblr, VK, OK.ru, Weibo, Bluesky, Likee, Triller
+**The extension icon doesn't show anything / no media detected**
 
-</details>
+- Make sure the video has actually started playing on the page. Some sites don't load media until you hit play.
+- Try refreshing the page and waiting a few seconds before clicking the icon.
+- Check that the extension has permissions for the site. Go to `chrome://extensions`, click "Details" on Detector, and make sure "Site access" is set to "On all sites" or at least includes the site you're on.
 
-<details>
-<summary><strong>🎬 Streaming / OTT (26+)</strong></summary>
+**Download starts but fails or gets stuck**
 
-Netflix, Disney+, HBO Max / Max, Hulu, Amazon Prime Video, Peacock, Paramount+, Starz, BritBox, Crunchyroll, CuriosityStream, Nebula, Dropout, Plex, Tubi, Pluto TV, Roku, Crackle, Popcornflix, Flixtor, AMC+, Discovery+, MX Player, LersiaPlay
+- Some sites use DRM protection that blocks downloading. There's not much you can do about that.
+- If it's a long video, give it time. Large HLS/DASH streams have hundreds of segments.
+- Try closing other tabs to free up memory. Merging video+audio in the browser uses RAM.
+- Check your disk space. Large downloads need enough free space for both the segments and the final merged file.
 
-</details>
+**The downloaded video has no audio (or no video)**
 
-<details>
-<summary><strong>🔴 Live Streaming (8+)</strong></summary>
+- This usually means the merging step failed. Try the download again.
+- If it keeps happening, try picking a lower quality. The higher quality streams are sometimes in separate video/audio tracks that need merging.
 
-Twitch, Kick, DLive, Trovo, Caffeine, AfreecaTV, TwitCasting, Huya
+**Video quality is low / doesn't match what I selected**
 
-</details>
+- Some sites only serve certain qualities based on your account, region, or whether you're logged in.
+- Make sure you're selecting the right option in the quality picker.
 
-<details>
-<summary><strong>🎵 Music & Audio (13+)</strong></summary>
+**Extension crashed or Chrome shows an error**
 
-SoundCloud, Spotify, Deezer, Bandcamp, Audiomack, Mixcloud, iHeart, TuneIn, Podbean, Spreaker, Anchor, Last.fm, Baahi Music
+- Go to `chrome://extensions`, disable and re-enable Detector.
+- If that doesn't work, remove it and load it again using the installation steps above.
+- Check the console for errors: right-click the extension icon > "Inspect popup" or go to `chrome://extensions` > Detector > "Inspect views: service worker".
 
-</details>
+**"Download failed - network error"**
 
-<details>
-<summary><strong>📰 News (15+)</strong></summary>
+- Check your internet connection.
+- Some sites block requests from extensions. Try again or try a different quality.
+- If you're behind a VPN or proxy, try turning it off temporarily.
 
-CNN, Fox News, BBC, Reuters, Bloomberg, CBS News, NBC News, Al Jazeera, France24, DW, NY Times, ESPN, ABC News, Northeast News (NE Now), EastMojo
+**The extension doesn't work on a specific site**
 
-</details>
+- Not every site is supported, even with the generic extractor.
+- Some sites frequently change their structure, which can break the extractor. You can open an issue on GitHub if you find a broken site.
 
-<details>
-<summary><strong>🌏 Asian Platforms (16+)</strong></summary>
+**Downloads are very slow**
 
-Bilibili, AcFun, iQiyi, Youku, MangoTV, Douyin, Niconico, Naver, Daum, Hotstar, SonyLIV, Zee5, Viu
+- The speed depends on the source site's servers, not the extension.
+- Try a lower quality if available.
+- Check if other downloads or tabs are using your bandwidth.
 
-</details>
+## License
 
-<details>
-<summary><strong>🎓 Education (8+)</strong></summary>
-
-Coursera, Udemy, Skillshare, MasterClass, Khan Academy, Egghead, Pluralsight, TED
-
-</details>
-
-<details>
-<summary><strong>🇪🇺 European Broadcasters (16+)</strong></summary>
-
-ARD, ZDF, Arte, France.tv, RAI Play, ITV, Channel 4, SVT, NRK, DR TV, ERTFlix, 9Now, NHK, CCTV, CDA
-
-</details>
-
-<details>
-<summary><strong>🏟️ Sports & Gaming (5+)</strong></summary>
-
-MLB, NBA, NFL, GameSpot, IGN, C-SPAN
-
-</details>
-
-<details>
-<summary><strong>🔗 Embed Players & Hosting (19+)</strong></summary>
-
-Brightcove, JW Player, Kaltura, Imgur, Flickr, Archive.org, Dropbox, Loom, Vidyard, Wistia, Canva, Floatplane, Patreon, Steam, Medal.tv, Gfycat, RedGIFs, Telegram, Globo
-
-</details>
-
-<details>
-<summary><strong>⚙️ Generic (Any Site)</strong></summary>
-
-The built-in generic extractor automatically detects video and audio on **any website** not explicitly listed above — including HLS streams, embedded players, and direct media files.
-
-</details>
-
----
-
-## 📥 Installation
-
-1. **Download** or clone this repo
-2. Go to `chrome://extensions` (or your browser's equivalent)
-3. Enable **Developer mode**
-4. Click **Load unpacked** → select the `Detector` folder
-5. Pin the extension to your toolbar
-
----
-
-## 🚀 Usage
-
-1. Visit any website with video or audio
-2. Click the **Detector** icon
-3. Pick your quality and hit download
-
-That's it — media is detected automatically.
-
----
-
-## 📝 License
-
-[Unlicense](LICENSE) — public domain. Free to use for any purpose.
-
----
-
-<div align="center">
-
-If you find Detector useful, give it a ⭐!
-
-</div>
+[Unlicense](LICENSE) - public domain. Do whatever you want with it.

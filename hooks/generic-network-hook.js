@@ -91,39 +91,35 @@
     var xhr = this;
     var hookUrl = xhr.__hookUrl;
     if (hookUrl && !seen.has(hookUrl)) {
-      xhr.addEventListener("load", function () {
-        try {
-          if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 400) {
-            var ct = (
-              xhr.getResponseHeader("content-type") || ""
-            ).toLowerCase();
-            // Check response body for HLS content if content-type suggests text.
-            // Guard with Content-Length to avoid pulling multi-MB binary payloads
-            // (e.g. video segments from proxy domains) into memory as text.
+      try {
+        xhr.addEventListener("load", function () {
+          try {
             if (
-              ct.includes("mpegurl") ||
-              ct.includes("text") ||
-              ct.includes("json") ||
-              ct.includes("octet") ||
-              ct.includes("binary") ||
-              ct === "" ||
-              isProxyDomain(hookUrl)
+              xhr.readyState === 4 &&
+              xhr.status >= 200 &&
+              xhr.status < 400
             ) {
-              var len = parseInt(
-                xhr.getResponseHeader("content-length") || "0",
-                10,
-              );
-              if (!len || len <= 1048576) {
-                checkResponseForHLS(hookUrl, xhr.responseText);
+              var ct = (
+                xhr.getResponseHeader("content-type") || ""
+              ).toLowerCase();
+              if (
+                ct.includes("mpegurl") ||
+                ct.includes("text") ||
+                ct.includes("json") ||
+                ct.includes("octet") ||
+                ct.includes("binary") ||
+                ct === "" ||
+                isProxyDomain(hookUrl)
+              ) {
+                var len = parseInt(
+                  xhr.getResponseHeader("content-length") || "0",
+                  10,
+                );
+                if (!len || len <= 1048576) {
+                  checkResponseForHLS(hookUrl, xhr.responseText);
+                }
               }
             }
-          }
-        } catch (e) {}
-      });
-    }
-    return origSend.apply(this, arguments);
-  };
-
   const origFetch = window.fetch;
   window.fetch = function (input, init) {
     const url = typeof input === "string" ? input : input?.url;

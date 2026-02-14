@@ -121,54 +121,107 @@
       var cipherFuncName = dispatchCall[1];
       result.cipherDispatchValue = parseInt(dispatchCall[2]);
 
-      var funcDefIdx = js.indexOf(cipherFuncName + "=function(");
-      if (funcDefIdx !== -1) {
-        var braceIdx = js.indexOf("{", funcDefIdx);
-        var funcBody = extractBraceBlock(js, braceIdx);
-        if (funcBody) {
-          // Find helper references: HELPER[LOOKUP[IDX]](ARRAY, NUM)
-          var le = escRe(result.lookupName);
-          var helperRe = new RegExp(
-            "([a-zA-Z0-9$_]+)\\[" +
-              le +
-              "\\[(\\d+)\\]\\]\\s*\\(\\s*([a-zA-Z0-9$_]+)\\s*,\\s*(\\d+)\\s*\\)",
-            "g",
-          );
-          var hm;
-          while ((hm = helperRe.exec(funcBody)) !== null) {
-            if (!result.cipherHelper) result.cipherHelper = hm[1];
-            result.cipherOps.push({
-              methodName: result.lookupArray[parseInt(hm[2])],
-              arg: parseInt(hm[4]),
-            });
-          }
+      // Find the RIGHT definition of cipherFuncName — there may be
+      // multiple functions with the same short name (e.g., "is").
+      // The real cipher function has 2+ params and lookup array refs.
+      var cipherFuncBody = findCipherFuncDef(
+        js,
+        cipherFuncName,
+        result.lookupName,
+      );
+      if (cipherFuncBody) {
+        // Find helper references: HELPER[LOOKUP[IDX]](ARRAY, NUM)
+        var le = escRe(result.lookupName);
+        var helperRe = new RegExp(
+          "([a-zA-Z0-9$_]+)\\[" +
+            le +
+            "\\[(\\d+)\\]\\]\\s*\\(\\s*([a-zA-Z0-9$_]+)\\s*,\\s*(\\d+)\\s*\\)",
+          "g",
+        );
+        var hm;
+        while ((hm = helperRe.exec(cipherFuncBody)) !== null) {
+          if (!result.cipherHelper) result.cipherHelper = hm[1];
+          result.cipherOps.push({
+            methodName: result.lookupArray[parseInt(hm[2])],
+            arg: parseInt(hm[4]),
+          });
         }
       }
     }
 
     // Find N-sig wrapper:
-    // Look for WRAPPER[0](x) near a .set("n" pattern in the player code
-    // The lookup array maps: l[33]="n", l[20]="set", l[42]="get"
+    // Look for WRAPPER[0](x) near a .set("n" or lookup[nIdx] context
     var nIdx = result.lookupArray.indexOf("n");
     var setIdx = result.lookupArray.indexOf("set");
+    var ln = result.lookupName; // actual lookup array name (e.g. "f")
     if (nIdx !== -1 && setIdx !== -1) {
-      // Search for: WRAPPER[0](VAR), ... [l[setIdx]](l[nIdx], VAR)
-      // or simpler: find any XXX[0](y) near l[nIdx] context
+      // Search for: WRAPPER[0](VAR) near the n-sig code block
       var wrapperRe = /([a-zA-Z0-9$_]+)\[0\]\s*\(\s*(\w+)\s*\)/g;
       var wm;
       while ((wm = wrapperRe.exec(js)) !== null) {
-        // Check nearby context for n-sig indicators
         var ctx = js.substring(
-          Math.max(0, wm.index - 100),
-          Math.min(js.length, wm.index + 200),
+          Math.max(0, wm.index - 200),
+          Math.min(js.length, wm.index + 300),
         );
-        // Should be near: l[nIdx] (the "n" parameter) or .set("n"
+        // Check context for lookup[nIdx] OR literal "n" near .get/.set
         if (
-          ctx.indexOf("l[" + nIdx + "]") !== -1 ||
-          ctx.indexOf('"n"') !== -1
+          ctx.indexOf(ln + "[" + nIdx + "]") !== -1 ||
+          ctx.indexOf('"n"') !== -1 ||
+          ctx.indexOf(".get(" + ln + "[") !== -1
         ) {
           result.nSigWrapper = wm[1];
           console.log(TAG, "N-sig wrapper found:", wm[1]);
+          break;
+        }
+      }
+    }
+
+    // Fallback: search for direct function call near .get("n")
+    if (!result.nSigWrapper && nIdx !== -1) {
+      // Pattern: .get("n")...FUNC(VAR) or .get(ln[nIdx])...FUNC(VAR)
+      var nSigCallRe =
+        /\.get\s*\(\s*(?:"n"|'n')\s*\).*?([a-zA-Z0-9$_]+)\s*\(\s*([a-zA-Z0-9$_]+)\s*\)/g;
+      var ncm;
+      while ((ncm = nSigCallRe.exec(js)) !== null) {
+        var callCtx = js.substring(
+          Math.max(0, ncm.index),
+          Math.min(js.length, ncm.index + 500),
+        );
+        // Must also have .set("n" or [ln[setIdx]] nearby
+        if (
+          callCtx.indexOf('"n"') !== -1 &&
+          (callCtx.indexOf(".set(") !== -1 ||
+            callCtx.indexOf(ln + "[" + setIdx + "]") !== -1)
+        ) {
+          // Check if the candidate is an array wrapper [0] or direct func
+          var candidateName = ncm[1];
+          // Skip builtins and common false positives
+          if (
+            /^(new|if|for|while|return|var|let|const|Math|String|Array|Object|g|b|h|R)$/.test(
+              candidateName,
+            )
+          )
+            continue;
+          // Check if it's an array wrapper
+          var arrCheck = js.match(
+            new RegExp("[;,\\n]\\s*" + escRe(candidateName) + "\\s*=\\s*\\["),
+          );
+          if (arrCheck) {
+            result.nSigWrapper = candidateName;
+            console.log(
+              TAG,
+              "N-sig wrapper found (array, via .get n):",
+              candidateName,
+            );
+          } else {
+            // Could be a direct function
+            result.nSigWrapper = candidateName;
+            console.log(
+              TAG,
+              "N-sig function found (direct, via .get n):",
+              candidateName,
+            );
+          }
           break;
         }
       }
@@ -183,6 +236,100 @@
       "| N-sig wrapper:",
       result.nSigWrapper || "none",
     );
+
+    // DIAGNOSTIC: Extended dump for debugging
+    if (result.lookupArray) {
+      console.log(
+        TAG,
+        "[DIAG] Lookup array name:",
+        result.lookupName,
+        "length:",
+        result.lookupArray.length,
+      );
+      console.log(
+        TAG,
+        "[DIAG] Lookup first 10:",
+        result.lookupArray.slice(0, 10),
+      );
+      console.log(
+        TAG,
+        "[DIAG] Lookup 'n' at:",
+        result.lookupArray.indexOf("n"),
+        "'set' at:",
+        result.lookupArray.indexOf("set"),
+        "'get' at:",
+        result.lookupArray.indexOf("get"),
+      );
+    }
+    if (result.cipherHelper) {
+      console.log(
+        TAG,
+        "[DIAG] Cipher helper:",
+        result.cipherHelper,
+        "exists as global?",
+        typeof window[result.cipherHelper],
+      );
+      if (window[result.cipherHelper]) {
+        try {
+          console.log(
+            TAG,
+            "[DIAG] Cipher helper methods:",
+            Object.keys(window[result.cipherHelper]),
+          );
+        } catch (e) {}
+      }
+    } else {
+      console.log(
+        TAG,
+        "[DIAG] No cipher helper found. Dispatch call match exists?",
+        !!result.cipherDispatchValue,
+      );
+    }
+    if (result.nSigWrapper) {
+      console.log(
+        TAG,
+        "[DIAG] N-sig wrapper:",
+        result.nSigWrapper,
+        "exists as global?",
+        typeof window[result.nSigWrapper],
+      );
+      if (
+        window[result.nSigWrapper] &&
+        Array.isArray(window[result.nSigWrapper])
+      ) {
+        console.log(
+          TAG,
+          "[DIAG] N-sig wrapper length:",
+          window[result.nSigWrapper].length,
+          "[0] type:",
+          typeof window[result.nSigWrapper][0],
+        );
+      }
+    } else {
+      console.log(TAG, "[DIAG] No N-sig wrapper found via lookup pattern.");
+      // DIAGNOSTIC: wider context around .get("n") to see N-sig call structure
+      var getNWide = js.match(/.{0,50}\.get\s*\(\s*["']n["']\s*\).{0,300}/g);
+      if (getNWide) {
+        console.log(TAG, "[DIAG] .get('n') wide context (first):", getNWide[0]);
+      }
+      // Also search for XXX[0]( patterns near "n" to find wrapper candidates
+      var arr0Near = js.match(
+        /.{0,80}([a-zA-Z0-9$_]+)\[0\]\s*\(\s*\w+\s*\).{0,80}/g,
+      );
+      if (arr0Near) {
+        var nRelated = arr0Near.filter(function (s) {
+          return (
+            s.indexOf('"n"') !== -1 || s.indexOf(ln + "[" + nIdx + "]") !== -1
+          );
+        });
+        console.log(
+          TAG,
+          "[DIAG] XXX[0]() near 'n':",
+          nRelated.length > 0 ? nRelated.slice(0, 3) : "none found",
+        );
+      }
+    }
+
     return result;
   }
 
@@ -567,6 +714,102 @@
     );
   }
 
+  /**
+   * Find the CORRECT definition of a cipher function by name.
+   * Short names like "is" can have multiple definitions in player.js.
+   * The real cipher function:
+   *   - Has 2 params (dispatchValue, signature)
+   *   - Has a body > 100 chars
+   *   - Contains lookup array references (e.g. f[N])
+   * Returns the function body block (including braces) or null.
+   */
+  function findCipherFuncDef(js, funcName, lookupName) {
+    var esc = escRe(funcName);
+    var defRe = new RegExp(esc + "\\s*=\\s*function\\s*\\(([^)]*)\\)", "g");
+    var dm;
+    var candidates = [];
+
+    while ((dm = defRe.exec(js)) !== null) {
+      var params = dm[1].split(",").map(function (p) {
+        return p.trim();
+      });
+      var braceIdx = js.indexOf("{", dm.index + dm[0].length - 1);
+      if (braceIdx === -1) continue;
+      var body = extractBraceBlock(js, braceIdx);
+      if (!body) continue;
+
+      candidates.push({
+        params: params,
+        body: body,
+        bodyLen: body.length,
+        hasLookup: lookupName ? body.indexOf(lookupName + "[") !== -1 : false,
+        idx: dm.index,
+      });
+    }
+
+    console.log(
+      TAG,
+      "[DIAG] Cipher '" + funcName + "' definitions found:",
+      candidates.length,
+      candidates.map(function (c) {
+        return (
+          "params=" +
+          c.params.length +
+          " body=" +
+          c.bodyLen +
+          " lookup=" +
+          c.hasLookup
+        );
+      }),
+    );
+
+    // Priority: 2+ params with lookup array references, largest body
+    var best = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var c = candidates[i];
+      if (c.params.length >= 2 && c.hasLookup) {
+        if (!best || c.bodyLen > best.bodyLen) best = c;
+      }
+    }
+    // Fallback: 2+ params, largest body
+    if (!best) {
+      for (var j = 0; j < candidates.length; j++) {
+        var c2 = candidates[j];
+        if (c2.params.length >= 2 && c2.bodyLen > 100) {
+          if (!best || c2.bodyLen > best.bodyLen) best = c2;
+        }
+      }
+    }
+    // Last resort: largest body with lookup refs
+    if (!best) {
+      for (var k = 0; k < candidates.length; k++) {
+        var c3 = candidates[k];
+        if (c3.hasLookup && c3.bodyLen > 100) {
+          if (!best || c3.bodyLen > best.bodyLen) best = c3;
+        }
+      }
+    }
+
+    if (best) {
+      console.log(
+        TAG,
+        "Cipher func def resolved:",
+        funcName,
+        "params=" + best.params.length,
+        "body=" + best.bodyLen + "ch",
+        "lookup=" + best.hasLookup,
+      );
+      return best.body;
+    }
+
+    console.warn(
+      TAG,
+      "No suitable cipher function definition found for:",
+      funcName,
+    );
+    return null;
+  }
+
   function findCipherFunctionName(js) {
     var patterns = [
       /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
@@ -628,9 +871,37 @@
     var callMatch = js.match(
       /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
     );
-    if (!callMatch) return null;
+    if (!callMatch) {
+      // DIAGNOSTIC: look for any decodeURIComponent(*.s) patterns to see what YT uses now
+      var decodePatterns = js.match(
+        /=\s*([a-zA-Z0-9$_]+)\s*\([^,]*decodeURIComponent\s*\([^)]*\.\s*s\s*\)/g,
+      );
+      console.log(
+        TAG,
+        "[DIAG] No dispatch cipher call found. decodeURIComponent(*.s) patterns:",
+        decodePatterns ? decodePatterns.slice(0, 5) : "none",
+      );
+      // Also look for encodeURIComponent patterns near signature
+      var encPatterns = js.match(
+        /encodeURIComponent\s*\(\s*([a-zA-Z0-9$_]+)\s*\(/g,
+      );
+      console.log(
+        TAG,
+        "[DIAG] encodeURIComponent(func()) patterns:",
+        encPatterns ? encPatterns.slice(0, 5) : "none",
+      );
+      return null;
+    }
     var cipherFuncName = callMatch[1];
     var dispatchValue = callMatch[2];
+    console.log(
+      TAG,
+      "[DIAG] Dispatch cipher call found:",
+      cipherFuncName,
+      "(",
+      dispatchValue,
+      ", decodeURIComponent(...))",
+    );
 
     // Find lookup array: var NAME = "...".split("DELIM") with 50+ elements
     var lookupArrayRe =
@@ -652,25 +923,36 @@
     }
     if (!lookupName) return null;
 
-    // Find cipher function definition
-    var funcDefIdx = js.indexOf(cipherFuncName + "=function(");
-    if (funcDefIdx === -1) return null;
-    var braceIdx = js.indexOf("{", funcDefIdx);
-    var funcBody = extractBraceBlock(js, braceIdx);
+    // Find cipher function definition — disambiguate short names
+    var funcBody = findCipherFuncDef(js, cipherFuncName, lookupName);
     if (!funcBody) return null;
 
-    // Get param list
-    var paramMatch = js.slice(funcDefIdx).match(/=function\s*\(([^)]+)\)/);
-    if (!paramMatch) return null;
-
-    // Extract parameter names
-    var paramNames = paramMatch[1].split(",").map(function (p) {
-      return p.trim();
-    });
-
-    // Find local variables in function body (var NAME = ...)
-    var localVarRe = /var\s+([a-zA-Z0-9$_]+)\s*=/g;
+    // Get param list from the body
+    var paramMatch = funcBody.match(/^\{/);
+    // We need the param names from the definition, re-extract them
+    var paramNames = [];
     var localVars = [];
+    // Scan all definitions to find the one whose body === funcBody
+    var defScanRe = new RegExp(
+      escRe(cipherFuncName) + "\\s*=\\s*function\\s*\\(([^)]+)\\)",
+      "g",
+    );
+    var dsm;
+    while ((dsm = defScanRe.exec(js)) !== null) {
+      var dbi = js.indexOf("{", dsm.index + dsm[0].length - 1);
+      if (dbi !== -1) {
+        var db = extractBraceBlock(js, dbi);
+        if (db === funcBody) {
+          paramNames = dsm[1].split(",").map(function (p) {
+            return p.trim();
+          });
+          break;
+        }
+      }
+    }
+
+    // Find local variables in function body
+    var localVarRe = /(?:var|let|const)\s+([a-zA-Z0-9$_]+)\s*=/g;
     var lvm;
     while ((lvm = localVarRe.exec(funcBody)) !== null) {
       localVars.push(lvm[1]);
@@ -688,6 +970,26 @@
     skipNames["Number"] = true;
     skipNames["JSON"] = true;
 
+    // DIAGNOSTIC: dump cipher function structure
+    console.log(
+      TAG,
+      "[DIAG] Cipher func:",
+      cipherFuncName,
+      "params:",
+      paramNames,
+      "locals:",
+      localVars,
+    );
+    console.log(TAG, "[DIAG] Cipher body (first 500):", funcBody.slice(0, 500));
+    console.log(TAG, "[DIAG] Cipher body (last 300):", funcBody.slice(-300));
+    console.log(
+      TAG,
+      "[DIAG] Lookup array name:",
+      lookupName,
+      "elements:",
+      lookupRaw ? lookupRaw.split(lookupDelim).length : 0,
+    );
+
     // Find helper object from function body (excluding params and locals)
     var lookupEsc = escRe(lookupName);
     // Look for HELPER[lookup[N]]( pattern - method call via lookup array
@@ -696,8 +998,10 @@
       "g",
     );
     var helperName = null;
+    var allHelperRefs = []; // DIAGNOSTIC: collect all matches
     var hrm;
     while ((hrm = helperRefRe.exec(funcBody)) !== null) {
+      allHelperRefs.push({ name: hrm[1], skipped: !!skipNames[hrm[1]] });
       if (!skipNames[hrm[1]]) {
         helperName = hrm[1];
         break;
@@ -707,6 +1011,38 @@
       console.warn(
         TAG,
         "Could not find cipher helper (after filtering params/locals)",
+      );
+      // DIAGNOSTIC: show what WAS found and what patterns exist
+      console.log(
+        TAG,
+        "[DIAG] Helper refs found (all matched, before filter):",
+        allHelperRefs,
+      );
+      // Try broader patterns to see what kind of calls exist in the body
+      var anyCallPattern = /([a-zA-Z0-9$_]+)\s*\.\s*([a-zA-Z0-9$_]+)\s*\(/g;
+      var dotCalls = [];
+      var dcm;
+      while (
+        (dcm = anyCallPattern.exec(funcBody)) !== null &&
+        dotCalls.length < 10
+      ) {
+        dotCalls.push(dcm[1] + "." + dcm[2] + "()");
+      }
+      console.log(TAG, "[DIAG] Dot-call patterns in cipher body:", dotCalls);
+      // Also show any bracket-access calls
+      var bracketCallPattern = /([a-zA-Z0-9$_]+)\[([^\]]+)\]\s*\(/g;
+      var bracketCalls = [];
+      var bcm;
+      while (
+        (bcm = bracketCallPattern.exec(funcBody)) !== null &&
+        bracketCalls.length < 10
+      ) {
+        bracketCalls.push(bcm[1] + "[" + bcm[2] + "]()");
+      }
+      console.log(
+        TAG,
+        "[DIAG] Bracket-call patterns in cipher body:",
+        bracketCalls,
       );
       return null;
     }
@@ -725,6 +1061,7 @@
 
     // Build self-contained code
     var argName = "_sig_";
+    var paramStr = paramNames.length > 0 ? paramNames.join(",") : "b,N";
     var code =
       "var " +
       lookupName +
@@ -740,8 +1077,9 @@
       ";\n" +
       "var " +
       cipherFuncName +
-      "=function" +
-      paramMatch[0].slice(paramMatch[0].indexOf("(")) +
+      "=function(" +
+      paramStr +
+      ")" +
       funcBody +
       ";\n" +
       "return " +
@@ -1205,6 +1543,42 @@
     }
     console.log(TAG, "Player.js loaded:", js.length, "bytes");
 
+    // DIAGNOSTIC: Dump key structural signatures from player.js
+    console.log(TAG, "[DIAG] ====== PLAYER.JS STRUCTURE DUMP ======");
+    // Check for split("DELIM") large arrays
+    var bigArrays = js.match(
+      /([a-zA-Z0-9$_]+)\s*=\s*"[^"]{200,}"\s*\.\s*split\s*\(/g,
+    );
+    console.log(
+      TAG,
+      "[DIAG] Big split arrays:",
+      bigArrays
+        ? bigArrays.map(function (s) {
+            return s.slice(0, 60) + "...";
+          })
+        : "none",
+    );
+    // Check for decodeURIComponent patterns (cipher signature)
+    var decURIPatterns = js.match(
+      /.{0,30}decodeURIComponent\s*\(\s*[a-zA-Z0-9$_]+\s*\.\s*s\s*\).{0,30}/g,
+    );
+    console.log(
+      TAG,
+      "[DIAG] decodeURIComponent(*.s):",
+      decURIPatterns ? decURIPatterns.slice(0, 3) : "none",
+    );
+    // Check for .get("n") patterns (N-sig)
+    var getNPatterns = js.match(/.{0,30}\.get\s*\(\s*["']n["']\s*\).{0,50}/g);
+    console.log(
+      TAG,
+      '[DIAG] .get("n") patterns:',
+      getNPatterns ? getNPatterns.slice(0, 3) : "none",
+    );
+    // Check for signatureTimestamp
+    var stsMatch = js.match(/signatureTimestamp[=:"\s]+(\d+)/);
+    console.log(TAG, "[DIAG] STS:", stsMatch ? stsMatch[1] : "not found");
+    console.log(TAG, "[DIAG] ====== END STRUCTURE DUMP ======");
+
     // === Step 1: Find external dependency names (2025+ architecture) ===
     var externalDeps = findExternalDeps(js);
 
@@ -1335,18 +1709,16 @@
       console.log(TAG, "Using direct cipher actions for format resolution");
     }
     // Priority 2: Legacy code-based cipher
+    // NOTE: new Function() is blocked by YouTube's Trusted Types CSP.
+    // Extracted cipher code is relayed to background.js for sandbox eval.
     if (!cipherFn && playerData.cipher) {
       if (typeof playerData.cipher === "function") {
         cipherFn = playerData.cipher;
       } else if (playerData.cipher.cipherCode) {
-        try {
-          cipherFn = new Function(
-            playerData.cipher.argName || "a",
-            playerData.cipher.cipherCode,
-          );
-        } catch (e) {
-          console.warn(TAG, "Failed to compile cipher code:", e.message);
-        }
+        console.log(
+          TAG,
+          "Cipher code extracted but cannot eval in MAIN world (Trusted Types). Will relay to background.",
+        );
       }
     }
 
@@ -1358,15 +1730,16 @@
       console.log(TAG, "Using direct N-sig function for format resolution");
     }
     // Priority 2: Legacy code-based N-sig
+    // NOTE: new Function() is blocked by YouTube's Trusted Types CSP.
+    // Extracted N-sig code is relayed to background.js for sandbox eval.
     if (!nSigFn && playerData.nSig) {
       if (typeof playerData.nSig === "function") {
         nSigFn = playerData.nSig;
       } else if (playerData.nSig.nSigCode) {
-        try {
-          nSigFn = new Function("return " + playerData.nSig.nSigCode)();
-        } catch (e) {
-          console.warn(TAG, "Failed to compile N-sig code:", e.message);
-        }
+        console.log(
+          TAG,
+          "N-sig code extracted but cannot eval in MAIN world (Trusted Types). Will relay to background.",
+        );
       }
     }
 

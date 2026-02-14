@@ -91,6 +91,9 @@ window.addEventListener("message", (e) => {
     case "EVAL_CIPHER":
       handleEvalCipher(e, id, e.data);
       break;
+    case "SOLVE_PLAYER":
+      handleSolvePlayer(e, id, e.data);
+      break;
     default:
       break;
   }
@@ -175,4 +178,159 @@ function handleEvalCipher(e, id, data) {
   }
 }
 
-console.log("[Sandbox] Ready (N-sig + Cipher eval)");
+// ─── yt-dlp-style full player.js solver ───────────────────────────────────
+// Uses meriyah (JS parser) + astring (AST→code) + yt.solver.core.js to:
+// 1. Parse the full ~1MB player.js into an AST
+// 2. Find n-sig and cipher functions via structural pattern matching
+// 3. Inject solver wrappers (_result.n / _result.sig)
+// 4. Execute the entire modified player.js via Function()
+// 5. Return solved values for each challenge
+
+let preparedPlayerCache = null;
+let preparedPlayerUrl = null;
+
+/**
+ * Handle the full player.js solver request.
+ *
+ * @param {MessageEvent} e - The incoming message event.
+ * @param {string|number} id - Correlation identifier.
+ * @param {Object} data - { playerJs, playerUrl, nChallenges, sigChallenges }
+ *   playerJs: full source of YouTube's base.js
+ *   playerUrl: URL for cache keying
+ *   nChallenges: array of n-sig parameter values to solve
+ *   sigChallenges: array of { sig, sp } objects for cipher solving
+ */
+function handleSolvePlayer(e, id, data) {
+  const startTime = performance.now();
+  try {
+    // Validate that jsc (yt.solver.core.js) is loaded
+    if (typeof jsc !== "function") {
+      throw new Error("yt.solver.core.js not loaded — jsc is " + typeof jsc);
+    }
+
+    const { playerJs, playerUrl, nChallenges, sigChallenges } = data;
+    if (!playerJs || typeof playerJs !== "string") {
+      throw new Error("No player.js source provided");
+    }
+
+    // Build the request in the format jsc() expects
+    const requests = [];
+    if (nChallenges && nChallenges.length > 0) {
+      requests.push({ type: "n", challenges: nChallenges });
+    }
+    if (sigChallenges && sigChallenges.length > 0) {
+      // For sig: yt-dlp sends sequential char strings as challenges.
+      // The result is a permutation that tells which indices to pick.
+      // Our caller sends actual signature strings, so we pass them directly.
+      requests.push({ type: "sig", challenges: sigChallenges });
+    }
+
+    if (requests.length === 0) {
+      e.source.postMessage(
+        { id, nResults: {}, sigResults: {}, cached: false },
+        "*",
+      );
+      return;
+    }
+
+    // Check if we have a cached preprocessed player for this URL
+    let input;
+    if (preparedPlayerCache && preparedPlayerUrl === playerUrl) {
+      input = {
+        type: "preprocessed",
+        preprocessed_player: preparedPlayerCache,
+        requests,
+      };
+      console.log("[Sandbox] Using cached preprocessed player for", playerUrl);
+    } else {
+      input = {
+        type: "player",
+        player: playerJs,
+        requests,
+        output_preprocessed: true,
+      };
+      console.log(
+        "[Sandbox] Preprocessing player.js (",
+        playerJs.length,
+        "bytes)",
+      );
+    }
+
+    // Run the solver
+    const output = jsc(input);
+
+    if (output.type === "error") {
+      throw new Error("Solver error: " + output.error);
+    }
+
+    // Cache the preprocessed player for future calls
+    if (output.preprocessed_player) {
+      preparedPlayerCache = output.preprocessed_player;
+      preparedPlayerUrl = playerUrl;
+      console.log(
+        "[Sandbox] Cached preprocessed player (",
+        preparedPlayerCache.length,
+        "ch) for",
+        playerUrl,
+      );
+    }
+
+    // Parse responses: map them back to n/sig results
+    const nResults = {};
+    const sigResults = {};
+    let responseIdx = 0;
+
+    if (nChallenges && nChallenges.length > 0) {
+      const resp = output.responses[responseIdx++];
+      if (resp.type === "result") {
+        Object.assign(nResults, resp.data);
+      } else {
+        console.warn("[Sandbox] N-sig solver error:", resp.error);
+      }
+    }
+    if (sigChallenges && sigChallenges.length > 0) {
+      const resp = output.responses[responseIdx++];
+      if (resp.type === "result") {
+        Object.assign(sigResults, resp.data);
+      } else {
+        console.warn("[Sandbox] Sig solver error:", resp.error);
+      }
+    }
+
+    const elapsed = (performance.now() - startTime).toFixed(1);
+    console.log(
+      `[Sandbox] Solver completed in ${elapsed}ms:`,
+      `n=${Object.keys(nResults).length}`,
+      `sig=${Object.keys(sigResults).length}`,
+      input.type === "preprocessed" ? "(cached)" : "(fresh)",
+    );
+
+    e.source.postMessage(
+      {
+        id,
+        nResults,
+        sigResults,
+        cached: input.type === "preprocessed",
+        elapsed: parseFloat(elapsed),
+      },
+      "*",
+    );
+  } catch (ex) {
+    const elapsed = (performance.now() - startTime).toFixed(1);
+    console.error(`[Sandbox] Solver fatal error (${elapsed}ms):`, ex);
+    e.source.postMessage(
+      {
+        id,
+        error: ex.message || String(ex),
+        nResults: {},
+        sigResults: {},
+      },
+      "*",
+    );
+  }
+}
+
+console.log(
+  "[Sandbox] Ready (N-sig + Cipher eval + Player solver)",
+  typeof jsc === "function" ? "[jsc OK]" : "[jsc MISSING]",
+);

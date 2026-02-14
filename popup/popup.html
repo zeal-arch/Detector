@@ -850,6 +850,73 @@
             color: var(--alert);
         }
 
+        /* Update Available Banner */
+        .update-banner {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            margin: 10px 14px 0;
+            border-radius: 10px;
+            background: rgba(198, 166, 241, 0.08);
+            border: 1px solid rgba(198, 166, 241, 0.18);
+            font-size: 12px;
+            color: var(--primary);
+            flex-shrink: 0;
+            cursor: default;
+        }
+
+        .update-banner-icon {
+            flex-shrink: 0;
+            width: 20px;
+            height: 20px;
+        }
+
+        .update-banner-text {
+            flex: 1;
+            line-height: 1.4;
+        }
+
+        .update-banner-text strong {
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .update-banner-actions {
+            display: flex;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        .update-btn {
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: none;
+            font-family: inherit;
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .update-btn.primary {
+            background: var(--primary);
+            color: #1E1E2E;
+        }
+
+        .update-btn.primary:hover {
+            background: var(--primary-hover);
+        }
+
+        .update-btn.dismiss {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--fg);
+        }
+
+        .update-btn.dismiss:hover {
+            background: rgba(255, 255, 255, 0.10);
+        }
+
         .banner-row {
             display: flex;
             align-items: center;
@@ -1108,6 +1175,24 @@
             </button>
         </div>
     </header>
+
+    <!-- Update Available Banner (hidden by default, shown via JS) -->
+    <div id="updateBanner" class="update-banner" style="display: none;">
+        <svg class="update-banner-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="17 1 21 5 17 9" />
+            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+            <polyline points="7 23 3 19 7 15" />
+            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+        </svg>
+        <div class="update-banner-text">
+            Update <strong id="updateVersion"></strong> available
+        </div>
+        <div class="update-banner-actions">
+            <button class="update-btn primary" id="updateDownloadBtn">Update</button>
+            <button class="update-btn dismiss" id="updateDismissBtn">✕</button>
+        </div>
+    </div>
 
     <!-- Main scrollable content -->
     <main id="content" class="custom-scrollbar">

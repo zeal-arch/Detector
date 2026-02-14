@@ -1415,4 +1415,33 @@ document.getElementById("clearAllBtn")?.addEventListener("click", async () => {
   init();
 });
 
+// ========== Update Banner Logic ==========
+async function checkAndShowUpdate() {
+  try {
+    const result = await chrome.storage.local.get("updateAvailable");
+    const update = result?.updateAvailable;
+    const banner = document.getElementById("updateBanner");
+    if (!update || !banner) {
+      if (banner) banner.style.display = "none";
+      return;
+    }
+    document.getElementById("updateVersion").textContent = `v${update.version}`;
+    banner.style.display = "flex";
+
+    document.getElementById("updateDownloadBtn").onclick = () => {
+      chrome.tabs.create({ url: update.url });
+    };
+
+    document.getElementById("updateDismissBtn").onclick = async () => {
+      banner.style.display = "none";
+      await chrome.runtime.sendMessage({ action: "DISMISS_UPDATE" });
+    };
+  } catch (e) {
+    console.warn("[UpdateBanner]", e);
+  }
+}
+
+checkAndShowUpdate();
+// =============================================
+
 init();

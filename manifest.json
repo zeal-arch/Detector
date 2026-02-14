@@ -34,7 +34,8 @@
         "webNavigation",
         "webRequest",
         "notifications",
-        "scripting"
+        "scripting",
+        "alarms"
     ],
     "host_permissions": [
         "*://*.youtube.com/*",

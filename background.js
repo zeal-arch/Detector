@@ -52,6 +52,91 @@ const REFERER_RULE_ID = 1;
 let activeMergeId = null;
 let mergeKeepaliveTimer = null; // Keeps SW alive during merge
 
+// ========== Auto-Update Checker (GitHub Releases) ==========
+const UPDATE_CONFIG = {
+  owner: "zeal-arch",
+  repo: "Detector",
+  currentVersion: chrome.runtime.getManifest().version,
+  checkIntervalHours: 6,
+  alarmName: "update-check",
+};
+
+/**
+ * Compares two semver strings (e.g. "1.1.0" vs "1.2.0").
+ * Returns true if remote is strictly newer than local.
+ */
+function isNewerVersion(remote, local) {
+  const r = remote.replace(/^v/, "").split(".").map(Number);
+  const l = local.split(".").map(Number);
+  for (let i = 0; i < Math.max(r.length, l.length); i++) {
+    const rp = r[i] || 0;
+    const lp = l[i] || 0;
+    if (rp > lp) return true;
+    if (rp < lp) return false;
+  }
+  return false;
+}
+
+/**
+ * Fetches the latest release from GitHub and stores update info if a newer
+ * version is available. Stores result in chrome.storage.local so the popup
+ * can display an update banner.
+ */
+async function checkForUpdate() {
+  try {
+    const url = `https://api.github.com/repos/${UPDATE_CONFIG.owner}/${UPDATE_CONFIG.repo}/releases/latest`;
+    const resp = await fetch(url, {
+      headers: { Accept: "application/vnd.github.v3+json" },
+    });
+    if (!resp.ok) return;
+
+    const release = await resp.json();
+    const latestVersion = (release.tag_name || "").replace(/^v/, "");
+
+    if (
+      latestVersion &&
+      isNewerVersion(latestVersion, UPDATE_CONFIG.currentVersion)
+    ) {
+      await chrome.storage.local.set({
+        updateAvailable: {
+          version: latestVersion,
+          url: release.html_url,
+          notes: (release.body || "").slice(0, 300),
+          publishedAt: release.published_at,
+          checkedAt: Date.now(),
+        },
+      });
+      // Set a global badge hint so users notice even without opening popup
+      chrome.action.setBadgeText({ text: "NEW" });
+      chrome.action.setBadgeBackgroundColor({ color: "#C6A6F1" });
+    } else {
+      // No update (or user already on latest) — clear any stale flag
+      await chrome.storage.local.remove("updateAvailable");
+    }
+  } catch (e) {
+    console.warn("[UpdateChecker] Failed to check for updates:", e);
+  }
+}
+
+// Schedule periodic update checks using chrome.alarms
+chrome.alarms.get(UPDATE_CONFIG.alarmName, (alarm) => {
+  if (!alarm) {
+    chrome.alarms.create(UPDATE_CONFIG.alarmName, {
+      delayInMinutes: 1, // first check ~1 min after install/startup
+      periodInMinutes: UPDATE_CONFIG.checkIntervalHours * 60,
+    });
+  }
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === UPDATE_CONFIG.alarmName) {
+    checkForUpdate();
+  }
+});
+
+// Also check on service worker startup
+checkForUpdate();
+
 // ========== YouTube itag → format metadata lookup (IDM-style sniffing) ==========
 // When YouTube's player.js fetches a videoplayback URL, cipher & N-sig are already
 // applied. We capture those URLs and use this table to reconstruct format metadata.
@@ -838,6 +923,9 @@ const ITAG_MAP = {
 // Import DRM detection utility
 importScripts("lib/drm-detection.js");
 
+// Import site-to-extractor mapping (single source of truth)
+importScripts("extractors/site-map.js");
+
 async function captureMetadata(tabId) {
   try {
     const results = await chrome.scripting.executeScript({
@@ -1319,6 +1407,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (msg.target === "offscreen") return false;
 
   switch (msg.action) {
+    case "CHECK_FOR_UPDATE":
+      checkForUpdate()
+        .then(() => respond({ ok: true }))
+        .catch(() => respond({ ok: false }));
+      return true;
+
+    case "DISMISS_UPDATE":
+      chrome.storage.local.remove("updateAvailable").then(() => {
+        chrome.action.setBadgeText({ text: "" });
+        respond({ ok: true });
+      });
+      return true;
+
     case "VIDEO_DETECTED":
       onVideoDetected(msg, sender.tab?.id)
         .then(respond)
@@ -2649,6 +2750,71 @@ async function sandboxEvalCipher(cipherCode, argName, sigs) {
   });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// yt-dlp-style full player.js solver
+// Sends the ENTIRE ~1MB player.js to the sandbox, which uses meriyah (AST
+// parser) + astring (code generator) + yt.solver.core.js to find the n-sig
+// and cipher functions structurally, then executes the whole player.js to
+// solve all challenges in one shot.  This is the same approach yt-dlp uses
+// with Deno/Node — but we use the Chrome MV3 sandbox iframe instead.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function sandboxSolvePlayer(
+  playerJs,
+  playerUrl,
+  nChallenges,
+  sigChallenges,
+) {
+  await ensureOffscreen();
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      console.warn("[BG] Player solver timed out (35s)");
+      reject(new Error("Player solver timed out"));
+    }, 35000);
+
+    chrome.runtime.sendMessage(
+      {
+        target: "offscreen",
+        action: "SOLVE_PLAYER",
+        playerJs,
+        playerUrl,
+        nChallenges: nChallenges || [],
+        sigChallenges: sigChallenges || [],
+      },
+      (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          console.warn(
+            "[BG] Player solver message error:",
+            chrome.runtime.lastError.message,
+          );
+          reject(
+            new Error(
+              "Player solver communication failed: " +
+                chrome.runtime.lastError.message,
+            ),
+          );
+          return;
+        }
+        if (response?.timedOut || response?.error) {
+          console.warn("[BG] Player solver error:", response.error);
+          reject(
+            new Error("Player solver failed: " + (response.error || "unknown")),
+          );
+          return;
+        }
+        resolve({
+          nResults: response?.nResults || {},
+          sigResults: response?.sigResults || {},
+          cached: response?.cached || false,
+          elapsed: response?.elapsed || 0,
+        });
+      },
+    );
+  });
+}
+
 async function pageScrapeWithCipher(
   videoId,
   pageResp,
@@ -2739,82 +2905,218 @@ async function pageScrapeWithCipher(
     formats.push(entry);
   }
 
-  if (cipherQueue.length && (cipherCode || sig?.cipherCode)) {
-    const cc = cipherCode || sig.cipherCode;
-    const ca = cipherArgName || sig?.cipherArgName || "a";
-    console.log(
-      "[BG] Tier 3: sandbox cipher eval for",
-      cipherQueue.length,
-      "formats",
-    );
-    const deciphered = await sandboxEvalCipher(
-      cc,
-      ca,
-      cipherQueue.map((e) => e.s),
-    );
-    for (let i = 0; i < cipherQueue.length; i++) {
-      const { fmt, url, sp } = cipherQueue[i];
-      const sig2 = deciphered[i];
-      if (!sig2 || typeof sig2 !== "string") continue;
+  // === yt-dlp style full player.js solver (try first) ===
+  let solverOk = false;
+  if (sig?.playerSource) {
+    // Collect challenges for the solver — include N params from cipher URLs too
+    const nChallengeSet = new Set(nEntries.map((e) => e.decoded));
+    for (const cEntry of cipherQueue) {
+      const nm = /[?&]n=([^&]+)/i.exec(cEntry.url);
+      if (nm) nChallengeSet.add(decodeURIComponent(nm[1]));
+    }
+    const nChallenges = [...nChallengeSet];
+    const sigChallenges = cipherQueue.map((e) => e.s);
 
-      let fullUrl =
-        url +
-        (url.includes("?") ? "&" : "?") +
-        sp +
-        "=" +
-        encodeURIComponent(sig2);
-      if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
+    if (nChallenges.length || sigChallenges.length) {
+      console.log(
+        "[BG] Trying full player.js solver:",
+        nChallenges.length,
+        "n-sig +",
+        sigChallenges.length,
+        "cipher challenges",
+      );
+      try {
+        const solverResult = await sandboxSolvePlayer(
+          sig.playerSource,
+          sig.playerUrl || playerUrl,
+          nChallenges,
+          sigChallenges,
+        );
+        const { nResults, sigResults, cached, elapsed } = solverResult;
+        console.log(
+          "[BG] Full solver returned in",
+          elapsed + "ms",
+          cached ? "(cached)" : "",
+          "| n-sig results:",
+          Object.keys(nResults).length,
+          "| cipher results:",
+          Object.keys(sigResults).length,
+        );
 
-      const mime = fmt.mimeType || "";
-      const cm = mime.match(/codecs="([^"]+)"/);
-      const codecs = cm ? cm[1] : "";
-      const isV = mime.startsWith("video/");
-      const isA = mime.startsWith("audio/");
+        // Apply cipher results from solver
+        let cipherOk = 0;
+        if (sigChallenges.length) {
+          for (const { fmt, url, sp, s } of cipherQueue) {
+            const sig2 = sigResults[s];
+            if (!sig2 || typeof sig2 !== "string") continue;
+            cipherOk++;
 
-      const entry = {
-        itag: fmt.itag,
-        url: fullUrl,
-        mimeType: mime,
-        quality: fmt.qualityLabel || fmt.quality || "",
-        qualityLabel: fmt.qualityLabel || "",
-        width: fmt.width || 0,
-        height: fmt.height || 0,
-        fps: fmt.fps || 0,
-        bitrate: fmt.bitrate || 0,
-        audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
-        audioQuality: fmt.audioQuality || "",
-        contentLength: parseInt(fmt.contentLength) || null,
-        codecs,
-        isVideo: isV,
-        isAudio: isA,
-        isMuxed: isV && codecs.includes("mp4a"),
-      };
+            let fullUrl =
+              url +
+              (url.includes("?") ? "&" : "?") +
+              sp +
+              "=" +
+              encodeURIComponent(sig2);
+            if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
 
-      const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
-      if (nm && sig?.nSigCode) {
-        nEntries.push({
-          idx: formats.length,
-          raw: nm[1],
-          decoded: decodeURIComponent(nm[1]),
-        });
+            const mime = fmt.mimeType || "";
+            const cm = mime.match(/codecs="([^"]+)"/);
+            const codecs = cm ? cm[1] : "";
+            const isV = mime.startsWith("video/");
+            const isA = mime.startsWith("audio/");
+
+            const entry = {
+              itag: fmt.itag,
+              url: fullUrl,
+              mimeType: mime,
+              quality: fmt.qualityLabel || fmt.quality || "",
+              qualityLabel: fmt.qualityLabel || "",
+              width: fmt.width || 0,
+              height: fmt.height || 0,
+              fps: fmt.fps || 0,
+              bitrate: fmt.bitrate || 0,
+              audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
+              audioQuality: fmt.audioQuality || "",
+              contentLength: parseInt(fmt.contentLength) || null,
+              codecs,
+              isVideo: isV,
+              isAudio: isA,
+              isMuxed: isV && codecs.includes("mp4a"),
+            };
+
+            const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
+            if (nm) {
+              nEntries.push({
+                idx: formats.length,
+                raw: nm[1],
+                decoded: decodeURIComponent(nm[1]),
+              });
+              // Also add to nChallenges so solver result covers them
+              const decoded = decodeURIComponent(nm[1]);
+              if (!nResults[decoded]) {
+                // This n wasn't in original challenges — can't solve it here,
+                // but mark it for fallback. This shouldn't normally happen since
+                // cipher-only streams also have n= params we already collected.
+              }
+            }
+            formats.push(entry);
+          }
+        }
+
+        // Apply N-sig results from solver (covers both original and cipher-added entries)
+        let nSigOk = 0;
+        for (const e of nEntries) {
+          const r = nResults[e.decoded];
+          if (r && typeof r === "string" && r !== e.decoded) {
+            formats[e.idx].url = formats[e.idx].url.replace(
+              "n=" + e.raw,
+              "n=" + encodeURIComponent(r),
+            );
+            nSigOk++;
+          }
+        }
+
+        // Check if solver produced enough results to consider it successful
+        const cipherNeeded = sigChallenges.length;
+        const nSigNeeded = nEntries.length;
+        solverOk =
+          (cipherNeeded === 0 || cipherOk >= cipherNeeded * 0.5) &&
+          (nSigNeeded === 0 || nSigOk >= nSigNeeded * 0.5);
+
+        console.log(
+          "[BG] Full solver results: cipher",
+          cipherOk + "/" + cipherNeeded,
+          "| n-sig",
+          nSigOk + "/" + nSigNeeded,
+          "| solverOk:",
+          solverOk,
+        );
+      } catch (solverErr) {
+        console.warn("[BG] Full player.js solver failed:", solverErr.message);
+        // Fall through to regex-based approach
       }
-      formats.push(entry);
     }
   }
 
-  if (nEntries.length && sig?.nSigCode) {
-    const results = await sandboxEval(
-      sig.nSigCode,
-      nEntries.map((e) => e.decoded),
-    );
-    for (let i = 0; i < nEntries.length; i++) {
-      const e = nEntries[i];
-      const r = results[i];
-      if (r && typeof r === "string" && r !== e.decoded) {
-        formats[e.idx].url = formats[e.idx].url.replace(
-          "n=" + e.raw,
-          "n=" + encodeURIComponent(r),
-        );
+  // === Fallback: regex-based cipher + N-sig processing ===
+  if (!solverOk) {
+    if (cipherQueue.length && (cipherCode || sig?.cipherCode)) {
+      const cc = cipherCode || sig.cipherCode;
+      const ca = cipherArgName || sig?.cipherArgName || "a";
+      console.log(
+        "[BG] Tier 3 fallback: sandbox cipher eval for",
+        cipherQueue.length,
+        "formats",
+      );
+      const deciphered = await sandboxEvalCipher(
+        cc,
+        ca,
+        cipherQueue.map((e) => e.s),
+      );
+      for (let i = 0; i < cipherQueue.length; i++) {
+        const { fmt, url, sp } = cipherQueue[i];
+        const sig2 = deciphered[i];
+        if (!sig2 || typeof sig2 !== "string") continue;
+
+        let fullUrl =
+          url +
+          (url.includes("?") ? "&" : "?") +
+          sp +
+          "=" +
+          encodeURIComponent(sig2);
+        if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
+
+        const mime = fmt.mimeType || "";
+        const cm = mime.match(/codecs="([^"]+)"/);
+        const codecs = cm ? cm[1] : "";
+        const isV = mime.startsWith("video/");
+        const isA = mime.startsWith("audio/");
+
+        const entry = {
+          itag: fmt.itag,
+          url: fullUrl,
+          mimeType: mime,
+          quality: fmt.qualityLabel || fmt.quality || "",
+          qualityLabel: fmt.qualityLabel || "",
+          width: fmt.width || 0,
+          height: fmt.height || 0,
+          fps: fmt.fps || 0,
+          bitrate: fmt.bitrate || 0,
+          audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
+          audioQuality: fmt.audioQuality || "",
+          contentLength: parseInt(fmt.contentLength) || null,
+          codecs,
+          isVideo: isV,
+          isAudio: isA,
+          isMuxed: isV && codecs.includes("mp4a"),
+        };
+
+        const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
+        if (nm && sig?.nSigCode) {
+          nEntries.push({
+            idx: formats.length,
+            raw: nm[1],
+            decoded: decodeURIComponent(nm[1]),
+          });
+        }
+        formats.push(entry);
+      }
+    }
+
+    if (nEntries.length && sig?.nSigCode) {
+      const results = await sandboxEval(
+        sig.nSigCode,
+        nEntries.map((e) => e.decoded),
+      );
+      for (let i = 0; i < nEntries.length; i++) {
+        const e = nEntries[i];
+        const r = results[i];
+        if (r && typeof r === "string" && r !== e.decoded) {
+          formats[e.idx].url = formats[e.idx].url.replace(
+            "n=" + e.raw,
+            "n=" + encodeURIComponent(r),
+          );
+        }
       }
     }
   }
@@ -2965,6 +3267,7 @@ async function loadSignatureData(playerUrl) {
     cipherArgName,
     sts,
     playerUrl,
+    playerSource: js,
     expiresAt: Date.now() + 43200000,
   };
   sigCache.set(playerUrl, data);
@@ -2980,8 +3283,94 @@ async function loadSignatureData(playerUrl) {
     nSigBundled ? "(bundled: " + nSigBundled.length + "ch)" : "",
     "| STS:",
     sts,
+    "| PlayerSource:",
+    js ? js.length + "ch" : "none",
   );
   return data;
+}
+
+// === Cipher function disambiguation helper ===
+// YouTube often has multiple functions with the same short name (e.g. "is").
+// The real cipher function: 2+ params, body > 100 chars, lookup array refs.
+function findCipherFuncDefBG(js, funcName, lookupName) {
+  const esc = escRe(funcName);
+  const defRe = new RegExp(esc + "\\s*=\\s*function\\s*\\(([^)]*)\\)", "g");
+  let dm;
+  const candidates = [];
+
+  while ((dm = defRe.exec(js)) !== null) {
+    const params = dm[1]
+      .split(",")
+      .map((p) => p.trim())
+      .filter((p) => p);
+    const braceIdx = js.indexOf("{", dm.index + dm[0].length - 1);
+    if (braceIdx === -1) continue;
+    const body = extractBraceBlock(js, braceIdx);
+    if (!body) continue;
+
+    candidates.push({
+      params,
+      body,
+      bodyLen: body.length,
+      hasLookup: lookupName ? body.indexOf(lookupName + "[") !== -1 : false,
+      idx: dm.index,
+    });
+  }
+
+  console.log(
+    "[BG] Cipher '" + funcName + "' definitions found:",
+    candidates.length,
+    candidates.map(
+      (c) =>
+        "params=" +
+        c.params.length +
+        " body=" +
+        c.bodyLen +
+        " lookup=" +
+        c.hasLookup,
+    ),
+  );
+
+  // Priority 1: 2+ params with lookup array references, largest body
+  let best = null;
+  for (const c of candidates) {
+    if (c.params.length >= 2 && c.hasLookup) {
+      if (!best || c.bodyLen > best.bodyLen) best = c;
+    }
+  }
+  // Priority 2: 2+ params, largest body > 100 chars
+  if (!best) {
+    for (const c of candidates) {
+      if (c.params.length >= 2 && c.bodyLen > 100) {
+        if (!best || c.bodyLen > best.bodyLen) best = c;
+      }
+    }
+  }
+  // Priority 3: largest body with lookup refs
+  if (!best) {
+    for (const c of candidates) {
+      if (c.hasLookup && c.bodyLen > 100) {
+        if (!best || c.bodyLen > best.bodyLen) best = c;
+      }
+    }
+  }
+
+  if (best) {
+    console.log(
+      "[BG] Cipher func def resolved:",
+      funcName,
+      "params=" + best.params.length,
+      "body=" + best.bodyLen + "ch",
+      "lookup=" + best.hasLookup,
+    );
+    return best;
+  }
+
+  console.warn(
+    "[BG] No suitable cipher function definition found for:",
+    funcName,
+  );
+  return null;
 }
 
 // === New-style dispatch cipher extraction (2025+) ===
@@ -3012,12 +3401,10 @@ function extractDispatchCipherActions(
   }
   if (!lookupArray || !lookupName) return null;
 
-  // Step 2: Find cipher function definition
-  const funcDefIdx = js.indexOf(cipherFuncName + "=function(");
-  if (funcDefIdx === -1) return null;
-  const braceIdx = js.indexOf("{", funcDefIdx);
-  const funcBody = extractBraceBlock(js, braceIdx);
-  if (!funcBody) return null;
+  // Step 2: Find cipher function definition (disambiguate short names)
+  const cipherDef = findCipherFuncDefBG(js, cipherFuncName, lookupName);
+  if (!cipherDef) return null;
+  const funcBody = cipherDef.body;
 
   // Step 3: Find calls to helper object via lookup: OBJ[LOOKUP[IDX]](VAR, NUM)
   const lookupEsc = escRe(lookupName);
@@ -3107,7 +3494,17 @@ function extractDispatchCipherActions(
       )
         types[mm[1]] = "splice";
       else if (/\.reverse\s*\(/.test(methodBody)) types[mm[1]] = "reverse";
-      else types[mm[1]] = "reverse"; // default: reverse doesn't have distinguishing patterns
+      else {
+        // Likely a no-arg method (reverse variant) — log for debugging
+        // rather than silently assuming reverse
+        console.warn(
+          "[BG] Unrecognized cipher method:",
+          mm[1],
+          "body:",
+          methodBody.slice(0, 120),
+        );
+        types[mm[1]] = "reverse";
+      }
     }
   }
 
@@ -3140,16 +3537,11 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
   const parts = lookupMatch[3].split(lookupMatch[4]);
   if (parts.length < 50) return null;
 
-  // Find cipher function definition
-  const funcDefIdx = js.indexOf(cipherFuncName + "=function(");
-  if (funcDefIdx === -1) return null;
-  const braceIdx = js.indexOf("{", funcDefIdx);
-  const funcBody = extractBraceBlock(js, braceIdx);
-  if (!funcBody) return null;
-
-  // Get param list
-  const paramMatch = js.slice(funcDefIdx).match(/=function\s*\(([^)]+)\)/);
-  if (!paramMatch) return null;
+  // Find cipher function definition (disambiguate short names)
+  const cipherDef = findCipherFuncDefBG(js, cipherFuncName, lookupName);
+  if (!cipherDef) return null;
+  const funcBody = cipherDef.body;
+  const paramStr = cipherDef.params.join(", ");
 
   // Find helper object name from function body
   const lookupEsc = escRe(lookupName);
@@ -3214,8 +3606,9 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
     ";\n" +
     "var " +
     cipherFuncName +
-    "=function" +
-    paramMatch[0].slice(paramMatch[0].indexOf("(")) +
+    "=function(" +
+    paramStr +
+    ")" +
     funcBody +
     ";\n" +
     "return " +
@@ -3684,6 +4077,11 @@ function extractNSigCode(js) {
     ),
     // Function declaration: function H(a) {
     new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
+    // var/let/const function expression: var H = function(a) {
+    new RegExp(
+      `(?:var|let|const)\\s+${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+      "g",
+    ),
     // Arrow function with parens: H = (a) => {
     new RegExp(
       `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
@@ -5125,203 +5523,6 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     contentHashes.delete(details.tabId);
   }
 });
-
-const SITE_EXTRACTOR_MAP = {
-  "vimeo.com": "vimeo.js",
-  "dailymotion.com": "dailymotion.js",
-  "rutube.ru": "rutube.js",
-  "rumble.com": "rumble.js",
-  "bitchute.com": "bitchute.js",
-  "odysee.com": "odysee.js",
-  "peertube.tv": "peertube.js",
-  "dtube.video": "dtube.js",
-  "vlare.tv": "vlare.js",
-  "metacafe.com": "metacafe.js",
-  "newgrounds.com": "newgrounds.js",
-  "streamable.com": "streamable.js",
-  "coub.com": "coub.js",
-
-  "facebook.com": "facebook.js",
-  "fb.watch": "facebook.js",
-  "reddit.com": "reddit.js",
-  "tiktok.com": "tiktok.js",
-  "snapchat.com": "snapchat.js",
-  "pinterest.com": "pinterest.js",
-  "linkedin.com": "linkedin.js",
-  "tumblr.com": "tumblr.js",
-  "vk.com": "vk.js",
-  "vk.ru": "vk.js",
-  "vkvideo.ru": "vkvideo.js",
-  "ok.ru": "ok.js",
-  "weibo.com": "weibo.js",
-  "bluesky.app": "bluesky.js",
-  "bsky.app": "bluesky.js",
-  "likee.video": "likee.js",
-  "triller.co": "triller.js",
-
-  "netflix.com": "netflix.js",
-  "disneyplus.com": "disneyplus.js",
-  "hbomax.com": "hbomax.js",
-  "max.com": "hbomax.js",
-  "hulu.com": "hulu.js",
-  "primevideo.com": "primevideo.js",
-  "amazon.com": "primevideo.js",
-  "peacocktv.com": "peacock.js",
-  "paramountplus.com": "paramountplus.js",
-  "starz.com": "starz.js",
-  "showtime.com": "showtime.js",
-  "britbox.com": "britbox.js",
-  "crunchyroll.com": "crunchyroll.js",
-  "funimation.com": "crunchyroll.js",
-  "curiositystream.com": "curiositystream.js",
-  "nebula.tv": "nebula.js",
-  "dropout.tv": "dropout.js",
-  "plex.tv": "plex.js",
-  "tubi.tv": "tubi.js",
-  "tubitv.com": "tubi.js",
-  "plutotv.com": "plutotv.js",
-  "pluto.tv": "plutotv.js",
-  "roku.com": "roku.js",
-  "therokuchannel.roku.com": "roku.js",
-  "crackle.com": "crackle.js",
-  "popcornflix.com": "popcornflix.js",
-  "popcornmovies.org": "popcornmovies.js",
-  "flixtor.to": "flixtor.js",
-  "vudu.com": "vudu.js",
-  "amcplus.com": "amcplus.js",
-
-  "twitch.tv": "twitch.js",
-  "kick.com": "kick.js",
-  "dlive.tv": "dlive.js",
-  "trovo.live": "trovo.js",
-  "caffeine.tv": "caffeine.js",
-  "afreecatv.com": "afreeca.js",
-  "twitcasting.tv": "twitcasting.js",
-  "huya.com": "huya.js",
-
-  "soundcloud.com": "soundcloud.js",
-  "spotify.com": "spotify.js",
-  "deezer.com": "deezer.js",
-  "bandcamp.com": "bandcamp.js",
-  "audiomack.com": "audiomack.js",
-  "mixcloud.com": "mixcloud.js",
-  "iheart.com": "iheart.js",
-  "tunein.com": "tunein.js",
-  "podbean.com": "podbean.js",
-  "spreaker.com": "spreaker.js",
-  "anchor.fm": "anchor.js",
-  "last.fm": "lastfm.js",
-  "vevo.com": "vevo.js",
-
-  "cnn.com": "cnn.js",
-  "foxnews.com": "foxnews.js",
-  "bbc.co.uk": "bbc.js",
-  "bbc.com": "bbc.js",
-  "reuters.com": "reuters.js",
-  "bloomberg.com": "bloomberg.js",
-  "cbsnews.com": "cbsnews.js",
-  "nbcnews.com": "nbcnews.js",
-  "aljazeera.com": "aljazeera.js",
-  "france24.com": "france24.js",
-  "dw.com": "dw.js",
-  "skynews.com": "skynews.js",
-  "sky.com": "skynews.js",
-  "nytimes.com": "nytimes.js",
-  "washingtonpost.com": "washingtonpost.js",
-  "espn.com": "espn.js",
-
-  "bilibili.com": "bilibili.js",
-  "acfun.cn": "acfun.js",
-  "iq.com": "iq.js",
-  "iqiyi.com": "iqiyi.js",
-  "youku.com": "youku.js",
-  "mgtv.com": "mangotv.js",
-  "douyin.com": "douyin.js",
-  "niconico.jp": "niconico.js",
-  "nicovideo.jp": "niconico.js",
-  "naver.com": "naver.js",
-  "vlive.tv": "vlive.js",
-  "daum.net": "daum.js",
-  "hotstar.com": "hotstar.js",
-  "sonyliv.com": "sonyliv.js",
-  "zee5.com": "zee5.js",
-  "viu.com": "viu.js",
-  "shahid.mbc.net": "shahid.js",
-  "tver.jp": "tver.js",
-  "abema.tv": "abematv.js",
-
-  "coursera.org": "coursera.js",
-  "udemy.com": "udemy.js",
-  "skillshare.com": "skillshare.js",
-  "masterclass.com": "masterclass.js",
-  "khanacademy.org": "khanacademy.js",
-  "egghead.io": "egghead.js",
-  "pluralsight.com": "pluralsight.js",
-  "ted.com": "ted.js",
-
-  "ard.de": "ard.js",
-  "ardmediathek.de": "ard.js",
-  "zdf.de": "zdf.js",
-  "arte.tv": "arte.js",
-  "france.tv": "francetv.js",
-  "rai.it": "raiplay.js",
-  "raiplay.it": "raiplay.js",
-  "itv.com": "itv.js",
-  "channel4.com": "channel4.js",
-  "svtplay.se": "svt.js",
-  "svt.se": "svt.js",
-  "nrk.no": "nrk.js",
-  "dr.dk": "drtv.js",
-  "ertflix.gr": "ertflix.js",
-  "9now.com.au": "9now.js",
-  "sbs.com.au": "sbs.js",
-  "nhk.or.jp": "nhk.js",
-  "cctv.com": "cctv.js",
-  "cda.pl": "cda.js",
-
-  "imgur.com": "imgur.js",
-  "flickr.com": "flickr.js",
-  "archive.org": "archive.js",
-  "dropbox.com": "dropbox.js",
-  "loom.com": "loom.js",
-  "vidyard.com": "vidyard.js",
-  "wistia.com": "wistia.js",
-  "canva.com": "canva.js",
-  "floatplane.com": "floatplane.js",
-  "patreon.com": "patreon.js",
-  "steam.com": "steam.js",
-  "steampowered.com": "steam.js",
-  "medal.tv": "medal.js",
-  "gfycat.com": "gfycat.js",
-  "redgifs.com": "redgifs.js",
-  "telegram.org": "telegram.js",
-  "t.me": "telegram.js",
-  "web.telegram.org": "telegram.js",
-  "globo.com": "globo.js",
-  "globoplay.com": "globo.js",
-
-  "brightcove.com": "brightcove.js",
-  "players.brightcove.net": "brightcove.js",
-  "jwplayer.com": "jwplayer.js",
-  "cdn.jwplayer.com": "jwplayer.js",
-  "kaltura.com": "kaltura.js",
-
-  "mlb.com": "mlb.js",
-  "nba.com": "nba.js",
-  "nfl.com": "nfl.js",
-  "gamespot.com": "gamespot.js",
-  "ign.com": "ign.js",
-  "cspan.org": "cspan.js",
-
-  "pornhub.com": "pornhub.js",
-  "xhamster.com": "xhamster.js",
-  "xvideos.com": "xvideos.js",
-  "9gag.com": "ninegag.js",
-
-  "discoveryplus.com": "discoveryplus.js",
-  "abcnews.go.com": "abcnews.js",
-  "vhx.tv": "vimeo-ott.js",
-};
 
 const DEDICATED_SITES = new Set([
   "youtube.com",
