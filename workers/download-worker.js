@@ -376,7 +376,7 @@ async function downloadM3U8(
       return new Promise((resolve) => {
         self.postMessage({
           name: "request_url_refresh",
-          data: { downloadId, resolve },
+          data: { downloadId },
         });
         // Background will call refresh_urls message with fresh URLs
         // Store the resolve function to be called when fresh URLs arrive
