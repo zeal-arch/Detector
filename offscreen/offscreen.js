@@ -263,17 +263,18 @@ async function getLibAV() {
         LibAVFactory = module.default;
       }
 
-      // Let the Emscripten runtime fetch + compile WASM via
-      // WebAssembly.instantiateStreaming (compiles while downloading).
-      // The .mjs module's import.meta.url resolves the .wasm path
-      // automatically to the correct chrome-extension:// lib/ directory.
-      // If streaming compilation fails (e.g. wrong MIME type), the runtime
-      // gracefully falls back to ArrayBuffer instantiation — same as before.
+      // Explicitly pass the WASM binary URL so the Emscripten loader
+      // fetches from the correct chrome-extension://…/lib/ directory
+      // instead of deriving it from self.location.href (which points
+      // to offscreen/offscreen.html — wrong directory).
+      const wasmUrl = chrome.runtime.getURL(
+        "lib/libav-6.5.7.1-h264-aac-mp3.wasm.wasm",
+      );
       console.log(
         "[OFFSCREEN] Initializing libav.js (streaming WASM compile)...",
       );
 
-      libavInstance = await LibAVFactory();
+      libavInstance = await LibAVFactory({ wasmurl: wasmUrl });
 
       console.log("[OFFSCREEN] libav.js ready");
       return libavInstance;
@@ -1330,7 +1331,10 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 );
                 // Prefer previously computed actualSize over msgData.size (which
                 // can be 0/undefined for chunked transfers)
-                finalSize = typeof actualSize === "number" ? actualSize : (msgData.size || 0);
+                finalSize =
+                  typeof actualSize === "number"
+                    ? actualSize
+                    : msgData.size || 0;
               }
             } else {
               finalBlobUrl = msgData.blobUrl;
