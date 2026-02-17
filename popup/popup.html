@@ -276,6 +276,93 @@
             font-size: 11px;
         }
 
+        /* DRM Key Extraction Panel */
+        .drm-panel {
+            margin-top: 6px;
+            padding: 8px;
+            background: rgba(76, 175, 80, 0.06);
+            border: 1px solid rgba(76, 175, 80, 0.2);
+            border-radius: 6px;
+            font-size: 11px;
+        }
+
+        .drm-keys-header {
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: #4CAF50;
+        }
+
+        .drm-keys-found {
+            padding: 6px 0;
+        }
+
+        .drm-keys-list {
+            max-height: 80px;
+            overflow-y: auto;
+            margin-bottom: 6px;
+        }
+
+        .drm-key-row code {
+            font-family: monospace;
+            font-size: 10px;
+            word-break: break-all;
+            color: #b0b0b0;
+        }
+
+        .drm-keys-actions {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .drm-btn {
+            padding: 4px 10px;
+            border: none;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .drm-btn-copy {
+            background: #4CAF50;
+            color: #fff;
+        }
+
+        .drm-btn-copy:hover {
+            background: #43A047;
+        }
+
+        .drm-btn-extract {
+            background: #FF9800;
+            color: #fff;
+        }
+
+        .drm-btn-extract:hover {
+            background: #F57C00;
+        }
+
+        .drm-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .drm-select {
+            padding: 3px 6px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+            color: inherit;
+            font-size: 10px;
+        }
+
+        .drm-status-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
         .login-hint {
             display: flex;
             align-items: center;
@@ -1011,9 +1098,11 @@
             margin-left: 4px;
             transition: background 0.2s;
         }
+
         .banner-stop-btn:hover {
             background: rgba(244, 67, 54, 1);
         }
+
         .banner-stop-btn svg {
             width: 12px;
             height: 12px;

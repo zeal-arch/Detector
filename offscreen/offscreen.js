@@ -16,6 +16,48 @@ const pending = new Map();
 let nextId = 1;
 let activeMergeAbort = null; // AbortController for cancelling merge downloads
 
+// Track player URLs that caused solver hangs/failures — skip retries within cooldown
+const failedPlayerUrls = new Map(); // playerUrl → timestamp of failure
+const SOLVER_FAIL_COOLDOWN = 5 * 60 * 1000; // 5 minutes before retrying a failed player
+
+// S34 fix: Merge queue to prevent concurrent large merges from exhausting memory
+// Each merge holds video + audio buffers (~1-2 GB each) in memory simultaneously.
+// Serialize large merges to avoid OOM crashes.
+const mergeQueue = [];
+let activeMerge = null; // Promise for the current merge operation
+const MERGE_MEMORY_THRESHOLD = 500 * 1024 * 1024; // 500 MB — serialize if either track > this
+
+/**
+ * Queue and serialize merge operations to prevent memory exhaustion.
+ * @param {Function} mergeFn - The merge function to execute
+ * @param {number} estimatedSize - Estimated memory usage in bytes
+ * @returns {Promise} - Resolves when merge completes
+ */
+async function queueMerge(mergeFn, estimatedSize = 0) {
+  // If the merge is large, wait for the current merge to finish
+  if (estimatedSize > MERGE_MEMORY_THRESHOLD && activeMerge) {
+    console.log(
+      `[OFFSCREEN] Large merge (${(estimatedSize / 1024 / 1024).toFixed(1)} MB) queued, waiting for active merge...`,
+    );
+    try {
+      await activeMerge;
+    } catch {}
+  }
+
+  // Execute the merge
+  const mergePromise = mergeFn();
+  activeMerge = mergePromise;
+
+  try {
+    return await mergePromise;
+  } finally {
+    // Clear activeMerge when this merge completes
+    if (activeMerge === mergePromise) {
+      activeMerge = null;
+    }
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.target !== "offscreen") return false;
 
@@ -105,6 +147,22 @@ function handleEvalCipher(msg, sendResponse) {
 }
 
 function handleSolvePlayer(msg, sendResponse) {
+  // Check if this player URL recently failed — skip retry within cooldown
+  const playerUrl = msg.playerUrl || "";
+  const failedAt = failedPlayerUrls.get(playerUrl);
+  if (failedAt && Date.now() - failedAt < SOLVER_FAIL_COOLDOWN) {
+    console.warn(
+      `[OFFSCREEN] Skipping solver for recently-failed player URL (cooldown active): ${playerUrl}`,
+    );
+    sendResponse({
+      error: "Player solver recently failed — cooldown active",
+      nResults: {},
+      sigResults: {},
+      timedOut: true,
+    });
+    return;
+  }
+
   const id = nextId++;
   pending.set(id, sendResponse);
 
@@ -125,6 +183,10 @@ function handleSolvePlayer(msg, sendResponse) {
   setTimeout(() => {
     if (pending.has(id)) {
       console.warn("[OFFSCREEN] Player solver timed out after 30s");
+      // Mark this player URL as failed to prevent retry storms
+      if (playerUrl) {
+        failedPlayerUrls.set(playerUrl, Date.now());
+      }
       pending.get(id)({
         error: "Player solver timeout",
         nResults: {},
@@ -132,6 +194,16 @@ function handleSolvePlayer(msg, sendResponse) {
         timedOut: true,
       });
       pending.delete(id);
+
+      // Reload the sandbox iframe to unstick it from any infinite loop
+      try {
+        const src = sandbox.src;
+        sandbox.src = "";
+        sandbox.src = src;
+        console.log("[OFFSCREEN] Sandbox iframe reloaded after solver timeout");
+      } catch (e) {
+        console.warn("[OFFSCREEN] Failed to reload sandbox iframe:", e.message);
+      }
     }
   }, 30000);
 }
@@ -180,23 +252,17 @@ async function getLibAV() {
         LibAVFactory = module.default;
       }
 
-      console.log("[OFFSCREEN] Initializing libav.js...");
-
-      const wasmUrl = chrome.runtime.getURL(
-        "lib/libav-6.5.7.1-h264-aac-mp3.wasm.wasm",
-      );
-      const wasmResp = await fetch(wasmUrl);
-      if (!wasmResp.ok) {
-        throw new Error(`Failed to fetch WASM binary: HTTP ${wasmResp.status}`);
-      }
-      const wasmBinary = await wasmResp.arrayBuffer();
+      // Let the Emscripten runtime fetch + compile WASM via
+      // WebAssembly.instantiateStreaming (compiles while downloading).
+      // The .mjs module's import.meta.url resolves the .wasm path
+      // automatically to the correct chrome-extension:// lib/ directory.
+      // If streaming compilation fails (e.g. wrong MIME type), the runtime
+      // gracefully falls back to ArrayBuffer instantiation — same as before.
       console.log(
-        `[OFFSCREEN] WASM binary loaded: ${(wasmBinary.byteLength / 1024 / 1024).toFixed(2)} MB`,
+        "[OFFSCREEN] Initializing libav.js (streaming WASM compile)...",
       );
 
-      libavInstance = await LibAVFactory({
-        wasmBinary: new Uint8Array(wasmBinary),
-      });
+      libavInstance = await LibAVFactory();
 
       console.log("[OFFSCREEN] libav.js ready");
       return libavInstance;
@@ -243,12 +309,26 @@ async function downloadToBuffer(url, label, signal, onProgress) {
       );
       await new Promise((r) => setTimeout(r, delay));
     }
-    response = await fetch(url, {
-      credentials: "include",
-      mode: "cors",
-      cache: "no-cache",
-      signal,
-    });
+    try {
+      response = await fetch(url, {
+        credentials: "include",
+        mode: "cors",
+        cache: "no-cache",
+        signal,
+      });
+    } catch (fetchErr) {
+      // Network error (QUIC protocol error, connection reset, DNS failure, etc.)
+      if (fetchErr.name === "AbortError") throw fetchErr;
+      console.warn(
+        `[OFFSCREEN] Network error downloading ${label} (attempt ${attempt + 1}/3): ${fetchErr.message}`,
+      );
+      lastStatus = 0;
+      if (attempt === 2)
+        throw new Error(
+          `Download failed: network error after 3 attempts (${fetchErr.message})`,
+        );
+      continue;
+    }
     lastStatus = response.status;
     if (response.ok) break;
     if (response.status !== 403) {
@@ -337,18 +417,21 @@ async function downloadToBuffer(url, label, signal, onProgress) {
 async function cleanupMergeOPFS() {
   try {
     const root = await getOPFSRoot();
+    let removed = 0;
     for await (const [name] of root) {
       if (
         name.startsWith("merge_video_") ||
         name.startsWith("merge_audio_") ||
-        name.startsWith("merge_output_")
+        name.startsWith("merge_output_") ||
+        name.startsWith("m3u8_")
       ) {
-        await root.removeEntry(name).catch(() => {});
+        await root.removeEntry(name, { recursive: true }).catch(() => {});
+        removed++;
       }
     }
-    console.log("[OFFSCREEN] OPFS merge cleanup done");
+    console.log(`[OFFSCREEN] OPFS cleanup done (removed ${removed} entries)`);
   } catch (e) {
-    console.warn("[OFFSCREEN] OPFS merge cleanup error:", e.message);
+    console.warn("[OFFSCREEN] OPFS cleanup error:", e.message);
   }
 }
 
@@ -360,17 +443,39 @@ async function cleanupMergeOPFS() {
  */
 function cleanupMEMFS() {
   if (!libavInstance) return;
-  // Clean up all possible input/output filenames (both MP4 and WebM variants)
+  // Clean up all possible input/output filenames across all merge/transmux paths
   for (const f of [
+    // YouTube merge (MP4 / WebM variants)
     "input_video.mp4",
     "input_video.webm",
     "input_audio.mp4",
     "input_audio.webm",
     "output.mp4",
     "output.webm",
+    // HLS separate audio merge (TS variants)
+    "input_video.ts",
+    "input_audio.ts",
+    "merged_output.mp4",
+    // TS → MP4 transmux
+    "input.ts",
   ]) {
     try {
       libavInstance.unlink(f);
+    } catch (e) {}
+  }
+  // Also clean up any readahead-backed files (streaming I/O)
+  // Must cover all extension variants: .ts (HLS transmux), .mp4 / .webm (fMP4/WebM merge)
+  for (const f of [
+    "input.ts",
+    "input_video.ts",
+    "input_audio.ts",
+    "input_video.mp4",
+    "input_audio.mp4",
+    "input_video.webm",
+    "input_audio.webm",
+  ]) {
+    try {
+      libavInstance.unlinkreadaheadfile(f);
     } catch (e) {}
   }
 }
@@ -379,6 +484,109 @@ function cleanupMEMFS() {
  * Cancels any in-progress merge operation, cleans up partial in-memory files, and reports the outcome.
  * @param {function(Object): void} sendResponse - Callback invoked with the result object: `{ success: true }` on successful cancellation, or `{ success: false, error: string }` if no active merge exists.
  */
+
+// FFmpeg codec constants for pre-flight probe
+const AVMEDIA_TYPE_VIDEO = 0;
+const AVMEDIA_TYPE_AUDIO = 1;
+const AV_CODEC_ID_AAC = 86018; // 0x15002
+const AV_CODEC_ID_MP3 = 86017; // 0x15001
+const AV_CODEC_ID_AC3 = 86019; // 0x15003
+const AV_CODEC_ID_EAC3 = 86056; // 0x15028
+const AV_CODEC_ID_OPUS = 86076; // 0x1503C
+const AV_CODEC_ID_VORBIS = 86021; // 0x15005
+
+/**
+ * Pre-flight probe: open a MEMFS file via the demuxer and return stream info.
+ *
+ * Uses libav.js ff_init_demuxer_file to inspect the container without running
+ * a full ffmpeg transcode.  Returns authoritative codec IDs from FFmpeg's own
+ * parser, which is more reliable than the JS-level PMT/CODECS heuristics used
+ * by the download worker.
+ *
+ * @param {Object} libav  - Initialized libav.js instance
+ * @param {string} filename - MEMFS filename to probe (e.g. "input.ts")
+ * @returns {{ valid: boolean, hasVideo: boolean, hasAudio: boolean,
+ *             audioCodecId: number|null, audioCodecName: string|null,
+ *             streams: Array<{index:number, codec_type:number, codec_id:number}> }}
+ */
+async function probeInputFile(libav, filename) {
+  try {
+    const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename);
+
+    const audioStream = streams.find(
+      (s) => s.codec_type === AVMEDIA_TYPE_AUDIO,
+    );
+    let audioCodecName = null;
+    if (audioStream) {
+      switch (audioStream.codec_id) {
+        case AV_CODEC_ID_AAC:
+          audioCodecName = "aac";
+          break;
+        case AV_CODEC_ID_MP3:
+          audioCodecName = "mp3";
+          break;
+        case AV_CODEC_ID_AC3:
+          audioCodecName = "ac3";
+          break;
+        case AV_CODEC_ID_EAC3:
+          audioCodecName = "eac3";
+          break;
+        case AV_CODEC_ID_OPUS:
+          audioCodecName = "opus";
+          break;
+        case AV_CODEC_ID_VORBIS:
+          audioCodecName = "vorbis";
+          break;
+        default:
+          audioCodecName = `unknown(${audioStream.codec_id})`;
+          break;
+      }
+    }
+
+    const info = {
+      valid: true,
+      hasVideo: streams.some((s) => s.codec_type === AVMEDIA_TYPE_VIDEO),
+      hasAudio: !!audioStream,
+      audioCodecId: audioStream ? audioStream.codec_id : null,
+      audioCodecName,
+      streams: streams.map((s) => ({
+        index: s.index,
+        codec_type: s.codec_type,
+        codec_id: s.codec_id,
+      })),
+    };
+
+    // Close the demuxer (does NOT delete the MEMFS/readahead file).
+    // Wrapped in its own try/catch so a close failure doesn't discard
+    // the successfully-probed info.
+    try {
+      await libav.avformat_close_input_js(fmt_ctx);
+    } catch (closeErr) {
+      console.warn(
+        `[OFFSCREEN] Probe close warning for ${filename}:`,
+        closeErr,
+      );
+    }
+
+    console.log(
+      `[OFFSCREEN] Probe ${filename}: ${info.streams.length} stream(s), ` +
+        `video=${info.hasVideo}, audio=${info.hasAudio}` +
+        (info.audioCodecName ? ` (${info.audioCodecName})` : ""),
+    );
+    return info;
+  } catch (e) {
+    console.warn(`[OFFSCREEN] Pre-flight probe of ${filename} failed:`, e);
+    return {
+      valid: false,
+      hasVideo: false,
+      hasAudio: false,
+      audioCodecId: null,
+      audioCodecName: null,
+      streams: [],
+    };
+  }
+}
+
 function handleCancelMerge(sendResponse) {
   if (activeMergeAbort) {
     console.log("[OFFSCREEN] Cancelling active merge...");
@@ -408,6 +616,41 @@ function handleCancelMerge(sendResponse) {
  * @param {Function} sendResponse - Callback to send the result back (called with an object describing success or error).
  */
 async function handleMergeAndDownload(msg, sendResponse) {
+  const { videoUrl, audioUrl, filename, mergeId } = msg;
+
+  // S34 fix: Estimate size from URL (Content-Length) before queuing
+  // to serialize large merges and prevent concurrent memory exhaustion
+  let estimatedSize = 0;
+  try {
+    const videoHead = await fetch(videoUrl, { method: "HEAD" });
+    const videoLength = parseInt(
+      videoHead.headers.get("content-length") || "0",
+      10,
+    );
+    const audioHead = await fetch(audioUrl, { method: "HEAD" });
+    const audioLength = parseInt(
+      audioHead.headers.get("content-length") || "0",
+      10,
+    );
+    estimatedSize = videoLength + audioLength;
+    console.log(
+      `[OFFSCREEN] Merge size estimate: ${(estimatedSize / 1024 / 1024).toFixed(1)} MB`,
+    );
+  } catch (e) {
+    // HEAD may fail, continue anyway
+    console.warn("[OFFSCREEN] Failed to estimate merge size:", e.message);
+  }
+
+  // Queue the merge if it's large
+  return queueMerge(async () => {
+    return await _doMerge(msg, sendResponse);
+  }, estimatedSize);
+}
+
+/**
+ * Internal merge implementation (separated for queuing)
+ */
+async function _doMerge(msg, sendResponse) {
   const { videoUrl, audioUrl, filename, mergeId } = msg;
   const progressKey = mergeId || Date.now().toString();
 
@@ -567,6 +810,9 @@ async function handleMergeAndDownload(msg, sendResponse) {
       throw new Error(`FFmpeg merge failed with exit code ${exitCode}`);
     }
 
+    // Check for cancellation immediately after FFmpeg completes
+    if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
+
     // Free input files from MEMFS BEFORE reading output — reduces peak memory
     try {
       libav.unlink(videoInputFile);
@@ -593,47 +839,54 @@ async function handleMergeAndDownload(msg, sendResponse) {
     const blob = new Blob([mergedData], { type: mimeType });
     // Free the raw buffer immediately — Blob owns the data now
     mergedData = null;
-    const blobUrl = URL.createObjectURL(blob);
-    const finalFilename = ensureExtension(filename, outputExt);
+    let blobUrl = null;
+    try {
+      blobUrl = URL.createObjectURL(blob);
+      const finalFilename = ensureExtension(filename, outputExt);
 
-    const downloadId = await new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        {
-          target: "background",
-          action: "DOWNLOAD_BLOB",
-          blobUrl,
-          filename: finalFilename,
-          size: outputSize,
-        },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else if (response?.success) {
-            resolve(response.downloadId);
-          } else {
-            reject(new Error(response?.error || "Download trigger failed"));
-          }
-        },
+      const downloadId = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            target: "background",
+            action: "DOWNLOAD_BLOB",
+            blobUrl,
+            filename: finalFilename,
+            size: outputSize,
+          },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+            } else if (response?.success) {
+              resolve(response.downloadId);
+            } else {
+              reject(new Error(response?.error || "Download trigger failed"));
+            }
+          },
+        );
+      });
+
+      console.log("[OFFSCREEN] Merged download started, id:", downloadId);
+
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
+
+      sendProgress(
+        progressKey,
+        "complete",
+        "Saving — choose location in popup",
+        100,
       );
-    });
 
-    console.log("[OFFSCREEN] Merged download started, id:", downloadId);
-
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
-
-    sendProgress(
-      progressKey,
-      "complete",
-      "Saving — choose location in popup",
-      100,
-    );
-
-    sendResponse({
-      success: true,
-      downloadId,
-      size: outputSize,
-      filename: finalFilename,
-    });
+      sendResponse({
+        success: true,
+        downloadId,
+        size: outputSize,
+        filename: finalFilename,
+      });
+    } catch (err) {
+      // Clean up blob URL if chrome API failed
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      throw err;
+    }
   } catch (err) {
     // Free any in-flight download buffers
     videoData = null;
@@ -697,12 +950,18 @@ function ensureMp4Extension(filename) {
 const activeWorkers = new Map();
 
 function handleStartWorkerDownload(msg, sendResponse) {
-  const { downloadId, url, type, filename, headers, sessionRuleId } = msg;
+  const { downloadId, url, type, filename, headers, sessionRuleId, tabId } =
+    msg;
 
   try {
     const workerUrl = chrome.runtime.getURL("workers/download-worker.js");
     const worker = new Worker(workerUrl);
     activeWorkers.set(downloadId, worker);
+    const extraRuleIds = [];
+    function cleanupAllHeaders() {
+      cleanupSessionHeaders(sessionRuleId);
+      for (const id of extraRuleIds) cleanupSessionHeaders(id);
+    }
 
     worker.onmessage = async (e) => {
       const { name: msgName, data: msgData } = e.data;
@@ -719,6 +978,36 @@ function handleStartWorkerDownload(msg, sendResponse) {
           });
           break;
 
+        case "request_url_refresh":
+          // S35 fix: Worker detected YouTube URL expiry, request fresh URLs
+          console.log("[OFFSCREEN] Worker requesting URL refresh");
+          chrome.runtime.sendMessage(
+            {
+              target: "background",
+              action: "REFRESH_YOUTUBE_URLS",
+              downloadId,
+              tabId: msg.tabId, // Pass tabId from original START_WORKER_DOWNLOAD
+            },
+            (refreshResponse) => {
+              if (refreshResponse?.urlMap) {
+                // Send fresh URLs back to worker
+                worker.postMessage({
+                  name: "refresh_urls",
+                  data: {
+                    downloadId,
+                    urlMap: refreshResponse.urlMap,
+                  },
+                });
+              } else {
+                console.warn(
+                  "[OFFSCREEN] URL refresh failed:",
+                  refreshResponse?.error,
+                );
+              }
+            },
+          );
+          break;
+
         case "download_result":
           try {
             let finalBlobUrl;
@@ -726,88 +1015,308 @@ function handleStartWorkerDownload(msg, sendResponse) {
             let finalSize = msgData.size || 0;
 
             const TRANSMUX_MAX = 2 * 1024 * 1024 * 1024;
-            if (msgData.needsTransmux && (msgData.size || 0) < TRANSMUX_MAX) {
+
+            // ── HLS separate audio merge ──
+            // When the worker downloaded video + audio as separate M3U8
+            // playlists, merge them into a single MP4 using libav.
+            if (msgData.audioBlobUrl) {
               try {
                 bc.postMessage({
                   type: "WORKER_PROGRESS",
                   downloadId,
-                  phase: "transmuxing",
-                  message: "Converting TS → MP4...",
+                  phase: "merging",
+                  message: "Merging video + audio tracks...",
                   percent: 85,
                   filename,
                 });
 
-                const tsResp = await fetch(msgData.blobUrl);
-                const tsBuffer = new Uint8Array(await tsResp.arrayBuffer());
+                const [videoResp, audioResp] = await Promise.all([
+                  fetch(msgData.blobUrl),
+                  fetch(msgData.audioBlobUrl),
+                ]);
+                let videoBlob = await videoResp.blob();
+                let audioBlob = await audioResp.blob();
 
                 URL.revokeObjectURL(msgData.blobUrl);
+                URL.revokeObjectURL(msgData.audioBlobUrl);
 
                 console.log(
-                  `[OFFSCREEN] Transmuxing TS → MP4: ${(tsBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`,
+                  `[OFFSCREEN] Merging video (${(videoBlob.size / 1024 / 1024).toFixed(2)} MB) + audio (${(audioBlob.size / 1024 / 1024).toFixed(2)} MB) — streaming I/O`,
                 );
 
                 const libav = await getLibAV();
+                const videoExt = msgData.needsTransmux ? "ts" : "mp4";
+                const audioExt = msgData.needsTransmux ? "ts" : "mp4";
+                const videoIn = `input_video.${videoExt}`;
+                const audioIn = `input_audio.${audioExt}`;
 
+                // Mount blobs as streaming readahead files — avoids the
+                // expensive blob.arrayBuffer() + writeFile() double-copy
+                // that previously tripled peak memory for V+A merges.
                 try {
-                  libav.unlink("input.ts");
+                  libav.unlinkreadaheadfile(videoIn);
                 } catch (e) {}
                 try {
-                  libav.unlink("output.mp4");
+                  libav.unlinkreadaheadfile(audioIn);
+                } catch (e) {}
+                try {
+                  libav.unlink("merged_output.mp4");
                 } catch (e) {}
 
-                libav.writeFile("input.ts", tsBuffer);
+                libav.mkreadaheadfile(videoIn, videoBlob);
+                libav.mkreadaheadfile(audioIn, audioBlob);
 
-                const exitCode = await libav.ffmpeg([
+                const ffArgs = [
                   "-y",
                   "-i",
-                  "input.ts",
+                  videoIn,
+                  "-i",
+                  audioIn,
                   "-c:v",
                   "copy",
                   "-c:a",
                   "copy",
-                  "-bsf:a",
-                  "aac_adtstoasc",
-                  "-movflags",
-                  "+faststart",
-                  "output.mp4",
-                ]);
+                ];
+                if (msgData.needsTransmux) {
+                  // Probe the audio input for authoritative codec detection
+                  const audioProbe = await probeInputFile(libav, audioIn);
+                  const workerCodec = msgData.audioCodec || null;
+                  const probeIsAAC =
+                    audioProbe.valid &&
+                    audioProbe.audioCodecId === AV_CODEC_ID_AAC;
+                  const applyBSF =
+                    probeIsAAC ||
+                    (!audioProbe.valid &&
+                      (!workerCodec ||
+                        workerCodec === "aac" ||
+                        workerCodec === "aac-he"));
+
+                  if (applyBSF) {
+                    ffArgs.push("-bsf:a", "aac_adtstoasc");
+                    console.log(
+                      `[OFFSCREEN] Merge BSF: applying aac_adtstoasc (probed=${audioProbe.audioCodecName}, worker=${workerCodec})`,
+                    );
+                  } else {
+                    console.log(
+                      `[OFFSCREEN] Merge BSF: skipping aac_adtstoasc (probed=${audioProbe.audioCodecName}, worker=${workerCodec})`,
+                    );
+                  }
+                }
+                ffArgs.push("-movflags", "+faststart", "merged_output.mp4");
+
+                const exitCode = await libav.ffmpeg(ffArgs);
+
+                // Clean up readahead devices immediately (releases Blob refs)
+                try {
+                  libav.unlinkreadaheadfile(videoIn);
+                } catch (e) {}
+                try {
+                  libav.unlinkreadaheadfile(audioIn);
+                } catch (e) {}
+                videoBlob = null;
+                audioBlob = null;
 
                 if (exitCode !== 0) {
                   throw new Error(
-                    `FFmpeg transmux failed with exit code ${exitCode}`,
+                    `FFmpeg merge failed with exit code ${exitCode}`,
                   );
                 }
 
-                const mp4Data = libav.readFile("output.mp4");
+                let mp4Data = libav.readFile("merged_output.mp4");
                 console.log(
-                  `[OFFSCREEN] Transmux complete: ${(mp4Data.byteLength / 1024 / 1024).toFixed(2)} MB`,
+                  `[OFFSCREEN] Merge complete: ${(mp4Data.byteLength / 1024 / 1024).toFixed(2)} MB`,
                 );
 
                 const mp4Blob = new Blob([mp4Data], { type: "video/mp4" });
+                mp4Data = null; // Free raw buffer — Blob owns the data now
                 finalBlobUrl = URL.createObjectURL(mp4Blob);
                 finalFilename = ensureMp4Extension(filename);
                 finalSize = mp4Blob.size;
 
                 try {
-                  libav.unlink("input.ts");
-                } catch (e) {}
-                try {
-                  libav.unlink("output.mp4");
+                  libav.unlink("merged_output.mp4");
                 } catch (e) {}
 
                 bc.postMessage({
                   type: "WORKER_PROGRESS",
                   downloadId,
-                  phase: "transmuxing",
-                  message: "Transmux complete!",
+                  phase: "merging",
+                  message: "Merge complete!",
                   percent: 95,
                   filename: finalFilename,
                 });
-              } catch (transmuxErr) {
+              } catch (mergeErr) {
+                cleanupMEMFS();
                 console.warn(
-                  "[OFFSCREEN] Transmux failed, falling back to raw TS:",
+                  "[OFFSCREEN] Audio merge failed, downloading video only:",
+                  mergeErr,
+                );
+                // Fallback: download video-only (audio will be missing)
+                finalBlobUrl = msgData.blobUrl;
+                finalFilename = guessExtension(
+                  filename,
+                  msgData.mimeType || msgData.contentType,
+                );
+                finalSize = msgData.size || 0;
+              }
+
+              // Clean up audio OPFS folder if present
+              if (msgData.audioOpfsCleanupInfo) {
+                cleanupOPFS(msgData.audioOpfsCleanupInfo.folder);
+              }
+            } else if (msgData.needsTransmux) {
+              // S32 fix: Check actual blob size before transmux, not just msgData.size.
+              // For HLS with chunked transfer or missing Content-Length, msgData.size
+              // may be 0 or undefined, allowing multi-GB files to bypass the guard.
+              try {
+                // Fetch the blob first to get actual size
+                const tsResp = await fetch(msgData.blobUrl);
+                let tsBlob = await tsResp.blob();
+                const actualSize = tsBlob.size;
+
+                console.log(
+                  `[OFFSCREEN] TS size check: reported=${msgData.size || 0}, actual=${actualSize}`,
+                );
+
+                if (actualSize >= TRANSMUX_MAX) {
+                  console.warn(
+                    `[OFFSCREEN] File too large for transmux (${(actualSize / 1024 / 1024 / 1024).toFixed(2)} GB > ${(TRANSMUX_MAX / 1024 / 1024 / 1024).toFixed(2)} GB). Delivering as raw .ts`,
+                  );
+
+                  // Deliver raw TS without transmux
+                  finalBlobUrl = msgData.blobUrl;
+                  finalFilename = guessExtension(
+                    filename,
+                    msgData.mimeType || msgData.contentType,
+                  );
+                  finalSize = actualSize;
+                } else {
+                  // Size is OK, proceed with transmux
+                  bc.postMessage({
+                    type: "WORKER_PROGRESS",
+                    downloadId,
+                    phase: "transmuxing",
+                    message: "Converting TS → MP4...",
+                    percent: 85,
+                    filename,
+                  });
+
+                  // NOTE: Do NOT revoke msgData.blobUrl here — we need it as a
+                  // fallback if transmux fails. The Blob ref is held by tsBlob
+                  // for the readahead device; the URL is revoked only on success.
+
+                  console.log(
+                    `[OFFSCREEN] Transmuxing TS → MP4: ${(actualSize / 1024 / 1024).toFixed(2)} MB (streaming I/O)`,
+                  );
+
+                  const libav = await getLibAV();
+
+                  // Mount the TS Blob as a streaming readahead file — FFmpeg
+                  // reads directly from the Blob via Blob.slice(), avoiding the
+                  // expensive blob.arrayBuffer() + writeFile() double-copy that
+                  // previously doubled peak memory.
+                  try {
+                    libav.unlinkreadaheadfile("input.ts");
+                  } catch (e) {}
+                  try {
+                    libav.unlink("output.mp4");
+                  } catch (e) {}
+
+                  libav.mkreadaheadfile("input.ts", tsBlob);
+
+                  // Pre-flight probe: use FFmpeg's own demuxer for authoritative
+                  // codec detection — more reliable than JS-level PMT parsing.
+                  const probe = await probeInputFile(libav, "input.ts");
+
+                  // Dynamic BSF: prefer probed codec, fall back to worker hint
+                  const tsFFArgs = [
+                    "-y",
+                    "-i",
+                    "input.ts",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                  ];
+
+                  // Use probe result for BSF decision when available;
+                  // fall back to worker-level detection (msgData.audioCodec)
+                  const probedIsAAC =
+                    probe.valid && probe.audioCodecId === AV_CODEC_ID_AAC;
+                  const workerCodec = msgData.audioCodec || null;
+                  const applyAAC_BSF =
+                    probedIsAAC ||
+                    (!probe.valid &&
+                      (!workerCodec ||
+                        workerCodec === "aac" ||
+                        workerCodec === "aac-he"));
+
+                  if (applyAAC_BSF) {
+                    tsFFArgs.push("-bsf:a", "aac_adtstoasc");
+                    console.log(
+                      `[OFFSCREEN] Transmux: applying aac_adtstoasc (probed=${probe.audioCodecName}, worker=${workerCodec})`,
+                    );
+                  } else {
+                    console.log(
+                      `[OFFSCREEN] Transmux: skipping aac_adtstoasc (probed=${probe.audioCodecName}, worker=${workerCodec})`,
+                    );
+                  }
+                  tsFFArgs.push("-movflags", "+faststart", "output.mp4");
+
+                  const exitCode = await libav.ffmpeg(tsFFArgs);
+
+                  // Clean up the readahead device immediately (releases Blob ref)
+                  try {
+                    libav.unlinkreadaheadfile("input.ts");
+                  } catch (e) {}
+                  tsBlob = null; // Allow GC of the original Blob
+
+                  if (exitCode !== 0) {
+                    throw new Error(
+                      `FFmpeg transmux failed with exit code ${exitCode}`,
+                    );
+                  }
+
+                  let mp4Data = libav.readFile("output.mp4");
+                  console.log(
+                    `[OFFSCREEN] Transmux complete: ${(mp4Data.byteLength / 1024 / 1024).toFixed(2)} MB`,
+                  );
+
+                  const mp4Blob = new Blob([mp4Data], { type: "video/mp4" });
+                  mp4Data = null; // Free raw buffer — Blob owns the data now
+                  finalBlobUrl = URL.createObjectURL(mp4Blob);
+                  finalFilename = ensureMp4Extension(filename);
+                  finalSize = mp4Blob.size;
+
+                  // Transmux succeeded — safe to revoke the original TS blob URL
+                  URL.revokeObjectURL(msgData.blobUrl);
+
+                  try {
+                    libav.unlink("output.mp4");
+                  } catch (e) {}
+
+                  bc.postMessage({
+                    type: "WORKER_PROGRESS",
+                    downloadId,
+                    phase: "transmuxing",
+                    message: "Transmux complete!",
+                    percent: 95,
+                    filename: finalFilename,
+                  });
+                }
+              } catch (transmuxErr) {
+                cleanupMEMFS();
+                console.warn(
+                  "[OFFSCREEN] Transmux failed or skipped, falling back to raw TS:",
                   transmuxErr,
                 );
+
+                // Validate fallback blob URL exists before using it
+                if (!msgData.blobUrl) {
+                  throw new Error(
+                    `Transmux failed and no fallback URL available: ${transmuxErr.message}`,
+                  );
+                }
 
                 finalBlobUrl = msgData.blobUrl;
                 finalFilename = guessExtension(
@@ -817,14 +1326,6 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 finalSize = msgData.size || 0;
               }
             } else {
-              if (
-                msgData.needsTransmux &&
-                (msgData.size || 0) >= TRANSMUX_MAX
-              ) {
-                console.warn(
-                  `[OFFSCREEN] File too large for transmux (${(msgData.size / 1024 / 1024 / 1024).toFixed(2)} GB). Downloading as raw .ts`,
-                );
-              }
               finalBlobUrl = msgData.blobUrl;
               const ct = msgData.mimeType || msgData.contentType;
               finalFilename = msgData.needsMerge
@@ -876,7 +1377,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                     URL.revokeObjectURL(finalBlobUrl);
                     if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
                   },
-                  6 * 60 * 60 * 1000,
+                  30 * 60 * 1000, // 30min safety net (primary cleanup is via onChanged listener)
                 );
               },
             );
@@ -907,11 +1408,13 @@ function handleStartWorkerDownload(msg, sendResponse) {
 
           worker.terminate();
           activeWorkers.delete(downloadId);
-          cleanupSessionHeaders(sessionRuleId);
+          cleanupAllHeaders();
           break;
 
         case "download_error":
           console.error("[OFFSCREEN] Worker error:", msgData.error);
+          // Clean up any OPFS folders created for this download
+          cleanupOPFSByPrefix(`m3u8_${downloadId}_`);
           chrome.runtime
             .sendMessage({
               target: "background",
@@ -925,7 +1428,29 @@ function handleStartWorkerDownload(msg, sendResponse) {
 
           worker.terminate();
           activeWorkers.delete(downloadId);
-          cleanupSessionHeaders(sessionRuleId);
+          cleanupAllHeaders();
+          break;
+
+        case "key_domains_discovered":
+          // Key URIs may be on a different domain than the stream segments.
+          // Create additional DNR header rules so auth/referer headers are sent.
+          if (
+            e.data.hosts?.length > 0 &&
+            headers &&
+            Object.keys(headers).length > 0
+          ) {
+            chrome.runtime
+              .sendMessage({
+                target: "background",
+                action: "ADD_KEY_HOST_HEADERS",
+                hosts: e.data.hosts,
+                headers,
+              })
+              .then((resp) => {
+                if (resp?.ruleIds) extraRuleIds.push(...resp.ruleIds);
+              })
+              .catch(() => {});
+          }
           break;
       }
     };
@@ -943,7 +1468,9 @@ function handleStartWorkerDownload(msg, sendResponse) {
         })
         .catch(() => {});
       activeWorkers.delete(downloadId);
-      cleanupSessionHeaders(sessionRuleId);
+      cleanupAllHeaders();
+      // Clean up any OPFS folders created for this download
+      cleanupOPFSByPrefix(`m3u8_${downloadId}_`);
     };
 
     worker.postMessage({
@@ -954,6 +1481,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
         type,
         filename,
         headers: headers || {},
+        tabId, // S35 fix: Pass tabId for URL refresh
       },
     });
 
@@ -961,7 +1489,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
     sendResponse({ success: true, downloadId });
   } catch (err) {
     console.error("[OFFSCREEN] Failed to start worker:", err);
-    cleanupSessionHeaders(sessionRuleId);
+    cleanupAllHeaders();
     sendResponse({ success: false, error: err.message });
   }
 }
@@ -975,6 +1503,8 @@ function handleCancelWorkerDownload(msg, sendResponse) {
       name: "cancel_download",
       data: { download_id: downloadId },
     });
+    // Clean up any OPFS folders created for this download
+    cleanupOPFSByPrefix(`m3u8_${downloadId}_`);
     setTimeout(() => {
       worker.terminate();
       activeWorkers.delete(downloadId);
@@ -992,6 +1522,25 @@ async function cleanupOPFS(folderName) {
     console.log(`[OFFSCREEN] OPFS cleanup: removed ${folderName}`);
   } catch (e) {
     console.warn(`[OFFSCREEN] OPFS cleanup failed (non-critical):`, e.message);
+  }
+}
+
+/**
+ * Remove all OPFS directories whose name starts with the given prefix.
+ * Used to clean up m3u8_{downloadId}_ folders on error/cancel when
+ * the exact folder name (which includes a timestamp) is unknown.
+ */
+async function cleanupOPFSByPrefix(prefix) {
+  try {
+    const root = await navigator.storage.getDirectory();
+    for await (const [name, handle] of root) {
+      if (handle.kind === "directory" && name.startsWith(prefix)) {
+        await root.removeEntry(name, { recursive: true }).catch(() => {});
+        console.log(`[OFFSCREEN] OPFS prefix cleanup: removed ${name}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[OFFSCREEN] OPFS prefix cleanup error:`, e.message);
   }
 }
 

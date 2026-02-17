@@ -43,6 +43,7 @@ const CLIENTS = {
 
 const tabData = new Map();
 const sigCache = new Map();
+const SIG_CACHE_MAX = 3; // Max cached player versions — each stores cipher/nsig data + full playerSource (~1.2MB)
 const pendingRequests = new Map();
 const sniffedStreams = new Map();
 const contentHashes = new Map();
@@ -50,7 +51,13 @@ const mergeProgress = new Map();
 const sniffedYouTubeUrls = new Map(); // tabId → Map(itag → {url, mime, clen, expire, ts})
 const REFERER_RULE_ID = 1;
 let activeMergeId = null;
+let pendingMergeRemoveTimer = null; // Timer ID for delayed activeMerge storage cleanup
 let mergeKeepaliveTimer = null; // Keeps SW alive during merge
+let workerKeepaliveTimer = null; // Keeps SW alive during worker downloads
+let activeWorkerCount = 0; // Track how many worker downloads are in flight
+let workerHealthCheckTimer = null; // Periodic offscreen health check during downloads
+let formatKeepaliveTimer = null; // Keeps SW alive during format resolution
+let activeFormatCount = 0; // Track concurrent getFormats() calls
 
 // ========== Auto-Update Checker (GitHub Releases) ==========
 const UPDATE_CONFIG = {
@@ -134,8 +141,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// Also check on service worker startup
-checkForUpdate();
+// Update check is handled by the alarm (delayInMinutes: 1 on first run)
+// — no separate top-level call needed to avoid double-check on startup.
 
 // ========== YouTube itag → format metadata lookup (IDM-style sniffing) ==========
 // When YouTube's player.js fetches a videoplayback URL, cipher & N-sig are already
@@ -920,11 +927,21 @@ const ITAG_MAP = {
   },
 };
 
-// Import DRM detection utility
-importScripts("lib/drm-detection.js");
-
-// Import site-to-extractor mapping (single source of truth)
-importScripts("extractors/site-map.js");
+// Import dependencies via importScripts (service worker only — Chrome MV3).
+// Firefox MV3 uses the "scripts" array in manifest.json to load these
+// files as background page scripts, so importScripts() is unavailable.
+// Chrome MV3 ignores the "scripts" array and uses service_worker only.
+if (typeof importScripts === "function") {
+  importScripts("lib/drm-detection.js");
+  importScripts("lib/compat.js");
+  importScripts("lib/widevine-proto.js");
+  importScripts("lib/mp4-parser.js");
+  importScripts("lib/cenc-decryptor.js");
+  importScripts("lib/manifest-parser-drm.js");
+  importScripts("lib/remote-cdm.js");
+  importScripts("lib/drm-handler.js");
+  importScripts("extractors/site-map.js");
+}
 
 async function captureMetadata(tabId) {
   try {
@@ -1099,10 +1116,267 @@ bcIn.onmessage = (e) => {
   }
 };
 
-function persistTabData() {
-  const obj = {};
+// ─── Debounced persistTabData ───────────────────────────────────
+// Returns a Promise that resolves when the storage write completes.
+// Debounces rapid writes (500ms trailing) to reduce storage I/O while
+// ensuring the final state is always persisted.  The returned Promise
+// resolves when the ACTUAL write is done (not just queued).
+
+// ── Quota-aware helpers (S25 fix) ──────────────────────────────
+// chrome.storage.session has a hard 10 MB quota (QUOTA_BYTES = 10,485,760).
+// Serializing 50+ YouTube tabs can exceed this limit.  These helpers
+// estimate the serialized size and trim stale entries before writing.
+const SESSION_QUOTA_BYTES = 10_485_760;
+const SESSION_QUOTA_SAFE = Math.floor(SESSION_QUOTA_BYTES * 0.8); // 80% watermark
+
+/**
+ * Estimate the JSON-stringified byte length of an object.
+ * Uses a fast approach — stringify a representative sample if the Map is very
+ * large, otherwise stringify the whole thing.
+ */
+function _estimateTabDataSize(obj) {
+  try {
+    return JSON.stringify(obj).length;
+  } catch {
+    return SESSION_QUOTA_BYTES; // assume worst-case if serialization fails
+  }
+}
+
+/**
+ * Trim tabData entries until the serialized payload fits under the safe
+ * watermark.  Eviction order (S50 enhancement):
+ *   1. Tabs that no longer exist in Chrome (stale entries from closed tabs)
+ *   2. Tabs without active downloads, sorted by age (oldest first)
+ *   3. Compress format arrays for tabs older than 10 minutes
+ *   4. As last resort, warn user and evict even recent tabs
+ * Mutates tabData in-place and returns the trimmed serialized object.
+ */
+async function _trimTabDataForQuota() {
+  let obj = {};
   for (const [tabId, data] of tabData) obj[tabId] = data;
-  chrome.storage.session.set({ tabDataCache: obj }).catch(() => {});
+  let size = _estimateTabDataSize(obj);
+
+  if (size <= SESSION_QUOTA_SAFE) return obj;
+
+  const sizeMB = (size / 1024 / 1024).toFixed(1);
+  const quotaMB = (SESSION_QUOTA_SAFE / 1024 / 1024).toFixed(1);
+  console.warn(
+    `[S50] tabDataCache size ${sizeMB}MB exceeds safe watermark ${quotaMB}MB. ` +
+      `Trimming from ${tabData.size} entries.`,
+  );
+
+  // S50 Phase 1: Remove entries for tabs that no longer exist
+  try {
+    const openTabs = await chrome.tabs.query({});
+    const openTabIds = new Set(openTabs.map((t) => t.id));
+    const staleCount = [...tabData.keys()].filter(
+      (tid) => !openTabIds.has(tid),
+    ).length;
+    for (const tabId of [...tabData.keys()]) {
+      if (!openTabIds.has(tabId)) {
+        tabData.delete(tabId);
+      }
+    }
+    if (staleCount > 0) {
+      console.log(`[S50] Removed ${staleCount} stale tab entries`);
+    }
+    obj = {};
+    for (const [tabId, data] of tabData) obj[tabId] = data;
+    size = _estimateTabDataSize(obj);
+    if (size <= SESSION_QUOTA_SAFE) return obj;
+  } catch (e) {
+    console.warn("[S50] Tab query during quota trim failed:", e?.message);
+  }
+
+  // S50 Phase 2: Compress format arrays for tabs older than 10 minutes
+  // Keep only itag, url, quality, contentLength — drop codec info, DASH details
+  const TEN_MINUTES = 600000;
+  const now = Date.now();
+  let compressedCount = 0;
+  for (const [tabId, data] of tabData) {
+    if (data.ts && now - data.ts > TEN_MINUTES && data.formats?.length) {
+      const essential = data.formats.map((f) => ({
+        itag: f.itag,
+        url: f.url,
+        quality: f.quality,
+        contentLength: f.contentLength,
+        mimeType: f.mimeType?.split(";")[0], // Drop codecs
+      }));
+      data.formats = essential;
+      data._compressed = true;
+      compressedCount++;
+    }
+  }
+  if (compressedCount > 0) {
+    console.log(`[S50] Compressed ${compressedCount} old tab format arrays`);
+    obj = {};
+    for (const [tabId, data] of tabData) obj[tabId] = data;
+    size = _estimateTabDataSize(obj);
+    if (size <= SESSION_QUOTA_SAFE) return obj;
+  }
+
+  // S50 Phase 3: Evict oldest tabs without active downloads
+  const activeDownloadTabIds = new Set(
+    [...activeDownloads.values()].map((d) => d.tabId).filter(Boolean),
+  );
+  const entries = [...tabData.entries()];
+
+  // Separate active vs inactive, sort inactive by age (oldest first)
+  const inactive = entries
+    .filter(([tid]) => !activeDownloadTabIds.has(tid))
+    .sort((a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0));
+
+  for (const [tabId] of inactive) {
+    if (tabData.size <= 10) break; // Keep at least 10 entries
+    tabData.delete(tabId);
+    obj = {};
+    for (const [tid, data] of tabData) obj[tid] = data;
+    size = _estimateTabDataSize(obj);
+    if (size <= SESSION_QUOTA_SAFE) break;
+  }
+
+  const evictedCount = entries.length - tabData.size;
+  if (evictedCount > 0) {
+    console.log(`[S50] Evicted ${evictedCount} inactive tabs`);
+  }
+
+  // S50 Phase 4: If still over quota, warn user and evict even active tabs
+  if (size > SESSION_QUOTA_SAFE && tabData.size > 10) {
+    console.warn(
+      `[S50] Still over quota (${(size / 1024 / 1024).toFixed(1)}MB) after trimming. ` +
+        `Warning user and performing emergency eviction.`,
+    );
+
+    // Notify user that we're running out of storage
+    try {
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+        title: "Storage Limit Reached",
+        message: `Too many tabs (${tabData.size}) are using extension storage. Oldest tabs will be cleared to prevent data loss. Consider closing unused video tabs.`,
+        priority: 1,
+      });
+    } catch (e) {
+      console.warn("[S50] Notification failed:", e?.message);
+    }
+
+    // Emergency: evict oldest 50% of remaining entries
+    const allEntries = [...tabData.entries()].sort(
+      (a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0),
+    );
+    const toRemove = Math.max(1, Math.floor(allEntries.length / 2));
+    for (let i = 0; i < toRemove && tabData.size > 1; i++) {
+      tabData.delete(allEntries[i][0]);
+    }
+    obj = {};
+    for (const [tid, data] of tabData) obj[tid] = data;
+    size = _estimateTabDataSize(obj);
+    console.log(
+      `[S50] Emergency eviction removed ${toRemove} tabs, final size: ${(size / 1024 / 1024).toFixed(1)}MB`,
+    );
+  }
+
+  return obj;
+}
+
+let _persistTimer = null;
+let _persistResolvers = [];
+
+function persistTabData() {
+  return new Promise((resolve) => {
+    _persistResolvers.push(resolve);
+    if (_persistTimer) clearTimeout(_persistTimer);
+    _persistTimer = setTimeout(async () => {
+      _persistTimer = null;
+      const resolvers = _persistResolvers;
+      _persistResolvers = [];
+
+      try {
+        const obj = await _trimTabDataForQuota();
+
+        await chrome.storage.session.set({ tabDataCache: obj });
+        for (const r of resolvers) r(true);
+      } catch (err) {
+        console.warn("[BG] persistTabData write failed:", err?.message);
+        // On quota error, attempt emergency trim and single retry
+        if (
+          err?.message?.includes?.("QUOTA_BYTES") ||
+          err?.message?.includes?.("quota")
+        ) {
+          try {
+            console.warn(
+              "[BG] Quota error detected — emergency trim and retry",
+            );
+            // Force aggressive trim by deleting half the entries
+            const entries = [...tabData.entries()].sort(
+              (a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0),
+            );
+            const toRemove = Math.ceil(entries.length / 2);
+            for (let i = 0; i < toRemove && tabData.size > 1; i++) {
+              tabData.delete(entries[i][0]);
+            }
+            const retryObj = {};
+            for (const [tabId, data] of tabData) retryObj[tabId] = data;
+            await chrome.storage.session.set({ tabDataCache: retryObj });
+            for (const r of resolvers) r(true);
+            return;
+          } catch (retryErr) {
+            console.error(
+              "[BG] Emergency persist retry also failed:",
+              retryErr?.message,
+            );
+          }
+        }
+        for (const r of resolvers) r(false);
+      }
+    }, 500);
+  });
+}
+
+// Immediate persist for critical paths — bypasses debounce
+async function persistTabDataNow() {
+  if (_persistTimer) {
+    clearTimeout(_persistTimer);
+    _persistTimer = null;
+  }
+  const resolvers = _persistResolvers;
+  _persistResolvers = [];
+
+  try {
+    const obj = await _trimTabDataForQuota();
+
+    await chrome.storage.session.set({ tabDataCache: obj });
+    for (const r of resolvers) r(true);
+  } catch (err) {
+    console.warn("[BG] persistTabDataNow write failed:", err?.message);
+    // On quota error, attempt emergency trim and single retry
+    if (
+      err?.message?.includes?.("QUOTA_BYTES") ||
+      err?.message?.includes?.("quota")
+    ) {
+      try {
+        console.warn("[BG] Quota error detected — emergency trim and retry");
+        const entries = [...tabData.entries()].sort(
+          (a, b) => (a[1]?.ts || 0) - (b[1]?.ts || 0),
+        );
+        const toRemove = Math.ceil(entries.length / 2);
+        for (let i = 0; i < toRemove && tabData.size > 1; i++) {
+          tabData.delete(entries[i][0]);
+        }
+        const retryObj = {};
+        for (const [tabId, data] of tabData) retryObj[tabId] = data;
+        await chrome.storage.session.set({ tabDataCache: retryObj });
+        for (const r of resolvers) r(true);
+        return;
+      } catch (retryErr) {
+        console.error(
+          "[BG] Emergency persist retry also failed:",
+          retryErr?.message,
+        );
+      }
+    }
+    for (const r of resolvers) r(false);
+  }
 }
 
 chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
@@ -1116,6 +1390,8 @@ chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
   // If the SW restarted while a merge was active, try to auto-resume
   if (result?.activeMerge?.status === "active") {
     const merge = result.activeMerge;
+    // Block concurrent merges immediately — set activeMergeId before async resume
+    activeMergeId = merge.mergeId || "resuming";
     if (merge.videoId && merge.videoItag && merge.audioItag) {
       console.log(
         "[BG] SW restarted during active merge — attempting auto-resume for",
@@ -1133,6 +1409,7 @@ chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
       // Kick off resume asynchronously
       resumeMergeFromState(merge).catch((e) => {
         console.error("[BG] Auto-resume failed:", e.message);
+        activeMergeId = null; // Unblock merge slot after failed resume
         chrome.storage.session
           .set({
             activeMerge: {
@@ -1144,6 +1421,7 @@ chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
           .catch(() => {});
       });
     } else {
+      activeMergeId = null; // No resume data — unblock merge slot
       console.warn(
         "[BG] SW restarted during merge but no videoId/itags stored — marking failed",
       );
@@ -1160,17 +1438,295 @@ chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
   }
 });
 
+// ─── Cleanup stale activeDownloads from previous SW lifetime ───────
+// If the SW died mid-download, entries stay in session storage forever
+// since the 15s cleanup timer never fires. Mark them as failed.
+chrome.storage.session.get("activeDownloads", (result) => {
+  const downloads = result?.activeDownloads;
+  if (!downloads || Object.keys(downloads).length === 0) return;
+
+  let cleaned = 0;
+  const MAX_STALE_AGE_MS = 5 * 60 * 1000; // 5 minutes
+  const now = Date.now();
+
+  for (const [id, dl] of Object.entries(downloads)) {
+    // If the download was "starting" or "downloading" and is stale,
+    // mark it as failed so the UI reflects the correct state
+    if (
+      (dl.phase === "starting" || dl.phase === "downloading") &&
+      now - (dl.ts || 0) > MAX_STALE_AGE_MS
+    ) {
+      downloads[id] = {
+        ...dl,
+        phase: "error",
+        message: "Download interrupted (service worker restarted)",
+        ts: now,
+      };
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) {
+    chrome.storage.session.set({ activeDownloads: downloads }).catch(() => {});
+    console.log(
+      "[BG] Marked",
+      cleaned,
+      "stale activeDownloads as failed after SW restart",
+    );
+  }
+});
+
+// ─── Clean stale DNR session rules from previous SW lifetime ───────
+// Session header rules (id >= SESSION_HEADER_BASE) persist across SW
+// restarts but sessionHeaderCounter resets to 0, causing ID collisions.
+// Only clear rules if no active downloads are in flight (surviving
+// offscreen workers may still depend on these header rules).
+(async () => {
+  try {
+    // Check for in-progress downloads before clearing rules
+    const dlResult = await chrome.storage.session.get("activeDownloads");
+    const activeDownloads = dlResult?.activeDownloads || {};
+    const inFlightCount = Object.values(activeDownloads).filter(
+      (d) => d.phase === "starting" || d.phase === "downloading",
+    ).length;
+
+    const rules = await chrome.declarativeNetRequest?.getSessionRules?.();
+    if (rules && rules.length > 0) {
+      const staleIds = rules
+        .filter((r) => r.id >= 1000000) // SESSION_HEADER_BASE
+        .map((r) => r.id);
+      if (staleIds.length > 0) {
+        if (inFlightCount > 0) {
+          console.log(
+            "[BG]",
+            inFlightCount,
+            "active downloads in flight — deferring DNR rule cleanup.",
+            "Rules preserved:",
+            staleIds.length,
+          );
+          // Bump the counter past existing rule IDs to avoid collisions
+          // without deleting rules that active downloads need
+          const maxId = Math.max(...staleIds);
+          sessionHeaderCounter = maxId - 1000000 + 1;
+        } else {
+          await chrome.declarativeNetRequest?.updateSessionRules?.({
+            removeRuleIds: staleIds,
+          });
+          console.log(
+            "[BG] Cleaned",
+            staleIds.length,
+            "stale session header rules from previous SW lifetime",
+          );
+        }
+      }
+    }
+  } catch (e) {
+    // declarativeNetRequest may not be available (Firefox)
+  }
+})();
+
+// ─── S31/S37 fix: Extension Update Handling ────────────────────────────
+// Chrome can auto-update extensions mid-download, killing all contexts.
+// Defer updates if downloads, merges, or format resolution are active.
+
+/**
+ * Check if there are any active downloads, merges, or format resolutions in progress.
+ * @returns {Promise<{hasActive: boolean, count: number, formatCount: number}>}
+ */
+async function hasActiveDownloads() {
+  try {
+    const dlResult = await chrome.storage.session.get("activeDownloads");
+    const activeDownloads = dlResult?.activeDownloads || {};
+    const count = Object.values(activeDownloads).filter(
+      (d) =>
+        d.phase === "starting" ||
+        d.phase === "downloading" ||
+        d.phase === "merging",
+    ).length;
+
+    // S37 fix: Also check for active format resolution (cipher/N-sig parsing)
+    // activeFormatCount tracks concurrent getFormats() calls that may be
+    // parsing 1+ MB player.js in the offscreen sandbox (takes 10-35 seconds)
+    const formatCount = activeFormatCount;
+
+    return {
+      hasActive: count > 0 || formatCount > 0,
+      count,
+      formatCount,
+    };
+  } catch (err) {
+    console.error("[BG] hasActiveDownloads error:", err);
+    return { hasActive: false, count: 0, formatCount: 0 };
+  }
+}
+
+// Listen for extension updates — defer if downloads or format resolution are active
+chrome.runtime.onUpdateAvailable.addListener((details) => {
+  console.log("[BG] Extension update available:", details.version);
+
+  hasActiveDownloads().then(({ hasActive, count, formatCount }) => {
+    if (hasActive) {
+      const reasons = [];
+      if (count > 0) reasons.push(`${count} download(s)`);
+      if (formatCount > 0) reasons.push(`${formatCount} format resolution(s)`);
+
+      console.warn(
+        `[BG] Deferring extension update — ${reasons.join(", ")} in progress`,
+      );
+      // Do NOT call chrome.runtime.reload() — let operations finish naturally
+      // Chrome will auto-update after the SW goes idle
+    } else {
+      console.log(
+        "[BG] No active downloads or format resolution — allowing extension update",
+      );
+      chrome.runtime.reload();
+    }
+  });
+});
+
+// Save download state before service worker suspension
+chrome.runtime.onSuspend.addListener(() => {
+  console.warn("[BG] Service worker suspending — marking in-flight downloads");
+
+  // Synchronous path only — onSuspend doesn't wait for async operations
+  chrome.storage.session.get("activeDownloads", (result) => {
+    const downloads = result?.activeDownloads || {};
+    let marked = 0;
+
+    for (const [id, dl] of Object.entries(downloads)) {
+      if (
+        dl.phase === "starting" ||
+        dl.phase === "downloading" ||
+        dl.phase === "merging"
+      ) {
+        downloads[id] = {
+          ...dl,
+          interrupted: true,
+          interruptedAt: Date.now(),
+        };
+        marked++;
+      }
+    }
+
+    if (marked > 0) {
+      chrome.storage.session.set({ activeDownloads: downloads });
+      console.log(
+        `[BG] Marked ${marked} downloads as interrupted before suspend`,
+      );
+    }
+  });
+});
+
+// Enhanced restoration: show user notification for interrupted downloads
+chrome.storage.session.get("activeDownloads", (result) => {
+  const downloads = result?.activeDownloads;
+  if (!downloads) return;
+
+  const interrupted = Object.values(downloads).filter((d) => d.interrupted);
+  if (interrupted.length > 0) {
+    console.log(
+      `[BG] Found ${interrupted.length} interrupted download(s) from previous session`,
+    );
+
+    // Show notification to user
+    if (chrome.notifications) {
+      const message =
+        interrupted.length === 1
+          ? "1 download was interrupted by an extension update or restart"
+          : `${interrupted.length} downloads were interrupted by an extension update or restart`;
+
+      chrome.notifications.create("interrupted-downloads", {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon-128.png"),
+        title: "Downloads Interrupted",
+        message: message,
+        priority: 1,
+      });
+    }
+
+    // Mark them as failed so cleanup can proceed
+    const now = Date.now();
+    for (const [id, dl] of Object.entries(downloads)) {
+      if (dl.interrupted) {
+        downloads[id] = {
+          ...dl,
+          phase: "error",
+          message: "Download interrupted by extension update or restart",
+          ts: now,
+        };
+      }
+    }
+
+    chrome.storage.session.set({ activeDownloads: downloads }).catch(() => {});
+  }
+});
+
+// ─── Initialize DRM bypass pipeline ────────────────────────────────
+// DRMHandler registers its own onMessage listener for EME_* messages.
+// It runs alongside (not instead of) the Detector's existing listener.
+// Store the promise so that DRM message handlers can await readiness.
+let drmInitReady = Promise.resolve();
+if (typeof DRMHandler !== "undefined" && DRMHandler.init) {
+  drmInitReady = DRMHandler.init().catch((e) => {
+    console.error("[BG] DRM handler init failed:", e);
+  });
+}
+
 const INSTAGRAM_REFERER_RULE_ID = 2;
 const TWITTER_REFERER_RULE_ID = 3;
 
+// ─── Pirate CDN Referer/Origin rules ───
+// Many pirate streaming CDNs reject requests with missing or chrome-extension:// Referer/Origin.
+// Each CDN domain gets a DNR rule so segment downloads succeed.
+// Rule IDs 4-30 are reserved for pirate CDNs.
+const PIRATE_CDN_RULES = [
+  // { id, cdnPattern (urlFilter or regexFilter), referer, origin }
+  { id: 4, cdn: "||rabbitstream.net/", ref: "https://rabbitstream.net/" },
+  { id: 5, cdn: "||megacloud.tv/", ref: "https://megacloud.tv/" },
+  { id: 6, cdn: "||vidplay.online/", ref: "https://vidplay.online/" },
+  { id: 7, cdn: "||filemoon.sx/", ref: "https://filemoon.sx/" },
+  { id: 8, cdn: "||streamtape.com/", ref: "https://streamtape.com/" },
+  { id: 9, cdn: "||doodstream.com/", ref: "https://doodstream.com/" },
+  { id: 10, cdn: "||mixdrop.co/", ref: "https://mixdrop.co/" },
+  { id: 11, cdn: "||voe.sx/", ref: "https://voe.sx/" },
+  { id: 12, cdn: "||streamwish.to/", ref: "https://streamwish.to/" },
+  { id: 13, cdn: "||vidhide.com/", ref: "https://vidhide.com/" },
+  { id: 14, cdn: "||filelions.to/", ref: "https://filelions.to/" },
+  { id: 15, cdn: "||vidguard.to/", ref: "https://vidguard.to/" },
+  { id: 16, cdn: "||rapid-cloud.co/", ref: "https://rapid-cloud.co/" },
+  { id: 17, cdn: "||dokicloud.one/", ref: "https://dokicloud.one/" },
+  { id: 18, cdn: "||mp4upload.com/", ref: "https://mp4upload.com/" },
+  { id: 19, cdn: "||upstream.to/", ref: "https://upstream.to/" },
+  { id: 20, cdn: "||vidoza.net/", ref: "https://vidoza.net/" },
+  { id: 21, cdn: "||streamsb.net/", ref: "https://streamsb.net/" },
+  { id: 22, cdn: "||embedrise.com/", ref: "https://embedrise.com/" },
+  { id: 23, cdn: "||lulustream.com/", ref: "https://lulustream.com/" },
+];
+
+// ─── CORS response header injection ───
+// Rule ID 31: Inject Access-Control-Allow-Origin: * on pirate CDN responses
+// so segment fetches from the extension context don't get blocked by CORS.
+const CORS_INJECT_RULE_ID = 31;
+
+// ─── CSP / X-Frame-Options stripping ───
+// Rule IDs 32-33: Remove restrictive headers that block iframe inspection
+// and cross-origin resource loading.
+const CSP_STRIP_RULE_ID = 32;
+const XFRAME_STRIP_RULE_ID = 33;
+
 chrome.declarativeNetRequest
-  .updateDynamicRules({
+  ?.updateDynamicRules({
     removeRuleIds: [
       REFERER_RULE_ID,
       INSTAGRAM_REFERER_RULE_ID,
       TWITTER_REFERER_RULE_ID,
+      ...PIRATE_CDN_RULES.map((r) => r.id),
+      CORS_INJECT_RULE_ID,
+      CSP_STRIP_RULE_ID,
+      XFRAME_STRIP_RULE_ID,
     ],
     addRules: [
+      // ─── YouTube ───
       {
         id: REFERER_RULE_ID,
         priority: 1,
@@ -1195,6 +1751,7 @@ chrome.declarativeNetRequest
         },
       },
 
+      // ─── Instagram ───
       {
         id: INSTAGRAM_REFERER_RULE_ID,
         priority: 1,
@@ -1219,6 +1776,7 @@ chrome.declarativeNetRequest
         },
       },
 
+      // ─── Twitter/X ───
       {
         id: TWITTER_REFERER_RULE_ID,
         priority: 1,
@@ -1237,9 +1795,165 @@ chrome.declarativeNetRequest
           resourceTypes: ["xmlhttprequest", "media", "other"],
         },
       },
+
+      // ─── Pirate CDN Referer/Origin rules ───
+      // Each pirate CDN gets Referer + Origin set to its own domain.
+      // CDNs reject requests where Referer is chrome-extension:// or empty.
+      ...PIRATE_CDN_RULES.map((r) => ({
+        id: r.id,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          requestHeaders: [
+            { header: "Referer", operation: "set", value: r.ref },
+            {
+              header: "Origin",
+              operation: "set",
+              value: r.ref.replace(/\/$/, ""),
+            },
+          ],
+        },
+        condition: {
+          urlFilter: r.cdn,
+          resourceTypes: ["xmlhttprequest", "media", "other"],
+        },
+      })),
+
+      // ─── CORS bypass: inject permissive response headers ───
+      // Pirate CDNs often don't set CORS headers. This rule adds
+      // Access-Control-Allow-Origin: * so extension fetches succeed.
+      {
+        id: CORS_INJECT_RULE_ID,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            {
+              header: "Access-Control-Allow-Origin",
+              operation: "set",
+              value: "*",
+            },
+            {
+              header: "Access-Control-Allow-Methods",
+              operation: "set",
+              value: "GET, POST, OPTIONS",
+            },
+            {
+              header: "Access-Control-Allow-Headers",
+              operation: "set",
+              value: "*",
+            },
+          ],
+        },
+        condition: {
+          // Match common pirate CDN domains that serve .ts/.m3u8/.mp4 segments
+          requestDomains: [
+            "rabbitstream.net",
+            "megacloud.tv",
+            "vidplay.online",
+            "filemoon.sx",
+            "streamtape.com",
+            "doodstream.com",
+            "mixdrop.co",
+            "voe.sx",
+            "streamwish.to",
+            "vidhide.com",
+            "filelions.to",
+            "vidguard.to",
+            "rapid-cloud.co",
+            "dokicloud.one",
+            "mp4upload.com",
+            "upstream.to",
+            "vidoza.net",
+            "streamsb.net",
+            "embedrise.com",
+            "lulustream.com",
+          ],
+          resourceTypes: ["xmlhttprequest", "media", "other"],
+        },
+      },
+
+      // ─── CSP stripping: remove Content-Security-Policy ───
+      // Many pirate player iframes set strict CSP that blocks extension injection.
+      // Stripping CSP allows content scripts to execute in embedded player frames.
+      {
+        id: CSP_STRIP_RULE_ID,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            { header: "Content-Security-Policy", operation: "remove" },
+            {
+              header: "Content-Security-Policy-Report-Only",
+              operation: "remove",
+            },
+          ],
+        },
+        condition: {
+          requestDomains: [
+            "rabbitstream.net",
+            "megacloud.tv",
+            "vidplay.online",
+            "filemoon.sx",
+            "doodstream.com",
+            "voe.sx",
+            "streamwish.to",
+            "vidhide.com",
+            "filelions.to",
+            "vidguard.to",
+            "rapid-cloud.co",
+            "dokicloud.one",
+            "embedrise.com",
+            "lulustream.com",
+            "2embed.cc",
+            "vidsrc.me",
+            "flixhq.to",
+            "sflix.se",
+            "fmovies.to",
+          ],
+          resourceTypes: ["sub_frame", "main_frame"],
+        },
+      },
+
+      // ─── X-Frame-Options / COEP / COOP stripping ───
+      // Remove headers that prevent iframe embedding of pirate player pages.
+      {
+        id: XFRAME_STRIP_RULE_ID,
+        priority: 1,
+        action: {
+          type: "modifyHeaders",
+          responseHeaders: [
+            { header: "X-Frame-Options", operation: "remove" },
+            { header: "Cross-Origin-Embedder-Policy", operation: "remove" },
+            { header: "Cross-Origin-Opener-Policy", operation: "remove" },
+          ],
+        },
+        condition: {
+          requestDomains: [
+            "rabbitstream.net",
+            "megacloud.tv",
+            "vidplay.online",
+            "filemoon.sx",
+            "doodstream.com",
+            "voe.sx",
+            "streamwish.to",
+            "vidhide.com",
+            "filelions.to",
+            "vidguard.to",
+            "rapid-cloud.co",
+            "2embed.cc",
+            "vidsrc.me",
+          ],
+          resourceTypes: ["sub_frame", "main_frame"],
+        },
+      },
     ],
   })
   .catch((e) => console.warn("[BG] DNR rule error:", e.message));
+
+console.log(
+  `[BG] DNR rules installed: 3 platform CDNs + ${PIRATE_CDN_RULES.length} pirate CDNs + CORS inject + CSP/XFO strip`,
+);
 
 async function fetchWithDNRHeaders(url, headers, fetchOptions = {}) {
   const ruleId = nextDNRRuleId();
@@ -1280,11 +1994,13 @@ async function fetchWithDNRHeaders(url, headers, fetchOptions = {}) {
   };
 
   try {
-    await chrome.declarativeNetRequest.updateSessionRules({ addRules: [rule] });
+    await chrome.declarativeNetRequest.updateSessionRules?.({
+      addRules: [rule],
+    });
     return await fetch(url, fetchOptions);
   } finally {
     await chrome.declarativeNetRequest
-      .updateSessionRules({
+      .updateSessionRules?.({
         removeRuleIds: [ruleId],
       })
       .catch(() => {});
@@ -1365,7 +2081,7 @@ async function addMergeHeaders(videoUrl, audioUrl) {
     ruleIds.push(MERGE_UA_RULE_ID);
   }
 
-  await chrome.declarativeNetRequest.updateSessionRules({
+  await chrome.declarativeNetRequest.updateSessionRules?.({
     removeRuleIds: [MERGE_ORIGIN_RULE_ID, MERGE_UA_RULE_ID],
     addRules: rules,
   });
@@ -1381,7 +2097,7 @@ async function removeMergeHeaders(ruleIds) {
     new Set([...(ruleIds || []), MERGE_ORIGIN_RULE_ID, MERGE_UA_RULE_ID]),
   );
   await chrome.declarativeNetRequest
-    .updateSessionRules({ removeRuleIds: ids })
+    ?.updateSessionRules({ removeRuleIds: ids })
     .catch(() => {});
   console.log("[BG] Removed merge DNR rules");
 }
@@ -1401,6 +2117,42 @@ async function getYouTubeCookieHeader() {
       resolve("");
     }
   });
+}
+
+// ─── Generic cookie forwarding ───
+// For any site (not just YouTube), extract cookies from the browser's cookie store
+// so the extension can make authenticated CDN requests. This is how a real browser
+// session already passed Cloudflare/DDoS-Guard challenges — we inherit that trust.
+async function getCookieHeaderForUrl(url) {
+  try {
+    const u = new URL(url);
+    return new Promise((resolve) => {
+      chrome.cookies.getAll({ domain: u.hostname }, (cookies) => {
+        if (!cookies || cookies.length === 0) {
+          // Try parent domain (e.g., .streamtape.com for cdn.streamtape.com)
+          const parts = u.hostname.split(".");
+          if (parts.length > 2) {
+            const parentDomain = "." + parts.slice(-2).join(".");
+            chrome.cookies.getAll({ domain: parentDomain }, (parentCookies) => {
+              if (!parentCookies || parentCookies.length === 0) {
+                resolve("");
+              } else {
+                resolve(
+                  parentCookies.map((c) => c.name + "=" + c.value).join("; "),
+                );
+              }
+            });
+          } else {
+            resolve("");
+          }
+          return;
+        }
+        resolve(cookies.map((c) => c.name + "=" + c.value).join("; "));
+      });
+    });
+  } catch {
+    return "";
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
@@ -1467,6 +2219,36 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       }
       return true;
 
+    case "INJECT_EME_INTERCEPTOR":
+      // Fallback injection for Trusted Types sites where bridge.js
+      // cannot set script.src due to CSP enforcement.
+      // Uses chrome.scripting.executeScript with world:"MAIN".
+      if (sender.tab?.id) {
+        chrome.scripting
+          .executeScript({
+            target: { tabId: sender.tab.id, allFrames: false },
+            files: ["content/eme-interceptor.js"],
+            world: "MAIN",
+          })
+          .then(() => {
+            console.log(
+              "[BG] EME interceptor injected via scripting API (Trusted Types fallback) on tab",
+              sender.tab.id,
+            );
+            respond({ success: true });
+          })
+          .catch((e) => {
+            console.warn(
+              "[BG] EME interceptor fallback injection failed:",
+              e.message,
+            );
+            respond({ success: false, error: e.message });
+          });
+      } else {
+        respond({ success: false, error: "No tab ID" });
+      }
+      return true;
+
     case "GET_VIDEO_INFO":
       onGetVideoInfo(msg.tabId, msg.videoId)
         .then(respond)
@@ -1486,24 +2268,24 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       return true;
 
     case "DOWNLOAD_BLOB":
-      chrome.downloads.download(
-        {
-          url: msg.blobUrl,
-          filename: msg.filename,
-          saveAs: true,
-        },
-        (id) => {
-          if (chrome.runtime.lastError) {
-            respond({
-              success: false,
-              error: chrome.runtime.lastError.message,
-            });
-          } else {
-            console.log("[BG] Blob download started, id:", id);
-            respond({ success: true, downloadId: id });
-          }
-        },
-      );
+      // Extension-origin blob URLs (blob:chrome-extension://...) are accessible
+      // from the service worker via chrome.downloads.download directly — no need
+      // for tab injection. The offscreen document creates the blob in the same
+      // extension origin, so the service worker can read it.
+      (async () => {
+        try {
+          const downloadId = await chrome.downloads.download({
+            url: msg.blobUrl,
+            filename: msg.filename || "video.mp4",
+            saveAs: true,
+          });
+          console.log("[BG] Blob download started, id:", downloadId);
+          respond({ success: true, downloadId });
+        } catch (e) {
+          console.error("[BG] Blob download failed:", e.message);
+          respond({ success: false, error: e.message });
+        }
+      })();
       return true;
 
     case "MERGE_PROGRESS":
@@ -1533,6 +2315,13 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .catch((e) => respond({ success: false, error: e.message }));
       return true;
 
+    case "REFRESH_YOUTUBE_URLS":
+      // S35 fix: Worker detected YouTube URL expiry, refresh format URLs
+      handleRefreshYouTubeUrls(msg)
+        .then(respond)
+        .catch((e) => respond({ success: false, error: e.message }));
+      return true;
+
     case "CANCEL_MERGE":
       chrome.runtime.sendMessage(
         { target: "offscreen", action: "CANCEL_MERGE" },
@@ -1554,6 +2343,9 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
     case "WORKER_COMPLETE":
       if (msg.downloadId) {
+        // Worker download finished — release keepalive
+        stopWorkerKeepalive();
+
         chrome.storage.session.get("activeDownloads", (result) => {
           const downloads = result?.activeDownloads || {};
           const existing = downloads[msg.downloadId] || {};
@@ -1594,6 +2386,30 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       }
       return false;
 
+    case "ADD_KEY_HOST_HEADERS": {
+      const keyHosts = msg.hosts || [];
+      const keyHeaders = msg.headers || {};
+      if (keyHosts.length === 0 || Object.keys(keyHeaders).length === 0) {
+        respond({ ruleIds: [] });
+        return true;
+      }
+      Promise.all(
+        keyHosts.map((host) =>
+          addSessionHeaders("||" + host + "/", keyHeaders).catch(() => null),
+        ),
+      ).then((ids) => {
+        respond({ ruleIds: ids.filter(Boolean) });
+      });
+      return true;
+    }
+
+    case "CHECK_SPECIALIST": {
+      const host = (msg.hostname || "").toLowerCase();
+      const script = host ? findSpecialistForHost(host) : null;
+      respond({ hasSpecialist: !!script, scriptFile: script });
+      return true;
+    }
+
     case "SPECIALIST_DETECTED":
       onSpecialistDetected(msg, sender.tab?.id)
         .then(respond)
@@ -1605,6 +2421,42 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .then(respond)
         .catch((e) => respond({ success: false, error: e.message }));
       return true;
+
+    case "BLOB_VIDEO_DETECTED": {
+      // Blob video detected via MSE/URL.createObjectURL — add to sniffedStreams
+      // with isBlobUrl flag so popup knows it requires page-context download
+      const blobTabId = sender.tab?.id;
+      if (blobTabId && blobTabId >= 0 && msg.blobUrl) {
+        const stream = {
+          url: msg.blobUrl,
+          type: "direct",
+          contentType: msg.blobType || "video/mp4",
+          size: msg.blobSize || 0,
+          ts: Date.now(),
+          isBlobUrl: true,
+        };
+        if (!sniffedStreams.has(blobTabId)) {
+          sniffedStreams.set(blobTabId, []);
+        }
+        const streams = sniffedStreams.get(blobTabId);
+        // Deduplicate blob URLs
+        if (!streams.some((s) => s.url === msg.blobUrl)) {
+          streams.push(stream);
+          console.log(
+            `[BG] Blob video added to sniffed streams on tab ${blobTabId}: ${msg.blobType}`,
+          );
+          chrome.action.setBadgeText({ text: "●", tabId: blobTabId });
+          chrome.action.setBadgeBackgroundColor({
+            color: "#2196F3",
+            tabId: blobTabId,
+          });
+        }
+        respond({ success: true });
+      } else {
+        respond({ success: false });
+      }
+      return true;
+    }
   }
 });
 
@@ -1640,6 +2492,24 @@ function extractVideoIdFromUrl(url) {
 
 async function onVideoDetected(msg, tabId) {
   console.log("[BG] Video detected:", msg.videoId, "tab:", tabId);
+
+  // S44 fix: Detect concurrent downloads of same video from multiple tabs
+  if (msg.videoId) {
+    const samevideotabs = [];
+    for (const [tid, data] of tabData) {
+      if (data.videoId === msg.videoId && tid !== tabId) {
+        samevideotabs.push(tid);
+      }
+    }
+    if (samevideotabs.length > 0) {
+      console.warn(
+        `[S44] Same video (${msg.videoId}) detected in ${samevideotabs.length + 1} tabs ` +
+          `(${[tabId, ...samevideotabs].join(", ")}). ` +
+          "Sniffed URLs are isolated per-tab, but simultaneous downloads may cause codec mismatches.",
+      );
+    }
+  }
+
   try {
     const info = await getFormats(msg.videoId, msg.pageData || {}, tabId);
 
@@ -1665,8 +2535,35 @@ async function onVideoDetected(msg, tabId) {
       chrome.action.setBadgeBackgroundColor({ color: "#4CAF50", tabId });
     }
 
-    tabData.set(tabId, { videoId: msg.videoId, info, ts: Date.now() });
-    persistTabData();
+    // Merge new formats into existing tabData rather than overwriting
+    // This prevents losing formats when multiple VIDEO_DETECTED arrive
+    // (e.g. generic extractor detects multiple <video> sources on same page)
+    const existing = tabData.get(tabId);
+    if (existing?.info?.formats?.length > 0 && info?.formats?.length > 0) {
+      const existingUrls = new Set(existing.info.formats.map((f) => f.url));
+      for (const fmt of info.formats) {
+        if (!existingUrls.has(fmt.url)) {
+          existing.info.formats.push(fmt);
+        }
+      }
+      // Preserve richer metadata (title, thumbnail, duration)
+      if (info.title && info.title !== "Video")
+        existing.info.title = info.title;
+      if (info.thumbnail) existing.info.thumbnail = info.thumbnail;
+      if (info.lengthSeconds) existing.info.lengthSeconds = info.lengthSeconds;
+      if (info.drmDetected) {
+        existing.info.drmDetected = info.drmDetected;
+        existing.info.drmType = info.drmType;
+        existing.info.drmSources = info.drmSources;
+        existing.info.drmConfidence = info.drmConfidence;
+      }
+      existing.ts = Date.now();
+      tabData.set(tabId, existing);
+    } else {
+      tabData.set(tabId, { videoId: msg.videoId, info, ts: Date.now() });
+    }
+    // Critical path — await immediate persist to ensure data survives SW restart
+    await persistTabDataNow();
 
     if (tabId && (!info.thumbnail || info.title === "Video")) {
       captureMetadata(tabId).then((meta) => {
@@ -1710,10 +2607,22 @@ async function onGetVideoInfo(tabId, videoId) {
     try {
       const stored = await chrome.storage.session.get("tabDataCache");
       if (stored?.tabDataCache?.[tabId]) {
-        cached = stored.tabDataCache[tabId];
-        tabData.set(tabId, cached);
+        // S55: Validate restored data structure to prevent crashes from corrupted profile
+        const restoredData = stored.tabDataCache[tabId];
+        if (isValidTabData(restoredData)) {
+          cached = restoredData;
+          tabData.set(tabId, cached);
+        } else {
+          console.warn(
+            `[BG] S55: Corrupted tabData cache for tab ${tabId} — skipping restoration`,
+            restoredData,
+          );
+          // Don't use cached data; will re-fetch formats
+        }
       }
-    } catch {}
+    } catch (err) {
+      console.warn("[BG] S55: Failed to restore tabDataCache:", err.message);
+    }
   }
 
   if (cached?.info && (!videoId || cached.videoId === videoId)) {
@@ -1722,129 +2631,54 @@ async function onGetVideoInfo(tabId, videoId) {
   if (!videoId) return { error: "No video ID" };
   const info = await getFormats(videoId, {}, tabId);
   tabData.set(tabId, { videoId, info, ts: Date.now() });
-  persistTabData();
+  await persistTabDataNow();
   return info;
+}
+
+/**
+ * S55: Validates tabData structure to prevent crashes from corrupted browser profile.
+ * Expected structure: { videoId: string, info: { formats: array, ... }, ts: number }
+ */
+function isValidTabData(data) {
+  if (!data || typeof data !== "object") return false;
+  if (!data.videoId || typeof data.videoId !== "string") return false;
+  if (!data.info || typeof data.info !== "object") return false;
+
+  const info = data.info;
+  // Critical fields that must exist
+  if (!Array.isArray(info.formats)) return false;
+  if (typeof info.videoId !== "string") return false;
+
+  // Validate each format has required fields
+  for (const fmt of info.formats) {
+    if (!fmt || typeof fmt !== "object") return false;
+    // Each format must have url, itag, and mimeType at minimum
+    if (typeof fmt.url !== "string" || !fmt.url) return false;
+    if (typeof fmt.itag !== "number" && typeof fmt.itag !== "string")
+      return false;
+    if (typeof fmt.mimeType !== "string") return false;
+  }
+
+  return true;
 }
 
 async function getFormats(videoId, pageData, tabId = null) {
   if (pendingRequests.has(videoId)) {
     return pendingRequests.get(videoId);
   }
+  startFormatKeepalive();
   const promise = getFormatsInner(videoId, pageData, tabId);
   pendingRequests.set(videoId, promise);
   try {
     return await promise;
   } finally {
     pendingRequests.delete(videoId);
+    stopFormatKeepalive();
   }
 }
 
 async function getFormatsInner(videoId, pageData, tabId = null) {
-  if (pageData.resolvedFormats && pageData.resolvedFormats.length > 0) {
-    console.log(
-      "[BG] ★ Tier 1: Using",
-      pageData.resolvedFormats.length,
-      "pre-deciphered formats from",
-      pageData.formatSource || "inject.js",
-    );
-
-    let synItag = 80000;
-    for (const f of pageData.resolvedFormats) {
-      if (!f.itag || f.itag === 0) {
-        f.itag = synItag++;
-      }
-    }
-
-    // Apply N-sig transformation — inject.js may have already applied it
-    // via direct global access (2025+ architecture). If directNSig is true,
-    // the URLs already have correct N-sig values.
-    if (!pageData.directNSig) {
-      const hasUntransformedN = pageData.resolvedFormats.some(
-        (f) => f.url && /[?&]n=([^&]{15,})/.test(f.url),
-      );
-
-      if (hasUntransformedN) {
-        let nSigCode = pageData.nSigCode || null;
-        let nSigBundled = pageData.nSigBundled || null;
-        let sig = null;
-
-        // Try to load signature data from player.js (background can fetch without CSP issues)
-        const playerUrl = pageData.playerUrl || null;
-        if (playerUrl) {
-          try {
-            sig = await loadSignatureData(playerUrl);
-            nSigCode = nSigCode || sig?.nSigCode || null;
-            nSigBundled = nSigBundled || sig?.nSigBundled || null;
-            console.log(
-              "[BG] Tier 1: Loaded sig data for n-sig transform — nSig:",
-              nSigCode ? "yes" : "none",
-              nSigBundled ? "(bundled)" : "",
-            );
-          } catch (e) {
-            console.warn("[BG] Tier 1: Failed to load sig data:", e.message);
-          }
-        }
-
-        if (nSigCode) {
-          console.log(
-            "[BG] Tier 1: Applying N-sig transform to",
-            pageData.resolvedFormats.length,
-            "formats",
-          );
-          await applyNSig(
-            pageData.resolvedFormats,
-            sig || { nSigCode, nSigBundled },
-          );
-        } else {
-          console.warn(
-            "[BG] Tier 1: No N-sig code available — downloads may be throttled",
-          );
-        }
-      }
-    } else {
-      console.log("[BG] Tier 1: N-sig already applied by inject.js (direct)");
-    }
-
-    // Enrich Tier 1 formats with sniffed URLs (IDM-style) — replaces any
-    // URLs where cipher/N-sig may have been applied incorrectly with the
-    // fully-decrypted URLs captured from YouTube's own player requests.
-    const resolveTabId = tabId || findTabIdForVideoId(videoId);
-    if (resolveTabId) {
-      const enriched = enrichFormatsWithSniffed(
-        pageData.resolvedFormats,
-        resolveTabId,
-      );
-      if (enriched > 0) {
-        console.log(
-          "[BG] Tier 1: Enriched",
-          enriched,
-          "format URLs from sniffed googlevideo.com requests",
-        );
-      }
-    }
-
-    const vd = pageData.playerResponse?.videoDetails || {};
-    return {
-      videoId: vd.videoId || videoId,
-      title: vd.title || pageData.title || "Video",
-      author: vd.author || pageData.author || "",
-      lengthSeconds: parseInt(vd.lengthSeconds) || pageData.duration || 0,
-      thumbnail:
-        vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || pageData.thumbnail || "",
-      formats: pageData.resolvedFormats,
-      clientUsed: pageData.formatSource || "page_deciphered",
-      loggedIn: pageData.loggedIn ?? null,
-    };
-  }
-
-  console.log(
-    "[BG] Tier 1 unavailable (resolvedFormats:",
-    pageData.resolvedFormats?.length || 0,
-    "| resolveError:",
-    pageData.resolveError || "none",
-    "), trying Tier 2...",
-  );
-
+  // ============ Tier 1: InnerTube API (android_vr → web → web_embedded) ============
   let visitorData = pageData.visitorData || null;
   let playerUrl = pageData.playerUrl || null;
   let pagePlayerResp = pageData.playerResponse || null;
@@ -1909,6 +2743,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let successfulClients = [];
   let bestVideoDetails = null;
   let triedWebEmbedded = false;
+  let nSigFailed = false;
 
   // Build a merged sig object that fills in nSigBundled / nSigCode from
   // pageData when the player-derived sig is missing those fields.
@@ -1988,8 +2823,9 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         allFormats.push(...info.formats);
         successfulClients.push(key);
 
-        if (mergedSig?.nSigCode) {
-          await applyNSig(info.formats, mergedSig);
+        if (mergedSig?.nSigCode || mergedSig?.playerSource) {
+          const nSigOk = await applyNSig(info.formats, mergedSig);
+          if (nSigOk === false) nSigFailed = true;
         }
 
         if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -2012,8 +2848,9 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (mergedSig?.nSigCode) {
-            await applyNSig(ciphered.formats, mergedSig);
+          if (mergedSig?.nSigCode || mergedSig?.playerSource) {
+            const nSigOk = await applyNSig(ciphered.formats, mergedSig);
+            if (nSigOk === false) nSigFailed = true;
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -2043,8 +2880,9 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (mergedSig?.nSigCode) {
-            await applyNSig(ciphered.formats, mergedSig);
+          if (mergedSig?.nSigCode || mergedSig?.playerSource) {
+            const nSigOk = await applyNSig(ciphered.formats, mergedSig);
+            if (nSigOk === false) nSigFailed = true;
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
@@ -2068,10 +2906,143 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
 
     const mergedFormats = deduplicateFormats(allFormats);
 
-    // Enrich Tier 2 formats with sniffed URLs (IDM-style)
+    // Enrich Tier 1 formats with sniffed URLs (IDM-style)
     const resolveTabId2 = tabId || findTabIdForVideoId(videoId);
     if (resolveTabId2) {
-      const enriched = enrichFormatsWithSniffed(mergedFormats, resolveTabId2);
+      const enriched = enrichFormatsWithSniffed(
+        mergedFormats,
+        resolveTabId2,
+        videoId,
+      );
+      if (enriched > 0) {
+        console.log(
+          "[BG] Tier 1: Enriched",
+          enriched,
+          "format URLs from sniffed googlevideo.com requests",
+        );
+      }
+    }
+
+    const vd = bestVideoDetails || {};
+
+    // S54 fix: Detect live streams in Tier 1
+    const isLive = vd.isLiveContent === true || vd.isLive === true;
+    const isLiveDvr = vd.isLiveDvrEnabled === true;
+
+    if (isLive) {
+      console.log(
+        "[S54] Live stream detected (Tier 1):",
+        videoId,
+        "DVR:",
+        isLiveDvr,
+      );
+    }
+
+    return {
+      videoId: vd.videoId || videoId,
+      title: vd.title || "YouTube Video",
+      author: vd.author || "",
+      lengthSeconds: parseInt(vd.lengthSeconds) || 0,
+      isLive: isLive || false, // S54: Track live status
+      isLiveDvr: isLiveDvr || false, // S54: Track if DVR enabled
+      thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
+      formats: mergedFormats,
+      clientUsed: successfulClients.join("+"),
+      loggedIn: pageData.loggedIn ?? null,
+      nSigFailed: nSigFailed || false,
+    };
+  }
+
+  // ============ Tier 2: inject.js pre-deciphered formats (fallback) ============
+  console.log(
+    "[BG] Tier 1 (API) returned 0 formats, trying Tier 2 (inject.js page-deciphered)...",
+  );
+
+  if (pageData.resolvedFormats && pageData.resolvedFormats.length > 0) {
+    console.log(
+      "[BG] ★ Tier 2: Using",
+      pageData.resolvedFormats.length,
+      "pre-deciphered formats from",
+      pageData.formatSource || "inject.js",
+    );
+
+    let synItag = 80000;
+    for (const f of pageData.resolvedFormats) {
+      if (!f.itag || f.itag === 0) {
+        f.itag = synItag++;
+      }
+    }
+
+    // Apply N-sig transformation — inject.js may have already applied it
+    // via direct global access (2025+ architecture). If directNSig is true,
+    // the URLs already have correct N-sig values.
+    if (!pageData.directNSig) {
+      const hasUntransformedN = pageData.resolvedFormats.some(
+        (f) => f.url && /[?&]n=([^&]{15,})/.test(f.url),
+      );
+
+      if (hasUntransformedN) {
+        let nSigCode = pageData.nSigCode || null;
+        let nSigBundled = pageData.nSigBundled || null;
+        // Reuse sig from Tier 1 if available; if not, load it now
+        // (sig is already declared at the top of the function)
+
+        // Try to load signature data from player.js (background can fetch without CSP issues)
+        const playerUrl = pageData.playerUrl || null;
+        if (playerUrl && !sig) {
+          try {
+            sig = await loadSignatureData(playerUrl);
+            console.log(
+              "[BG] Tier 2: Loaded sig data for n-sig transform — nSig:",
+              sig?.nSigCode ? "yes" : "none",
+              sig?.nSigBundled ? "(bundled)" : "",
+            );
+          } catch (e) {
+            console.warn("[BG] Tier 2: Failed to load sig data:", e.message);
+          }
+        }
+
+        // Merge with sig data (whether from Tier 1 or just loaded)
+        if (sig) {
+          nSigCode = nSigCode || sig.nSigCode || null;
+          nSigBundled = nSigBundled || sig.nSigBundled || null;
+        }
+
+        if (nSigCode || sig?.playerSource) {
+          console.log(
+            "[BG] Tier 2: Applying N-sig transform to",
+            pageData.resolvedFormats.length,
+            "formats",
+            nSigCode ? "(regex code)" : "(full solver only)",
+          );
+          const nSigOk = await applyNSig(
+            pageData.resolvedFormats,
+            sig || { nSigCode, nSigBundled },
+          );
+          if (nSigOk === false) {
+            pageData.nSigFailed = true;
+          }
+        } else {
+          console.warn(
+            "[BG] Tier 2: No N-sig code or player source available — downloads may be throttled",
+          );
+          pageData.nSigFailed = true;
+        }
+      }
+    } else {
+      console.log("[BG] Tier 2: N-sig already applied by inject.js (direct)");
+    }
+
+    // Enrich Tier 2 formats with sniffed URLs (IDM-style) — replaces any
+    // URLs where cipher/N-sig may have been applied incorrectly with the
+    // fully-decrypted URLs captured from YouTube's own player requests.
+    const resolveTabId = tabId || findTabIdForVideoId(videoId);
+    if (resolveTabId) {
+      const enriched = enrichFormatsWithSniffed(
+        pageData.resolvedFormats,
+        resolveTabId,
+        videoId,
+      );
       if (enriched > 0) {
         console.log(
           "[BG] Tier 2: Enriched",
@@ -2081,17 +3052,34 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
       }
     }
 
-    const vd = bestVideoDetails || {};
+    const vd = pageData.playerResponse?.videoDetails || {};
+
+    // S54 fix: Detect live streams to track live-to-VOD transitions
+    const isLive = vd.isLiveContent === true || vd.isLive === true;
+    const isLiveDvr = vd.isLiveDvrEnabled === true;
+
+    if (isLive) {
+      console.log(
+        "[S54] Live stream detected (Tier 2):",
+        videoId,
+        "DVR:",
+        isLiveDvr,
+      );
+    }
 
     return {
       videoId: vd.videoId || videoId,
-      title: vd.title || "YouTube Video",
-      author: vd.author || "",
-      lengthSeconds: parseInt(vd.lengthSeconds) || 0,
-      thumbnail: vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || "",
-      formats: mergedFormats,
-      clientUsed: successfulClients.join("+"),
+      title: vd.title || pageData.title || "Video",
+      author: vd.author || pageData.author || "",
+      lengthSeconds: parseInt(vd.lengthSeconds) || pageData.duration || 0,
+      isLive: isLive || false, // S54: Track live status
+      isLiveDvr: isLiveDvr || false, // S54: Track if DVR enabled
+      thumbnail:
+        vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || pageData.thumbnail || "",
+      formats: pageData.resolvedFormats,
+      clientUsed: pageData.formatSource || "page_deciphered",
       loggedIn: pageData.loggedIn ?? null,
+      nSigFailed: pageData.nSigFailed || false,
     };
   }
 
@@ -2101,7 +3089,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   // URLs from the player's own network requests. Use these as a last resort.
   const sniffTabId = tabId || findTabIdForVideoId(videoId);
   if (sniffTabId) {
-    const sniffedFormats = buildSniffedFormats(sniffTabId);
+    const sniffedFormats = buildSniffedFormats(sniffTabId, videoId);
     if (sniffedFormats.length > 0) {
       console.log(
         "[BG] ★ Tier S: Using",
@@ -2167,6 +3155,23 @@ async function fetchPageData(videoId) {
     throw new Error(`YouTube page fetch failed: HTTP ${resp.status}`);
   }
   const html = await resp.text();
+
+  // S45 fix: Detect Cloudflare bot challenge HTML responses
+  if (
+    html.includes("<!DOCTYPE") &&
+    (html.includes("Checking your browser") ||
+      html.includes("challenge-platform") ||
+      html.includes("cf-browser-verification") ||
+      html.includes("DDoS protection by Cloudflare"))
+  ) {
+    console.error(
+      "[S45] Cloudflare bot challenge detected in page fetch. " +
+        "Site is blocking extension's fetch(). User must complete challenge in browser first.",
+    );
+    throw new Error(
+      "Cloudflare bot protection blocked request. Visit the site in browser to complete challenge.",
+    );
+  }
 
   let visitorData = null;
   const vd = /"VISITOR_DATA":\s*"([^"]+)"/.exec(html);
@@ -2558,7 +3563,7 @@ async function buildInfoWithSandboxCipher(
 }
 
 async function applyNSig(formats, sig) {
-  if (!sig?.nSigCode) return;
+  if (!sig?.nSigCode && !sig?.nSigBundled && !sig?.playerSource) return;
 
   const entries = [];
   for (const f of formats) {
@@ -2579,44 +3584,176 @@ async function applyNSig(formats, sig) {
   let results = null;
   let succeeded = false;
 
-  // Try 1: Plain N-sig code (original extraction)
-  try {
-    results = await sandboxEval(sig.nSigCode, decodedParams);
-    // Validate: check if at least one value actually changed
-    const anyChanged = results.some(
-      (r, i) => r && typeof r === "string" && r !== decodedParams[i],
+  // yt-dlp-style N-sig result validation: if result.endsWith(challenge),
+  // the JS function threw an exception and YouTube appended the original
+  // value to an error string — this means the transform FAILED.
+  function validateNSigResults(res, params) {
+    const invalidIdx = res.findIndex(
+      (r, i) =>
+        typeof r === "string" &&
+        r.endsWith(params[i]) &&
+        r.length > params[i].length,
     );
-    if (anyChanged) {
-      succeeded = true;
-      console.log("[BG] N-sig transform succeeded (plain code)");
-    } else {
+    if (invalidIdx !== -1) {
       console.warn(
-        "[BG] N-sig plain code returned unchanged values — trying bundled...",
+        `[BG] N-sig result invalid (endsWith challenge): "${res[invalidIdx]}" for challenge "${params[invalidIdx]}"`,
+      );
+      return false;
+    }
+    const anyChanged = res.some(
+      (r, i) => r && typeof r === "string" && r !== params[i],
+    );
+    return anyChanged;
+  }
+
+  // Try 1: Plain N-sig code (original extraction)
+  if (sig.nSigCode) {
+    try {
+      results = await sandboxEval(sig.nSigCode, decodedParams);
+      if (validateNSigResults(results, decodedParams)) {
+        succeeded = true;
+        console.log("[BG] N-sig transform succeeded (plain code)");
+      } else {
+        console.warn(
+          "[BG] N-sig plain code returned unchanged/invalid values — trying bundled...",
+        );
+      }
+    } catch (err) {
+      console.warn(
+        "[BG] N-sig plain code failed:",
+        err.message,
+        "— trying bundled...",
       );
     }
-  } catch (err) {
-    console.warn(
-      "[BG] N-sig plain code failed:",
-      err.message,
-      "— trying bundled...",
-    );
   }
 
   // Try 2: yt-dlp bundled N-sig (includes all dependencies)
   if (!succeeded && sig.nSigBundled) {
     try {
       results = await sandboxEval(sig.nSigBundled, decodedParams);
-      const anyChanged = results.some(
-        (r, i) => r && typeof r === "string" && r !== decodedParams[i],
-      );
-      if (anyChanged) {
+      if (validateNSigResults(results, decodedParams)) {
         succeeded = true;
         console.log("[BG] ★ N-sig transform succeeded (yt-dlp bundled code)");
       } else {
-        console.warn("[BG] N-sig bundled code also returned unchanged values");
+        console.warn(
+          "[BG] N-sig bundled code also returned unchanged/invalid values",
+        );
       }
     } catch (err2) {
       console.warn("[BG] N-sig bundled code also failed:", err2.message);
+    }
+  }
+
+  // Try 3: Full player.js solver (AST-based, sends entire player.js to sandbox)
+  // This is the nuclear option — if regex extraction failed because YouTube
+  // changed base.js patterns, the full solver uses structural AST analysis
+  // (meriyah parser) to find N-sig functions, just like yt-dlp does.
+  // The sandbox has the FULL player.js context so wrapper functions like
+  // Y$K = {return g.transform(a)} resolve naturally — no pre-bundling needed.
+  if (!succeeded && sig.playerSource) {
+    try {
+      console.log(
+        "[BG] N-sig regex failed — trying full player.js solver (AST-based)...",
+      );
+      const solverResult = await sandboxSolvePlayer(
+        sig.playerSource,
+        sig.playerUrl || "",
+        decodedParams, // N-sig challenges
+        [], // No cipher challenges needed here
+      );
+      const { nResults, elapsed } = solverResult;
+      const solvedCount = Object.keys(nResults).length;
+      console.log(
+        "[BG] Full solver returned",
+        solvedCount,
+        "N-sig results in",
+        elapsed + "ms",
+      );
+
+      if (solvedCount > 0) {
+        // Build results array matching decodedParams order
+        results = decodedParams.map((p) => nResults[p] || p);
+        if (validateNSigResults(results, decodedParams)) {
+          succeeded = true;
+          console.log(
+            "[BG] ★★ N-sig transform succeeded (full player.js solver)",
+          );
+        } else {
+          console.warn(
+            "[BG] Full solver returned invalid results (endsWith check failed)",
+          );
+        }
+      }
+    } catch (err3) {
+      console.warn("[BG] Full player.js solver also failed:", err3.message);
+    }
+  }
+
+  // Try 4: Player variant fallback — yt-dlp uses alternate player.js builds
+  // (TV, TCC, TCE, ES6, etc.) which may have different N-sig structures.
+  // If the main player.js solver failed, try the TV player variant.
+  if (!succeeded && sig.playerUrl) {
+    const variantMap = {
+      tv: "tv-player-ias.vflset/tv-player-ias.js",
+      tce: "player_ias_tce.vflset/en_US/base.js",
+      tcc: "player_ias_tcc.vflset/en_US/base.js",
+      es6: "player_es6.vflset/en_US/base.js",
+    };
+    // Extract player version from current URL: /s/player/{version}/
+    const versionMatch = sig.playerUrl.match(/\/s\/player\/([a-zA-Z0-9_-]+)\//);
+    if (versionMatch) {
+      const playerVersion = versionMatch[1];
+      // Determine which variant we already tried
+      const currentVariant = sig.playerUrl.includes("tv-player")
+        ? "tv"
+        : sig.playerUrl.includes("_tce")
+          ? "tce"
+          : sig.playerUrl.includes("_tcc")
+            ? "tcc"
+            : "main";
+
+      for (const [variantName, variantPath] of Object.entries(variantMap)) {
+        if (variantName === currentVariant) continue; // Skip variant we already tried
+        const variantUrl = `https://www.youtube.com/s/player/${playerVersion}/${variantPath}`;
+        try {
+          console.log(
+            `[BG] Trying player variant: ${variantName} (${variantUrl})`,
+          );
+          const resp = await fetch(variantUrl, { cache: "default" });
+          if (!resp.ok) {
+            console.log(
+              `[BG] Variant ${variantName} returned HTTP ${resp.status}`,
+            );
+            continue;
+          }
+          const variantJs = await resp.text();
+          if (!variantJs || variantJs.length < 5000) continue;
+
+          const solverResult = await sandboxSolvePlayer(
+            variantJs,
+            variantUrl,
+            decodedParams,
+            [],
+          );
+          const { nResults, elapsed } = solverResult;
+          const solvedCount = Object.keys(nResults).length;
+          console.log(
+            `[BG] Variant ${variantName} solver returned ${solvedCount} results in ${elapsed}ms`,
+          );
+          if (solvedCount > 0) {
+            results = decodedParams.map((p) => nResults[p] || p);
+            if (validateNSigResults(results, decodedParams)) {
+              succeeded = true;
+              console.log(
+                `[BG] ★★★ N-sig transform succeeded (variant: ${variantName})`,
+              );
+              break;
+            }
+          }
+        } catch (varErr) {
+          console.warn(`[BG] Variant ${variantName} failed:`, varErr.message);
+        }
+      }
     }
   }
 
@@ -2625,22 +3762,38 @@ async function applyNSig(formats, sig) {
       "[BG] All N-sig transforms failed — downloads may be throttled. " +
         "Sniffed URLs (IDM-style) will be used if available.",
     );
-    return;
+
+    // S42 fix: Detect experimental player issues
+    console.error(
+      "[S42] N-sig extraction failed completely. Possible causes:\n" +
+        "  1. YouTube experimental player with new algorithm\n" +
+        "  2. Function signature changed (requires different arity)\n" +
+        "  3. New ES syntax not supported by parser\n" +
+        "Downloads will be throttled to 50 KB/s without N-sig transform.",
+    );
+
+    return false; // Signal failure to caller
   }
 
-  // Apply successful results
+  // Apply successful results (O(1) lookup by itag)
+  const itagMap = new Map();
+  for (const f of formats) if (f.itag != null) itagMap.set(f.itag, f);
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     const r = results[i];
     if (r && typeof r === "string" && r !== e.decoded) {
-      const fmt = formats.find((f) => f.itag === e.itag);
+      const fmt = itagMap.get(e.itag);
       if (fmt)
         fmt.url = fmt.url.replace("n=" + e.raw, "n=" + encodeURIComponent(r));
     }
   }
+  return true; // N-sig transform succeeded
 }
 
 async function ensureOffscreen() {
+  // Offscreen API is Chrome-only; Firefox uses background pages directly
+  if (typeof compat !== "undefined" && !compat.hasOffscreen) return;
+
   try {
     const all = await chrome.runtime.getContexts({
       contextTypes: ["OFFSCREEN_DOCUMENT"],
@@ -2660,19 +3813,43 @@ async function ensureOffscreen() {
     if (!e.message?.includes("Only a single offscreen")) throw e;
   }
 
-  await Promise.race([
+  // S28 fix: if the offscreen exists but is hung (stuck in libav/sandbox),
+  // the PONG never arrives.  The timeout must REJECT so callers know the
+  // offscreen is unhealthy, rather than silently resolving and sending work
+  // to a document that will never respond.
+  const healthy = await Promise.race([
     new Promise((resolve) => {
       const handler = (e) => {
         if (e.data?.type === "PONG") {
           bcIn.removeEventListener("message", handler);
-          resolve();
+          resolve(true);
         }
       };
       bcIn.addEventListener("message", handler);
       bcOut.postMessage({ type: "PING" });
     }),
-    new Promise((r) => setTimeout(r, 3000)),
+    new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
   ]);
+
+  if (!healthy) {
+    console.warn(
+      "[BG] Offscreen document unresponsive (no PONG within 3s) — recreating",
+    );
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch {}
+    try {
+      await chrome.offscreen.createDocument({
+        url: "offscreen/offscreen.html",
+        reasons: ["IFRAME_SCRIPTING", "BLOBS", "WORKERS"],
+        justification: "Recreated after unresponsive offscreen doc (S28 fix)",
+      });
+    } catch (e) {
+      if (!e.message?.includes("Only a single offscreen")) throw e;
+    }
+    // Wait briefly for the fresh document to initialize
+    await new Promise((r) => setTimeout(r, 500));
+  }
 }
 
 async function sandboxEval(fnCode, params) {
@@ -2895,7 +4072,7 @@ async function pageScrapeWithCipher(
     };
 
     const nm = /[?&]n=([^&]+)/i.exec(url);
-    if (nm && sig?.nSigCode) {
+    if (nm && (sig?.nSigCode || sig?.playerSource)) {
       nEntries.push({
         idx: formats.length,
         raw: nm[1],
@@ -2991,13 +4168,6 @@ async function pageScrapeWithCipher(
                 raw: nm[1],
                 decoded: decodeURIComponent(nm[1]),
               });
-              // Also add to nChallenges so solver result covers them
-              const decoded = decodeURIComponent(nm[1]);
-              if (!nResults[decoded]) {
-                // This n wasn't in original challenges — can't solve it here,
-                // but mark it for fallback. This shouldn't normally happen since
-                // cipher-only streams also have n= params we already collected.
-              }
             }
             formats.push(entry);
           }
@@ -3040,84 +4210,92 @@ async function pageScrapeWithCipher(
 
   // === Fallback: regex-based cipher + N-sig processing ===
   if (!solverOk) {
-    if (cipherQueue.length && (cipherCode || sig?.cipherCode)) {
-      const cc = cipherCode || sig.cipherCode;
-      const ca = cipherArgName || sig?.cipherArgName || "a";
-      console.log(
-        "[BG] Tier 3 fallback: sandbox cipher eval for",
-        cipherQueue.length,
-        "formats",
-      );
-      const deciphered = await sandboxEvalCipher(
-        cc,
-        ca,
-        cipherQueue.map((e) => e.s),
-      );
-      for (let i = 0; i < cipherQueue.length; i++) {
-        const { fmt, url, sp } = cipherQueue[i];
-        const sig2 = deciphered[i];
-        if (!sig2 || typeof sig2 !== "string") continue;
+    try {
+      if (cipherQueue.length && (cipherCode || sig?.cipherCode)) {
+        const cc = cipherCode || sig.cipherCode;
+        const ca = cipherArgName || sig?.cipherArgName || "a";
+        console.log(
+          "[BG] Tier 3 fallback: sandbox cipher eval for",
+          cipherQueue.length,
+          "formats",
+        );
+        const deciphered = await sandboxEvalCipher(
+          cc,
+          ca,
+          cipherQueue.map((e) => e.s),
+        );
+        for (let i = 0; i < cipherQueue.length; i++) {
+          const { fmt, url, sp } = cipherQueue[i];
+          const sig2 = deciphered[i];
+          if (!sig2 || typeof sig2 !== "string") continue;
 
-        let fullUrl =
-          url +
-          (url.includes("?") ? "&" : "?") +
-          sp +
-          "=" +
-          encodeURIComponent(sig2);
-        if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
+          let fullUrl =
+            url +
+            (url.includes("?") ? "&" : "?") +
+            sp +
+            "=" +
+            encodeURIComponent(sig2);
+          if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
 
-        const mime = fmt.mimeType || "";
-        const cm = mime.match(/codecs="([^"]+)"/);
-        const codecs = cm ? cm[1] : "";
-        const isV = mime.startsWith("video/");
-        const isA = mime.startsWith("audio/");
+          const mime = fmt.mimeType || "";
+          const cm = mime.match(/codecs="([^"]+)"/);
+          const codecs = cm ? cm[1] : "";
+          const isV = mime.startsWith("video/");
+          const isA = mime.startsWith("audio/");
 
-        const entry = {
-          itag: fmt.itag,
-          url: fullUrl,
-          mimeType: mime,
-          quality: fmt.qualityLabel || fmt.quality || "",
-          qualityLabel: fmt.qualityLabel || "",
-          width: fmt.width || 0,
-          height: fmt.height || 0,
-          fps: fmt.fps || 0,
-          bitrate: fmt.bitrate || 0,
-          audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
-          audioQuality: fmt.audioQuality || "",
-          contentLength: parseInt(fmt.contentLength) || null,
-          codecs,
-          isVideo: isV,
-          isAudio: isA,
-          isMuxed: isV && codecs.includes("mp4a"),
-        };
+          const entry = {
+            itag: fmt.itag,
+            url: fullUrl,
+            mimeType: mime,
+            quality: fmt.qualityLabel || fmt.quality || "",
+            qualityLabel: fmt.qualityLabel || "",
+            width: fmt.width || 0,
+            height: fmt.height || 0,
+            fps: fmt.fps || 0,
+            bitrate: fmt.bitrate || 0,
+            audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
+            audioQuality: fmt.audioQuality || "",
+            contentLength: parseInt(fmt.contentLength) || null,
+            codecs,
+            isVideo: isV,
+            isAudio: isA,
+            isMuxed: isV && codecs.includes("mp4a"),
+          };
 
-        const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
-        if (nm && sig?.nSigCode) {
-          nEntries.push({
-            idx: formats.length,
-            raw: nm[1],
-            decoded: decodeURIComponent(nm[1]),
-          });
-        }
-        formats.push(entry);
-      }
-    }
-
-    if (nEntries.length && sig?.nSigCode) {
-      const results = await sandboxEval(
-        sig.nSigCode,
-        nEntries.map((e) => e.decoded),
-      );
-      for (let i = 0; i < nEntries.length; i++) {
-        const e = nEntries[i];
-        const r = results[i];
-        if (r && typeof r === "string" && r !== e.decoded) {
-          formats[e.idx].url = formats[e.idx].url.replace(
-            "n=" + e.raw,
-            "n=" + encodeURIComponent(r),
-          );
+          const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
+          if (nm) {
+            nEntries.push({
+              idx: formats.length,
+              raw: nm[1],
+              decoded: decodeURIComponent(nm[1]),
+            });
+          }
+          formats.push(entry);
         }
       }
+
+      if (nEntries.length && sig?.nSigCode) {
+        const results = await sandboxEval(
+          sig.nSigCode,
+          nEntries.map((e) => e.decoded),
+        );
+        for (let i = 0; i < nEntries.length; i++) {
+          const e = nEntries[i];
+          const r = results[i];
+          if (r && typeof r === "string" && r !== e.decoded) {
+            formats[e.idx].url = formats[e.idx].url.replace(
+              "n=" + e.raw,
+              "n=" + encodeURIComponent(r),
+            );
+          }
+        }
+      }
+    } catch (fallbackErr) {
+      console.warn(
+        "[BG] Tier 3 regex fallback failed:",
+        fallbackErr.message,
+        "— returning formats with throttled N-sig",
+      );
     }
   }
 
@@ -3136,7 +4314,15 @@ async function pageScrapeWithCipher(
 async function loadSignatureData(playerUrl) {
   if (sigCache.has(playerUrl)) {
     const c = sigCache.get(playerUrl);
-    if (Date.now() < c.expiresAt) return c;
+    if (Date.now() < c.expiresAt) {
+      // S39 fix: Log player version for debugging multi-version issues
+      const versionMatch = playerUrl.match(/\/player\/(\w+)\//);
+      console.log(
+        "[BG] Using cached sig for player version:",
+        versionMatch?.[1] || "unknown",
+      );
+      return c;
+    }
   }
 
   console.log("[BG] Loading player JS:", playerUrl);
@@ -3214,7 +4400,7 @@ async function loadSignatureData(playerUrl) {
   let nSigBundled = null;
   if (nSigCode) {
     try {
-      nSigBundled = bundleNSigWithDeps(js);
+      nSigBundled = bundleNSigWithDeps(js, nSigCode);
       if (nSigBundled && nSigBundled !== nSigCode) {
         console.log(
           "[BG] yt-dlp bundled N-sig available (" +
@@ -3271,6 +4457,50 @@ async function loadSignatureData(playerUrl) {
     expiresAt: Date.now() + 43200000,
   };
   sigCache.set(playerUrl, data);
+
+  // S39 fix: Log when multiple player.js versions are cached
+  const versions = new Set();
+  for (const key of sigCache.keys()) {
+    const match = key.match(/\/player\/(\w+)\//);
+    if (match) versions.add(match[1]);
+  }
+  if (versions.size > 1) {
+    console.warn(
+      `[S39] Multiple player.js versions cached (${versions.size}): YouTube A/B testing detected`,
+      Array.from(versions),
+    );
+  }
+
+  // ── sigCache eviction (S26 fix) ──────────────────────────────
+  // 1. Proactively purge expired entries (not just on get)
+  const now = Date.now();
+  for (const [key, val] of sigCache) {
+    if (now >= val.expiresAt) {
+      sigCache.delete(key);
+      console.log("[BG] sigCache: evicted expired entry:", key);
+    }
+  }
+  // 2. Enforce max cache size — evict oldest (earliest expiresAt) entries
+  while (sigCache.size > SIG_CACHE_MAX) {
+    let oldestKey = null;
+    let oldestExpire = Infinity;
+    for (const [key, val] of sigCache) {
+      if (val.expiresAt < oldestExpire) {
+        oldestExpire = val.expiresAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) {
+      sigCache.delete(oldestKey);
+      console.log(
+        "[BG] sigCache: evicted oldest entry (size cap " + SIG_CACHE_MAX + "):",
+        oldestKey,
+      );
+    } else {
+      break;
+    }
+  }
+
   console.log(
     "[BG] Cipher:",
     actionList
@@ -3494,9 +4724,11 @@ function extractDispatchCipherActions(
       )
         types[mm[1]] = "splice";
       else if (/\.reverse\s*\(/.test(methodBody)) types[mm[1]] = "reverse";
-      else {
-        // Likely a no-arg method (reverse variant) — log for debugging
-        // rather than silently assuming reverse
+      else if (/\w+\[.+?\]\s*\(/.test(methodBody)) {
+        // Lookup-array-based call (e.g. {b[f[35]]()}) — reverse variant
+        types[mm[1]] = "reverse";
+      } else {
+        // Genuinely unrecognized method — default to reverse, log for debugging
         console.warn(
           "[BG] Unrecognized cipher method:",
           mm[1],
@@ -4058,13 +5290,40 @@ function extractNSigCode(js) {
 
   if (!fn) return null;
 
+  // Resolve array wrapper: if fn="eMK" and arrIdx=0, find eMK=[X,Y,Z] and use X
   if (arrIdx !== null) {
-    const am = js.match(
+    // Try multiple patterns for array assignment
+    const arrayPatterns = [
+      // Standard: ;eMK=[X,Y,Z]
       new RegExp(`[,;\\n]\\s*${escRe(fn)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`),
-    );
-    if (am) {
-      const items = am[1].split(",");
-      if (items[arrIdx]) fn = items[arrIdx].trim();
+      // Var declaration: var eMK=[X,Y,Z]
+      new RegExp(
+        `(?:var|let|const)\\s+${escRe(fn)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
+      ),
+      // Start of line: eMK=[X,Y,Z]
+      new RegExp(`^\\s*${escRe(fn)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`, "m"),
+    ];
+
+    let resolved = false;
+    for (const pattern of arrayPatterns) {
+      const am = js.match(pattern);
+      if (am) {
+        const items = am[1].split(",").map((i) => i.trim());
+        if (items[arrIdx]) {
+          const oldFn = fn;
+          fn = items[arrIdx];
+          console.log(`[BG] N-sig array resolved: ${oldFn}[${arrIdx}] → ${fn}`);
+          resolved = true;
+          break;
+        }
+      }
+    }
+
+    if (!resolved) {
+      console.warn(
+        `[BG] N-sig array resolution failed for ${fn}[${arrIdx}] - pattern not found`,
+      );
+      return null;
     }
   }
 
@@ -4102,28 +5361,378 @@ function extractNSigCode(js) {
       `(?:var|let|const)\\s+${esc}\\s*=\\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=>\\s*\\{`,
       "g",
     ),
+    // 2026 patterns: object property functions
+    // obj={H:function(a){...}}
+    new RegExp(`${esc}\\s*:\\s*function\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
+    // obj={H(a){...}} or obj={H:(a)=>{...}}
+    new RegExp(`${esc}\\s*:\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`, "g"),
+    new RegExp(`${esc}\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
   ];
 
+  let matchCount = 0;
   for (const re of defPatterns) {
     let sm;
     while ((sm = re.exec(js)) !== null) {
+      matchCount++;
       const braceIdx = sm.index + sm[0].lastIndexOf("{");
-      const body = extractBraceBlock(js, braceIdx);
+      let body = extractBraceBlock(js, braceIdx);
       if (!body) continue;
 
-      // N-sig functions are large (typically 500+ chars) and contain
-      // try/catch blocks and array indexing — skip tiny matches
-      if (body.length < 200) continue;
+      // 2026 fix: Handle wrapper functions (e.g., Y$K calls g.realFunc)
+      // If body is small (< 150) but looks like a wrapper, extract the real function
+      let resolvedParams = null;
+      if (body.length < 150) {
+        // Pattern 1: Wrapper calls object method: {return g.someFunc(a)}
+        let wrapperMatch = body.match(
+          /\{\s*return\s+([a-zA-Z0-9$_]+)\.([a-zA-Z0-9$_]+)\s*\(\s*[^)]*\s*\)\s*;?\s*\}/,
+        );
+
+        if (wrapperMatch) {
+          const objName = wrapperMatch[1];
+          const methodName = wrapperMatch[2];
+          console.log(
+            `[BG] N-sig ${fn} is wrapper → ${objName}.${methodName}, body: ${body}`,
+          );
+
+          // Find the object definition closest to the wrapper (not first in file).
+          // Single-letter names like 'g' match hundreds of times in minified JS,
+          // so we find the LAST definition before the wrapper function.
+          const objDefRe = new RegExp(
+            `(?:var|let|const)\\s+${escRe(objName)}\\s*=\\s*\\{`,
+            "g",
+          );
+          let objDefMatch = null;
+          let _odm;
+          let matchesBeforeWrapper = 0;
+          let matchesAfterWrapper = 0;
+          while ((_odm = objDefRe.exec(js)) !== null) {
+            if (_odm.index > sm.index) {
+              matchesAfterWrapper++;
+              break;
+            }
+            matchesBeforeWrapper++;
+            objDefMatch = _odm;
+          }
+          console.log(
+            `[BG] N-sig object ${objName} search: ${matchesBeforeWrapper} matches before wrapper @ ${sm.index}, ${matchesAfterWrapper} after`,
+          );
+          if (objDefMatch) {
+            console.log(
+              `[BG] N-sig using ${objName} definition @ ${objDefMatch.index} (${sm.index - objDefMatch.index} chars before wrapper)`,
+            );
+            const objBraceIdx =
+              objDefMatch.index + objDefMatch[0].lastIndexOf("{");
+            const objBody = extractBraceBlock(js, objBraceIdx);
+
+            if (objBody) {
+              console.log(
+                `[BG] N-sig object ${objName} body extracted: ${objBody.length}ch, searching for method ${methodName}`,
+              );
+              // Extract the specific method from the object
+              // Try multiple method definition patterns
+              const methodPatterns = [
+                new RegExp(
+                  `${escRe(methodName)}\\s*:\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+                ),
+                new RegExp(`${escRe(methodName)}\\s*\\(([^)]*)\\)\\s*\\{`), // ES6 shorthand
+                new RegExp(
+                  `${escRe(methodName)}\\s*:\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
+                ), // Arrow function
+              ];
+
+              let methodMatch = null;
+              for (const methodPattern of methodPatterns) {
+                methodMatch = objBody.match(methodPattern);
+                if (methodMatch) {
+                  console.log(
+                    `[BG] N-sig found method ${methodName} using pattern: ${methodPattern}`,
+                  );
+                  const methodBraceIdx =
+                    objBody.indexOf(methodMatch[0]) +
+                    methodMatch[0].lastIndexOf("{");
+                  const methodBody = extractBraceBlock(objBody, methodBraceIdx);
+                  if (methodBody && methodBody.length >= 150) {
+                    // Return self-contained code with object definition
+                    const code =
+                      `var ${objName}=${objBody};` +
+                      `return ${objName}.${methodName}(${sm[1]});`;
+                    console.log(
+                      `[BG] N-sig wrapper resolved: ${objName}.${methodName} (${code.length}ch)`,
+                    );
+                    return `function(${sm[1]}){${code}}`;
+                  } else {
+                    console.log(
+                      `[BG] N-sig method ${methodName} too small: ${methodBody ? methodBody.length : 0}ch`,
+                    );
+                  }
+                  break;
+                }
+              }
+              if (!methodMatch) {
+                console.warn(
+                  `[BG] N-sig method ${methodName} not found in object ${objName}. Object preview: ${objBody.slice(0, 500)}...`,
+                );
+              }
+            } else {
+              console.warn(
+                `[BG] N-sig object ${objName} body extraction failed at index ${objDefMatch.index}`,
+              );
+            }
+          } else {
+            console.warn(`[BG] N-sig object ${objName} not found in player.js`);
+          }
+        }
+
+        // Pattern 2: Wrapper calls standalone function: {return someFunc(a)}
+        // Note: Must NOT match object methods (already handled above)
+        if (!wrapperMatch) {
+          wrapperMatch = body.match(
+            /\{\s*return\s+(?!\w+\.)([a-zA-Z0-9$_]+)\s*\(\s*[^)]*\s*\)\s*;?\s*\}/,
+          );
+        }
+
+        // Pattern 3: Wrapper calls array element: {return g[0](a)}
+        if (!wrapperMatch) {
+          wrapperMatch = body.match(
+            /\{\s*return\s+([a-zA-Z0-9$_]+)\[(\d+)\]\s*\(\s*[^)]*\s*\)\s*;?\s*\}/,
+          );
+          if (wrapperMatch) {
+            const arrName = wrapperMatch[1];
+            const arrIdx = parseInt(wrapperMatch[2]);
+            console.log(
+              `[BG] N-sig ${fn} is array wrapper → ${arrName}[${arrIdx}]`,
+            );
+
+            // Resolve array: find arrName = [X, Y, Z] and get element at arrIdx
+            const arrDefPatterns = [
+              new RegExp(
+                `[,;\\n]\\s*${escRe(arrName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
+              ),
+              new RegExp(
+                `(?:var|let|const)\\s+${escRe(arrName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
+              ),
+            ];
+            let resolvedFuncName = null;
+            for (const ap of arrDefPatterns) {
+              const am = js.match(ap);
+              if (am) {
+                const items = am[1].split(",").map((i) => i.trim());
+                if (items[arrIdx]) {
+                  resolvedFuncName = items[arrIdx];
+                  break;
+                }
+              }
+            }
+            if (resolvedFuncName) {
+              console.log(
+                `[BG] N-sig array ${arrName}[${arrIdx}] → ${resolvedFuncName}`,
+              );
+              // Now use findFunctionDefinition to resolve the actual function
+              const arrFuncDef = findFunctionDefinition(js, resolvedFuncName);
+              if (
+                arrFuncDef &&
+                arrFuncDef.body &&
+                arrFuncDef.body.length >= 150
+              ) {
+                console.log(
+                  `[BG] N-sig array wrapper resolved: ${resolvedFuncName} (${arrFuncDef.body.length}ch)`,
+                );
+                body = arrFuncDef.body;
+                resolvedParams = arrFuncDef.params;
+              } else {
+                console.warn(
+                  `[BG] N-sig array target ${resolvedFuncName} not found or too small`,
+                );
+              }
+            } else {
+              console.warn(`[BG] N-sig array ${arrName} definition not found`);
+            }
+            // Clear wrapperMatch so Pattern 2 fallback below doesn't re-trigger
+            wrapperMatch = null;
+          }
+        }
+
+        // Pattern 4: Multi-statement wrapper: {a=someFunc(a);return a} or {var b=g.f(a);return b}
+        if (!wrapperMatch && body.length < 150) {
+          const multiMatch = body.match(
+            /\{\s*(?:var\s+)?\w+\s*=\s*(?:([a-zA-Z0-9$_]+)\.([a-zA-Z0-9$_]+)|(?!\w+\.)([a-zA-Z0-9$_]+))\s*\(\s*[^)]*\s*\)\s*;\s*return\s+\w+\s*;?\s*\}/,
+          );
+          if (multiMatch) {
+            if (multiMatch[1] && multiMatch[2]) {
+              // Object method: a = g.transform(a); return a
+              // Re-use Pattern 1 logic — set up wrapperMatch-like state
+              const objName = multiMatch[1];
+              const methodName = multiMatch[2];
+              console.log(
+                `[BG] N-sig ${fn} is multi-stmt wrapper → ${objName}.${methodName}`,
+              );
+              // Fake a Pattern 1 match to let the code above handle it on retry
+              // Instead, directly replicate the object resolution here
+              const objDefRe2 = new RegExp(
+                `(?:var|let|const)\\s+${escRe(objName)}\\s*=\\s*\\{`,
+                "g",
+              );
+              let objDefMatch2 = null,
+                _odm2;
+              while ((_odm2 = objDefRe2.exec(js)) !== null) {
+                if (_odm2.index > sm.index) break;
+                objDefMatch2 = _odm2;
+              }
+              if (objDefMatch2) {
+                const objBraceIdx2 =
+                  objDefMatch2.index + objDefMatch2[0].lastIndexOf("{");
+                const objBody2 = extractBraceBlock(js, objBraceIdx2);
+                if (objBody2) {
+                  const mp = [
+                    new RegExp(
+                      `${escRe(methodName)}\\s*:\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+                    ),
+                    new RegExp(`${escRe(methodName)}\\s*\\(([^)]*)\\)\\s*\\{`),
+                  ];
+                  for (const mre of mp) {
+                    const mm = objBody2.match(mre);
+                    if (mm) {
+                      const mbi =
+                        objBody2.indexOf(mm[0]) + mm[0].lastIndexOf("{");
+                      const mb = extractBraceBlock(objBody2, mbi);
+                      if (mb && mb.length >= 150) {
+                        const code = `var ${objName}=${objBody2};return ${objName}.${methodName}(${sm[1]});`;
+                        console.log(
+                          `[BG] N-sig multi-stmt wrapper resolved: ${objName}.${methodName} (${code.length}ch)`,
+                        );
+                        return `function(${sm[1]}){${code}}`;
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+            } else if (multiMatch[3]) {
+              // Standalone function: a = someFunc(a); return a
+              console.log(
+                `[BG] N-sig ${fn} is multi-stmt standalone wrapper → ${multiMatch[3]}`,
+              );
+              wrapperMatch = [multiMatch[0], multiMatch[3]];
+              // Fall through to Pattern 2 resolution below
+            }
+          }
+        }
+
+        if (wrapperMatch && wrapperMatch[1]) {
+          const realFuncName = wrapperMatch[1];
+          // Skip if we already handled object method pattern
+          if (!wrapperMatch[0].includes(".")) {
+            console.log(
+              `[BG] N-sig ${fn} is standalone wrapper → ${realFuncName}`,
+            );
+
+            // Find the real function definition — use proximity search
+            // (last match BEFORE the wrapper, not first in file)
+            const realFnEsc = escRe(realFuncName);
+            const realFnPatterns = [
+              new RegExp(
+                `(?:^|[;,\\n])\\s*${realFnEsc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+                "gm",
+              ),
+              new RegExp(
+                `function\\s+${realFnEsc}\\s*\\(([^)]*)\\)\\s*\\{`,
+                "g",
+              ),
+              new RegExp(
+                `(?:var|let|const)\\s+${realFnEsc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
+                "g",
+              ),
+            ];
+
+            let bestMatch = null;
+            for (const realRe of realFnPatterns) {
+              let rm;
+              while ((rm = realRe.exec(js)) !== null) {
+                const realBraceIdx = rm.index + rm[0].lastIndexOf("{");
+                const realBody = extractBraceBlock(js, realBraceIdx);
+                if (realBody && realBody.length >= 150) {
+                  // Prefer the last match before the wrapper (closest preceding def),
+                  // fall back to first match after if none exist before
+                  if (!bestMatch) {
+                    bestMatch = {
+                      index: rm.index,
+                      body: realBody,
+                      params: rm[1],
+                    };
+                  } else if (
+                    rm.index <= sm.index &&
+                    rm.index > bestMatch.index
+                  ) {
+                    // Closer before the wrapper — always better
+                    bestMatch = {
+                      index: rm.index,
+                      body: realBody,
+                      params: rm[1],
+                    };
+                  } else if (
+                    bestMatch.index > sm.index &&
+                    rm.index < bestMatch.index
+                  ) {
+                    // Both after wrapper — pick the closer one
+                    bestMatch = {
+                      index: rm.index,
+                      body: realBody,
+                      params: rm[1],
+                    };
+                  }
+                }
+              }
+            }
+            if (bestMatch) {
+              console.log(
+                `[BG] N-sig resolved ${realFuncName}: ${bestMatch.body.length}ch (${bestMatch.index < sm.index ? "before" : "after"} wrapper @ ${sm.index - bestMatch.index} chars)`,
+              );
+              body = bestMatch.body;
+              resolvedParams = bestMatch.params;
+            } else {
+              console.warn(
+                `[BG] N-sig standalone function ${realFuncName} not resolved`,
+              );
+            }
+          }
+        }
+
+        // Still too small after wrapper check
+        if (body.length < 150) {
+          console.log(
+            `[BG] N-sig candidate ${fn} skipped: too small (${body.length}ch)`,
+          );
+          continue;
+        }
+      }
+
+      // 2026 fix: YouTube N-sig functions evolved - relax validation
+      // New: accept any function 150+ chars with basic complexity indicators
+
+      // Accept if any of these complexity indicators are present:
+      const hasTryCatch = /try\s*\{/.test(body);
+      const hasArrayIndex = /\[\s*\d+\s*\]/.test(body);
+      const hasStringOps = /\.split\(|\.join\(|\.slice\(/.test(body);
+      const hasLoops = /for\s*\(|while\s*\(/.test(body);
+      const isLargeEnough = body.length >= 300;
+
       if (
-        !/try\s*\{/.test(body) &&
-        !/\[\s*\d+\s*\]/.test(body) &&
-        body.length < 2000
-      )
+        !hasTryCatch &&
+        !hasArrayIndex &&
+        !hasStringOps &&
+        !hasLoops &&
+        !isLargeEnough
+      ) {
+        console.log(
+          `[BG] N-sig candidate ${fn} skipped: no complexity indicators (${body.length}ch)`,
+        );
         continue;
+      }
 
-      let code = `function(${sm[1]})${body}`;
+      const params = resolvedParams || sm[1];
+      let code = `function(${params})${body}`;
 
-      const arg0 = sm[1].split(",")[0].trim();
+      const arg0 = params.split(",")[0].trim();
       code = code.replace(
         new RegExp(
           `if\\s*\\([^)]*typeof\\s+${escRe(arg0)}[^)]*\\)\\s*return\\s+${escRe(arg0)}\\s*;?`,
@@ -4136,14 +5745,17 @@ function extractNSigCode(js) {
         code.length,
         "chars from function",
         fn,
+        "| try/catch:",
+        hasTryCatch,
+        "| array[]:",
+        hasArrayIndex,
       );
       return code;
     }
   }
 
   console.warn(
-    "[BG] N-sig function definition not found or too small for:",
-    fn,
+    `[BG] N-sig function definition not found or too small for: ${fn} (checked ${matchCount} potential matches)`,
   );
   return null;
 }
@@ -4164,9 +5776,9 @@ function extractNSigCode(js) {
 // 4. Bundles everything into a standalone script
 // ============================================================
 
-function bundleNSigWithDeps(js) {
-  // Step 1: Find N-sig function name the same way extractNSigCode does
-  const nSigCode = extractNSigCode(js);
+function bundleNSigWithDeps(js, preExtractedNSigCode) {
+  // Step 1: Use pre-extracted code if available, otherwise extract (avoid duplicate work)
+  const nSigCode = preExtractedNSigCode || extractNSigCode(js);
   if (!nSigCode) return null;
 
   // Step 2: Find the N-sig function name again (we need it for the dependency scan)
@@ -4394,6 +6006,8 @@ function bundleNSigWithDeps(js) {
   function scanAndExtractDeps(code, parentName, depth) {
     // Find all identifier references that could be IIFE-scoped dependencies
     // Pattern: identifiers used as function calls or property accesses
+    // NOTE: We intentionally only match identifiers followed by (, [, or .prop
+    // to avoid pulling in local variables/params as false dependencies.
     const identRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]*)\s*(?:\(|\[|\.\w)/g;
     let im;
     const candidates = new Set();
@@ -4403,23 +6017,6 @@ function bundleNSigWithDeps(js) {
       if (name === parentName) continue; // self-reference
       if (name.length === 1 && /[a-z]/.test(name)) continue; // single lowercase = likely param
       candidates.add(name);
-    }
-
-    // Also find plain identifier assignments/references
-    const assignRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]{1,})\b/g;
-    let am;
-    while ((am = assignRe.exec(code)) !== null) {
-      const name = am[1];
-      if (BUILTINS.has(name)) continue;
-      if (name === parentName) continue;
-      // Only consider names that appear as function calls or assignments
-      if (
-        code.includes(name + "(") ||
-        code.includes(name + "[") ||
-        code.includes(name + ".")
-      ) {
-        candidates.add(name);
-      }
     }
 
     for (const candidate of candidates) {
@@ -4522,6 +6119,10 @@ function findFunctionDefinition(js, name) {
     ),
   ];
 
+  // Collect ALL candidates across all patterns, then pick the best one
+  // (largest body). Short minified names can match multiple definitions;
+  // returning the first hit could pick a tiny unrelated function.
+  let best = null;
   for (const re of patterns) {
     let m;
     while ((m = re.exec(js)) !== null) {
@@ -4531,16 +6132,25 @@ function findFunctionDefinition(js, name) {
       // Skip very tiny matches (likely false positives)
       if (body.length < 10) continue;
 
-      const params = m[1];
-      const fullCode = `var ${name} = function(${params})${body};`;
-      return {
-        code: fullCode,
-        body,
-        params,
-        startIdx: m.index,
-        endIdx: braceIdx + body.length,
-      };
+      if (!best || body.length > best.body.length) {
+        best = {
+          params: m[1],
+          body,
+          startIdx: m.index,
+          endIdx: braceIdx + body.length,
+        };
+      }
     }
+  }
+  if (best) {
+    const fullCode = `var ${name} = function(${best.params})${best.body};`;
+    return {
+      code: fullCode,
+      body: best.body,
+      params: best.params,
+      startIdx: best.startIdx,
+      endIdx: best.endIdx,
+    };
   }
   return null;
 }
@@ -4698,6 +6308,119 @@ function stopMergeKeepalive() {
 }
 
 // ============================================================
+// Service Worker Keepalive during worker downloads
+// Same pattern as merge keepalive — counts active workers and
+// starts/stops one shared interval.
+// ============================================================
+function startWorkerKeepalive() {
+  activeWorkerCount++;
+  if (!workerKeepaliveTimer) {
+    workerKeepaliveTimer = setInterval(chrome.runtime.getPlatformInfo, 25000);
+    console.log("[BG] Worker download keepalive started");
+  }
+  startWorkerHealthCheck();
+}
+
+function stopWorkerKeepalive() {
+  activeWorkerCount = Math.max(0, activeWorkerCount - 1);
+  if (activeWorkerCount === 0 && workerKeepaliveTimer) {
+    clearInterval(workerKeepaliveTimer);
+    workerKeepaliveTimer = null;
+    console.log("[BG] Worker download keepalive stopped");
+  }
+  if (activeWorkerCount === 0 && workerHealthCheckTimer) {
+    clearInterval(workerHealthCheckTimer);
+    workerHealthCheckTimer = null;
+  }
+}
+
+// ============================================================
+// Offscreen Health Check during Worker Downloads
+// If Chrome kills the offscreen document under memory pressure,
+// WORKER_COMPLETE never arrives and the download hangs forever.
+// Periodically verify offscreen is still alive; if dead, mark
+// all in-flight worker downloads as failed.
+// ============================================================
+function startWorkerHealthCheck() {
+  if (workerHealthCheckTimer) return;
+  workerHealthCheckTimer = setInterval(async () => {
+    if (activeWorkerCount === 0) {
+      clearInterval(workerHealthCheckTimer);
+      workerHealthCheckTimer = null;
+      return;
+    }
+    try {
+      const contexts = await chrome.runtime.getContexts?.({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+      });
+      if (contexts && contexts.length === 0) {
+        console.warn(
+          "[BG] Offscreen document died during worker downloads — cleaning up",
+        );
+        clearInterval(workerHealthCheckTimer);
+        workerHealthCheckTimer = null;
+        activeWorkerCount = 0;
+        if (workerKeepaliveTimer) {
+          clearInterval(workerKeepaliveTimer);
+          workerKeepaliveTimer = null;
+        }
+        // Mark all in-flight worker downloads as failed
+        chrome.storage.session.get("activeDownloads", (result) => {
+          const downloads = result?.activeDownloads || {};
+          let changed = false;
+          for (const [id, dl] of Object.entries(downloads)) {
+            if (
+              dl.phase === "starting" ||
+              dl.phase === "downloading" ||
+              dl.phase === "transmuxing" ||
+              dl.phase === "merging"
+            ) {
+              downloads[id] = {
+                ...dl,
+                phase: "error",
+                message: "Download interrupted (offscreen document was killed)",
+                ts: Date.now(),
+              };
+              changed = true;
+            }
+          }
+          if (changed) {
+            chrome.storage.session
+              .set({ activeDownloads: downloads })
+              .catch(() => {});
+          }
+        });
+      }
+    } catch {
+      // getContexts not supported (Firefox) — skip check
+    }
+  }, 10000); // Check every 10 seconds
+}
+
+// ============================================================
+// Service Worker Keepalive during format resolution
+// getFormats → getFormatsInner → sandboxSolvePlayer can take
+// 10-35 seconds.  Without a keepalive Chrome's 30-second idle
+// timer can kill the SW mid-Promise.
+// ============================================================
+function startFormatKeepalive() {
+  activeFormatCount++;
+  if (!formatKeepaliveTimer) {
+    formatKeepaliveTimer = setInterval(chrome.runtime.getPlatformInfo, 25000);
+    console.log("[BG] Format resolution keepalive started");
+  }
+}
+
+function stopFormatKeepalive() {
+  activeFormatCount = Math.max(0, activeFormatCount - 1);
+  if (activeFormatCount === 0 && formatKeepaliveTimer) {
+    clearInterval(formatKeepaliveTimer);
+    formatKeepaliveTimer = null;
+    console.log("[BG] Format resolution keepalive stopped");
+  }
+}
+
+// ============================================================
 // Resume merge after SW restart or offscreen death
 // Re-fetches fresh YouTube URLs using the stored videoId/itags,
 // then restarts the merge with new URLs.
@@ -4773,10 +6496,23 @@ async function doMergedDownload(msg) {
     return { success: false, error: "A merge is already in progress" };
   }
 
-  await ensureOffscreen();
+  // Cancel any pending delayed removal from a previous merge's finally block
+  if (pendingMergeRemoveTimer) {
+    clearTimeout(pendingMergeRemoveTimer);
+    pendingMergeRemoveTimer = null;
+  }
 
+  // Claim the merge slot BEFORE any async work to prevent concurrent merges
   const mergeId = Date.now().toString();
   activeMergeId = mergeId;
+
+  try {
+    await ensureOffscreen();
+  } catch (e) {
+    activeMergeId = null;
+    throw e;
+  }
+
   console.log("[BG] Starting merged download:", filename, "mergeId:", mergeId);
 
   chrome.storage.session
@@ -4822,11 +6558,39 @@ async function doMergedDownload(msg) {
           filename,
           mergeId,
         },
-        (response) => {
+        async (response) => {
           clearTimeout(timeout);
           if (chrome.runtime.lastError) {
             const errMsg = chrome.runtime.lastError.message;
             console.error("[BG] Merge message error:", errMsg);
+
+            // S38 fix: Detect memory pressure (OOM kills offscreen)
+            const isOOM =
+              errMsg.includes("message port closed") ||
+              errMsg.includes("Could not establish connection");
+
+            if (isOOM) {
+              try {
+                const allTabs = await chrome.tabs.query({});
+                const tabCount = allTabs.length;
+
+                if (tabCount > 100) {
+                  console.warn(
+                    `[S38] High tab count detected (${tabCount}) — likely memory pressure caused OOM`,
+                  );
+                  resolve({
+                    success: false,
+                    error: `Merge failed due to memory pressure. You have ${tabCount} tabs open. Close unused tabs and try again.`,
+                    isOOM: true,
+                    tabCount,
+                  });
+                  return;
+                }
+              } catch (e) {
+                console.warn("[S38] Failed to check tab count:", e.message);
+              }
+            }
+
             // Offscreen document was likely destroyed (DevTools, Chrome GC, etc.)
             // If we have resume data, try to auto-retry with fresh URLs
             if (
@@ -4940,7 +6704,7 @@ async function doMergedDownload(msg) {
 
       try {
         // Re-resolve formats through the full tier cascade:
-        //   Tier 1 (inject.js) → Tier 2 (InnerTube API) → Tier S (sniffed) → Tier 3 (scrape)
+        //   Tier 1 (InnerTube API) → Tier 2 (inject.js) → Tier S (sniffed) → Tier 3 (scrape)
         // Each tier applies N-sig transform (plain → yt-dlp bundled fallback)
         // and enriches with sniffed googlevideo.com URLs when available.
         const resumeTabId = findTabIdForVideoId(videoId);
@@ -5051,17 +6815,31 @@ async function doMergedDownload(msg) {
     return result;
   } finally {
     await removeMergeHeaders(mergeRuleIds);
+    const finishedMergeId = mergeId;
     activeMergeId = null;
     stopMergeKeepalive();
 
-    setTimeout(() => {
-      chrome.storage.session.remove("activeMerge").catch(() => {});
+    // Delayed removal — but guarded: only remove if no new merge has started
+    pendingMergeRemoveTimer = setTimeout(() => {
+      pendingMergeRemoveTimer = null;
+      chrome.storage.session.get("activeMerge", (result) => {
+        // Only remove if the stored merge is the one WE just finished
+        if (result?.activeMerge?.mergeId === finishedMergeId) {
+          chrome.storage.session.remove("activeMerge").catch(() => {});
+        }
+      });
     }, 10000);
   }
 }
 
 async function doDownload(url, filename) {
   filename = sanitize(filename);
+
+  // S51 fix: Warn about potential IDM/JDownloader race conditions
+  // These tools often intercept googlevideo.com URLs, leading to duplicate downloads
+  if (url.includes("googlevideo.com")) {
+    console.warn("[S51] Downloading from googlevideo.com.");
+  }
 
   return new Promise((resolve) => {
     chrome.downloads.download({ url, filename, saveAs: true }, (id) => {
@@ -5103,6 +6881,65 @@ chrome.tabs.onRemoved.addListener((id) => {
   persistTabData();
 });
 
+// S47 fix: Monitor chrome.downloads for filesystem quota failures
+// When the OS filesystem is full, chrome.downloads.download() initiates
+// successfully but fails mid-write with FILE_FAILED error. The extension
+// reports "success" but the file doesn't exist. Listen to onChanged to
+// detect this and notify the user.
+const downloadFailureTracker = new Map(); // downloadId -> {filename, notified}
+
+chrome.downloads.onChanged.addListener((delta) => {
+  // Only care about downloads that transition to interrupted state
+  if (delta.state && delta.state.current === "interrupted") {
+    // Check if it's a FILE_FAILED error (quota/permissions)
+    if (delta.error && delta.error.current) {
+      const errorCode = delta.error.current;
+
+      // FILE_FAILED typically means: disk full, quota exceeded, or permission denied
+      if (errorCode === "FILE_FAILED") {
+        chrome.downloads.search({ id: delta.id }, (downloads) => {
+          if (downloads && downloads.length > 0) {
+            const dl = downloads[0];
+            const filename = dl.filename || "unknown file";
+
+            // Only notify once per download
+            if (!downloadFailureTracker.has(delta.id)) {
+              downloadFailureTracker.set(delta.id, {
+                filename,
+                notified: true,
+              });
+
+              console.error(
+                `[BG] Download ${delta.id} failed with FILE_FAILED: ${filename} (likely disk full or quota exceeded)`,
+              );
+
+              if (chrome.notifications) {
+                chrome.notifications.create(`download-failed-${delta.id}`, {
+                  type: "basic",
+                  iconUrl: chrome.runtime.getURL("icons/icon-128.png"),
+                  title: "Download Failed: Disk Full",
+                  message: `File: ${filename}\n\nYour system drive may be out of space. Free up disk space and try again.`,
+                  priority: 2,
+                });
+              }
+            }
+          }
+        });
+      }
+
+      // Other potential errors to log for debugging
+      if (errorCode !== "USER_CANCELED") {
+        console.warn(`[BG] Download ${delta.id} interrupted: ${errorCode}`);
+      }
+    }
+  }
+
+  // Clean up tracker for completed downloads
+  if (delta.state && delta.state.current === "complete") {
+    downloadFailureTracker.delete(delta.id);
+  }
+});
+
 async function doFetchUrl(url, options = {}) {
   try {
     const fetchOpts = {
@@ -5131,6 +6968,60 @@ async function doFetchUrl(url, options = {}) {
 console.log(
   "[BG] YouTube Downloader service worker ready (3-tier architecture)",
 );
+
+// S43 fix: Check for orphaned downloads after crash/force-kill
+// After Chrome crashes or force-kill, OPFS data survives but activeDownloads
+// in memory is lost. Notify user to clean up orphaned data.
+(async () => {
+  try {
+    const result = await chrome.storage.session.get("activeDownloads");
+    const downloads = result?.activeDownloads || {};
+
+    // Count downloads that were in progress (not complete/error)
+    const orphaned = Object.entries(downloads).filter(
+      ([id, dl]) =>
+        dl.phase === "starting" ||
+        dl.phase === "downloading" ||
+        dl.phase === "merging",
+    );
+
+    if (orphaned.length > 0) {
+      console.warn(
+        `[BG] Found ${orphaned.length} orphaned download(s) from previous session (may have left OPFS data)`,
+      );
+
+      // Estimate potential orphaned data size (rough heuristic: 1-2 GB per large download)
+      const estimatedSize = orphaned.length * 1.5; // GB
+
+      if (chrome.notifications) {
+        chrome.notifications.create("opfs-orphaned-data", {
+          type: "basic",
+          iconUrl: chrome.runtime.getURL("icons/icon-128.png"),
+          title: "Orphaned Download Data Detected",
+          message: `${orphaned.length} download(s) were interrupted by a crash or force-kill. ~${estimatedSize.toFixed(1)} GB of temporary data may remain in storage. Open extension popup and use "Clear Storage" to clean up.`,
+          priority: 1,
+          buttons: [{ title: "Got it" }],
+        });
+      }
+
+      // Mark them as error state for proper cleanup tracking
+      const now = Date.now();
+      for (const [id, dl] of orphaned) {
+        downloads[id] = {
+          ...dl,
+          phase: "error",
+          message: "Download interrupted (crash/force-kill)",
+          ts: now,
+          orphaned: true, // Flag for potential OPFS cleanup
+        };
+      }
+
+      await chrome.storage.session.set({ activeDownloads: downloads });
+    }
+  } catch (e) {
+    console.warn("[BG] Orphan detection failed:", e.message);
+  }
+})();
 
 const YOUTUBE_HOSTS = new Set([
   "youtube.com",
@@ -5209,18 +7100,60 @@ chrome.webRequest.onResponseStarted.addListener(
     const baseType = contentType.split(";")[0].trim();
 
     // Known proxy/CDN domains used by streaming sites
+    // Synced with generic-network-hook.js PROXY_DOMAINS list
+    // Uses full domain suffixes to prevent false positives
     const PROXY_STREAM_DOMAINS = [
       "vodvidl.site",
-      "rabbitstream",
-      "megacloud",
-      "vidplay",
-      "filemoon",
-      "dokicloud",
-      "rapid-cloud",
-      "vidstreaming",
+      "rabbitstream.net",
+      "megacloud.tv",
+      "vidplay.site",
+      "filemoon.sx",
+      "dokicloud.one",
+      "rapid-cloud.co",
+      "vidstreaming.io",
       "trueparadise.workers.dev",
-      "tigerflare",
+      "tigerflare.com",
       "videasy.net",
+      // Additional pirate CDN/embed domains (from generic-network-hook.js)
+      "streamtape.com",
+      "doodstream.com",
+      "mixdrop.co",
+      "upstream.to",
+      "streamlare.com",
+      "fembed.com",
+      "voe.sx",
+      "streamhub.to",
+      "streamsb.net",
+      "vidcloud.co",
+      "mycloud.to",
+      "mp4upload.com",
+      "evoload.io",
+      "streamz.ws",
+      "vidoza.net",
+      "netu.tv",
+      "supervideo.tv",
+      "jetload.net",
+      "vido.gg",
+      "streamwish.to",
+      "vidhide.com",
+      "embedrise.com",
+      "closeload.top",
+      "filelions.to",
+      "vidguard.to",
+      "lulustream.com",
+      "vembed.net",
+      "multiembed.mov",
+      "2embed.cc",
+      "vidsrc.me",
+      "autoembed.cc",
+      "flixhq.to",
+      "sflix.to",
+      "fmovies.to",
+      "gomovies.sx",
+      "123movies.to",
+      "putlocker.vip",
+      "kinox.to",
+      "primewire.li",
     ];
     const isProxyDomain = PROXY_STREAM_DOMAINS.some((d) =>
       details.url.includes(d),
@@ -5370,6 +7303,11 @@ function isYouTubeOrigin(origin) {
 // Captures fully-decrypted googlevideo.com/videoplayback URLs that YouTube's
 // player.js generates. These URLs already have cipher & N-sig applied, so we
 // bypass the fragile extraction logic entirely when cipher/N-sig breaks.
+//
+// Data structure: sniffedYouTubeUrls = Map(tabId → Map("videoId:itag" → data))
+// Using composite key "videoId:itag" prevents URL collisions when a page
+// embeds multiple YouTube videos (playlist pages, blog embeds, etc.) since
+// itag values overlap between videos (e.g., all have itag 140 for audio).
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
@@ -5392,6 +7330,17 @@ chrome.webRequest.onBeforeRequest.addListener(
       const dur = parseFloat(url.searchParams.get("dur")) || 0;
       const expire = parseInt(url.searchParams.get("expire")) || 0;
 
+      // Extract video ID from the googlevideo.com URL's "id" parameter.
+      // Format is typically "o-<hash>.<videoId>.<number>" or just the video ID.
+      // Falls back to "unknown" if not parseable (single-video pages still work).
+      let videoId = "unknown";
+      const idParam = url.searchParams.get("id");
+      if (idParam) {
+        // Try to extract 11-char YouTube video ID from the id parameter
+        const match = idParam.match(/([A-Za-z0-9_-]{11})/);
+        if (match) videoId = match[1];
+      }
+
       // Build a clean full-file URL (strip range= so we can download the whole thing)
       const cleanUrl = new URL(details.url);
       cleanUrl.searchParams.delete("range");
@@ -5404,17 +7353,23 @@ chrome.webRequest.onBeforeRequest.addListener(
       }
 
       const tabSniffed = sniffedYouTubeUrls.get(details.tabId);
-      tabSniffed.set(itag, {
+
+      // Use composite key "videoId:itag" to prevent collisions between
+      // different embedded videos that share the same itag numbers
+      const sniffKey = `${videoId}:${itag}`;
+      tabSniffed.set(sniffKey, {
         url: cleanUrl.toString(),
         mime,
         clen,
         dur,
         expire,
         ts: Date.now(),
+        videoId,
+        itag,
       });
 
       console.log(
-        `[YT-SNIFF] Captured itag ${itag} (${mime}) on tab ${details.tabId}`,
+        `[YT-SNIFF] Captured itag ${itag} video=${videoId} (${mime}) on tab ${details.tabId}`,
         `— ${tabSniffed.size} URLs total`,
       );
     } catch {
@@ -5424,18 +7379,102 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["*://*.googlevideo.com/*"] },
 );
 
+// S48: Validate that a sniffed URL is not affected by system time manipulation.
+// Returns { valid: boolean, reason?: string }
+function validateSniffedUrlTime(data, nowSeconds) {
+  if (!data.expire) {
+    // No expire timestamp — can't validate, assume valid
+    return { valid: true };
+  }
+
+  // Use trusted time reference: performance.timeOrigin is fixed at page load,
+  // performance.now() increments monotonically (pauses during sleep but never jumps)
+  const trustedNowMs = performance.timeOrigin + performance.now();
+  const trustedNowSeconds = Math.floor(trustedNowMs / 1000);
+
+  // Check if URL is expired (based on trusted time)
+  if (data.expire < trustedNowSeconds) {
+    return { valid: false, reason: "URL expired" };
+  }
+
+  // Check if system time was moved backward (current time < capture time)
+  // This is impossible unless the user manipulated their clock
+  if (data.ts && nowSeconds < Math.floor(data.ts / 1000) - 5) {
+    // Allow 5 second tolerance for clock drift/precision
+    console.warn(
+      `[S48] System time anomaly detected: current time (${nowSeconds}) is before URL capture time (${Math.floor(data.ts / 1000)}). User may have moved clock backward.`,
+    );
+    return {
+      valid: false,
+      reason: "System time moved backward (clock manipulation detected)",
+    };
+  }
+
+  // Check if system time was moved suspiciously far forward
+  // YouTube URLs typically expire in 6 hours, so if current time is >24 hours
+  // after capture but before expire, the user likely moved clock forward
+  const ONE_DAY = 86400; // 24 hours in seconds
+  if (
+    data.ts &&
+    nowSeconds > Math.floor(data.ts / 1000) + ONE_DAY &&
+    data.expire > nowSeconds + 3600
+  ) {
+    // Current time is >24h after capture, but URL still valid for >1h
+    console.warn(
+      `[S48] System time anomaly: URL captured ${Math.floor((nowSeconds - data.ts / 1000) / 3600)}h ago but still valid for ${Math.floor((data.expire - nowSeconds) / 3600)}h (typical: 6h lifetime). Clock may have moved forward.`,
+    );
+    // Don't invalidate — just log suspicion (could be legitimate long-lived URL)
+  }
+
+  // Compare Date.now() vs trusted time (detect if Date.now() was tampered)
+  const timeDiff = Math.abs(nowSeconds - trustedNowSeconds);
+  if (timeDiff > 300) {
+    // >5 minute discrepancy between Date.now() and performance.now()
+    console.warn(
+      `[S48] System time discrepancy: Date.now() differs from trusted time by ${timeDiff}s. Using trusted time for validation.`,
+    );
+    // Use trusted time for final decision
+    if (data.expire < trustedNowSeconds) {
+      return { valid: false, reason: "URL expired (trusted time)" };
+    }
+  }
+
+  return { valid: true };
+}
+
 // Build format objects from sniffed YouTube URLs using ITAG_MAP metadata.
 // Returns an array of format objects compatible with the existing format pipeline.
-function buildSniffedFormats(tabId) {
+// When videoId is provided, only returns formats for that specific video
+// (prevents Frankenstein mixes from multi-video embed pages).
+function buildSniffedFormats(tabId, videoId) {
   const tabSniffed = sniffedYouTubeUrls.get(tabId);
   if (!tabSniffed || tabSniffed.size === 0) return [];
 
   const formats = [];
   const now = Math.floor(Date.now() / 1000);
 
-  for (const [itag, data] of tabSniffed) {
-    // Skip expired URLs
-    if (data.expire && data.expire < now) continue;
+  for (const [sniffKey, data] of tabSniffed) {
+    // sniffKey format: "videoId:itag"
+    const itag = data.itag ?? parseInt(sniffKey.split(":").pop());
+
+    // Filter by videoId if specified — prevents mixing URLs from different videos
+    if (
+      videoId &&
+      data.videoId &&
+      data.videoId !== "unknown" &&
+      data.videoId !== videoId
+    ) {
+      continue;
+    }
+
+    // S48: Validate URL freshness with system time manipulation detection
+    const timeValidation = validateSniffedUrlTime(data, now);
+    if (!timeValidation.valid) {
+      console.warn(
+        `[S48] Skipping sniffed URL for itag ${itag}: ${timeValidation.reason}`,
+      );
+      continue;
+    }
 
     const lk = ITAG_MAP[itag];
 
@@ -5479,7 +7518,9 @@ function buildSniffedFormats(tabId) {
 // Replace format URLs with sniffed ones where itag matches.
 // This fixes formats that have correct metadata but broken URLs
 // (e.g. cipher worked but N-sig failed, leaving throttled n= values).
-function enrichFormatsWithSniffed(formats, tabId) {
+// When videoId is provided, only matches sniffed URLs for that specific video
+// to prevent replacing with URLs from a different embedded video.
+function enrichFormatsWithSniffed(formats, tabId, videoId) {
   const tabSniffed = sniffedYouTubeUrls.get(tabId);
   if (!tabSniffed || tabSniffed.size === 0) return 0;
 
@@ -5487,9 +7528,42 @@ function enrichFormatsWithSniffed(formats, tabId) {
   let replaced = 0;
 
   for (const fmt of formats) {
-    const sniffed = tabSniffed.get(fmt.itag);
+    // Try composite key "videoId:itag" first (specific video match)
+    let sniffed = null;
+    if (videoId) {
+      sniffed = tabSniffed.get(`${videoId}:${fmt.itag}`);
+    }
+    // Fallback: try "unknown:itag" for entries where videoId wasn't extractable
+    if (!sniffed) {
+      sniffed = tabSniffed.get(`unknown:${fmt.itag}`);
+    }
+    // Fallback: scan all entries for matching itag (backwards compat)
+    if (!sniffed) {
+      for (const [, data] of tabSniffed) {
+        if (data.itag === fmt.itag) {
+          // Only use if videoId matches or no filter
+          if (
+            !videoId ||
+            !data.videoId ||
+            data.videoId === "unknown" ||
+            data.videoId === videoId
+          ) {
+            sniffed = data;
+            break;
+          }
+        }
+      }
+    }
     if (!sniffed) continue;
-    if (sniffed.expire && sniffed.expire < now) continue;
+
+    // S48: Validate URL freshness with system time manipulation detection
+    const timeValidation = validateSniffedUrlTime(sniffed, now);
+    if (!timeValidation.valid) {
+      console.warn(
+        `[S48] Skipping sniffed URL replacement for itag ${fmt.itag}: ${timeValidation.reason}`,
+      );
+      continue;
+    }
 
     // Replace URL with sniffed version (already has correct cipher + N-sig)
     fmt.url = sniffed.url;
@@ -5633,6 +7707,23 @@ async function injectIframeHooks(tabId, frameId) {
             } catch {}
           }
 
+          // Relay blob video detections from generic-network-hook
+          if (
+            event.data.type === "__generic_extractor__" &&
+            event.data.isBlobVideo &&
+            event.data.blobUrl
+          ) {
+            try {
+              chrome.runtime.sendMessage({
+                action: "BLOB_VIDEO_DETECTED",
+                blobUrl: event.data.blobUrl,
+                blobType: event.data.blobType || "video/mp4",
+                blobSize: event.data.blobSize || 0,
+                frameUrl: window.location.href,
+              });
+            } catch {}
+          }
+
           // Also relay MAGIC_M3U8_DETECTION from iframes
           if (
             event.data.type === "MAGIC_M3U8_DETECTION" &&
@@ -5735,8 +7826,113 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   }
 });
 
+/**
+ * Fetch an HLS master playlist, parse its variants, and return per-quality
+ * format entries.  Falls back to an empty array if the URL points to a media
+ * playlist or the fetch fails.
+ */
+async function parseHLSVariants(masterUrl, mimeType) {
+  try {
+    const resp = await fetch(masterUrl, { cache: "no-cache" });
+    if (!resp.ok) return [];
+    const text = await resp.text();
+
+    // Not a master playlist — single bitrate stream
+    if (!text.includes("#EXT-X-STREAM-INF")) return [];
+
+    const baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
+    const lines = text.split("\n").map((l) => l.trim());
+    const variants = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith("#EXT-X-STREAM-INF:")) continue;
+
+      const attrStr = lines[i].substring("#EXT-X-STREAM-INF:".length);
+      const attrs = {};
+      // Simple attribute parser for BANDWIDTH, RESOLUTION, CODECS, etc.
+      for (const m of attrStr.matchAll(/([\w-]+)=(?:"([^"]*)"|([^,]*))/g)) {
+        attrs[m[1]] = m[2] !== undefined ? m[2] : m[3];
+      }
+
+      let url = null;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (lines[j] && !lines[j].startsWith("#")) {
+          url = lines[j];
+          break;
+        }
+      }
+      if (!url) continue;
+      // Resolve relative URLs
+      if (!/^https?:\/\//i.test(url)) {
+        url = url.startsWith("/")
+          ? new URL(url, masterUrl).href
+          : baseUrl + url;
+      }
+
+      const bw = parseInt(attrs.BANDWIDTH) || 0;
+      const res = attrs.RESOLUTION || "";
+      const [w, h] = res.split("x").map(Number);
+      const label = h ? `${h}p` : bw ? `${Math.round(bw / 1000)}k` : "Auto";
+
+      variants.push({
+        url,
+        bandwidth: bw,
+        width: w || 0,
+        height: h || 0,
+        resolution: res,
+        codecs: attrs.CODECS || "",
+        label,
+      });
+    }
+
+    if (variants.length === 0) return [];
+
+    // Sort by bandwidth descending (highest quality first)
+    variants.sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+
+    console.log(
+      `[BG] Parsed ${variants.length} HLS quality variants from master playlist`,
+    );
+
+    return variants.map((v, idx) => ({
+      url: v.url,
+      itag: `hls-${v.height || v.bandwidth || idx}`,
+      mimeType,
+      quality: v.label,
+      qualityLabel: `${v.label}${v.codecs ? " · " + v.codecs.split(",")[0] : ""}`,
+      width: v.width,
+      height: v.height,
+      bandwidth: v.bandwidth,
+      isVideo: true,
+      isMuxed: true,
+      ext: "mp4",
+      isHLS: true,
+    }));
+  } catch (e) {
+    console.warn("[BG] Failed to parse HLS master playlist:", e.message);
+    return [];
+  }
+}
+
 async function onSpecialistDetected(msg, tabId) {
   console.log("[BG] Specialist detected:", msg.protocol, "tab:", tabId);
+
+  // Discard stale detections from MAIN-world hooks that fired after
+  // an SPA navigation (S15 race condition). Compare the message's
+  // pageUrl against the tab's current URL.
+  if (msg.pageUrl && tabId) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.url && msg.pageUrl !== tab.url) {
+        console.debug(
+          `[BG] Dropping stale specialist detection: msg URL ${msg.pageUrl.substring(0, 60)} ≠ tab URL ${tab.url.substring(0, 60)}`,
+        );
+        return { success: false, error: "Stale detection (SPA navigated)" };
+      }
+    } catch {
+      // Tab may have closed — proceed anyway
+    }
+  }
 
   let formats = [];
   let videoId = null;
@@ -5786,6 +7982,25 @@ async function onSpecialistDetected(msg, tabId) {
             ext: f.ext || "mp4",
           });
         }
+      }
+    } else if (
+      (videoType === "HLS" || videoType === "M3U8") &&
+      /\.m3u8(\?|#|$)/i.test(videoUrl)
+    ) {
+      // Try to fetch master playlist and parse quality variants
+      formats = await parseHLSVariants(videoUrl, mimeType);
+      if (formats.length === 0) {
+        // Fallback: single format entry (media playlist or fetch failed)
+        formats.push({
+          url: videoUrl,
+          mimeType,
+          quality: "auto",
+          qualityLabel: "HLS (best quality)",
+          isVideo: true,
+          isMuxed: true,
+          ext: "mp4",
+          isHLS: true,
+        });
       }
     } else {
       formats.push({
@@ -6349,6 +8564,8 @@ function mergeSniffedStreamIntoTabData(tabId, stream) {
 }
 
 const SESSION_HEADER_BASE = 1000000;
+const SESSION_RULE_SAFETY_MARGIN = 500; // Trigger cleanup when within this margin of limit
+const MAX_SESSION_RULES = 5000; // Chrome's MAX_NUMBER_OF_SESSION_RULES
 let sessionHeaderCounter = 0;
 
 async function addSessionHeaders(urlPattern, headers) {
@@ -6364,6 +8581,35 @@ async function addSessionHeaders(urlPattern, headers) {
 
   if (requestHeaders.length === 0) return ruleId;
 
+  // Proactive cleanup: if approaching Chrome's 5000 session rule limit,
+  // purge old session header rules to prevent silent failures.
+  try {
+    const existingRules =
+      await chrome.declarativeNetRequest?.getSessionRules?.();
+    if (
+      existingRules &&
+      existingRules.length >= MAX_SESSION_RULES - SESSION_RULE_SAFETY_MARGIN
+    ) {
+      // Find session header rules (id >= SESSION_HEADER_BASE) that are likely orphaned
+      const sessionRuleIds = existingRules
+        .filter((r) => r.id >= SESSION_HEADER_BASE)
+        .map((r) => r.id)
+        .sort((a, b) => a - b);
+      // Keep the newest 100, purge the rest
+      const toRemove = sessionRuleIds.slice(0, sessionRuleIds.length - 100);
+      if (toRemove.length > 0) {
+        await chrome.declarativeNetRequest?.updateSessionRules?.({
+          removeRuleIds: toRemove,
+        });
+        console.warn(
+          `[BG] Purged ${toRemove.length} old session header rules (approaching ${MAX_SESSION_RULES} limit)`,
+        );
+      }
+    }
+  } catch {
+    // getSessionRules may not be available (Firefox)
+  }
+
   const rule = {
     id: ruleId,
     priority: 2,
@@ -6374,20 +8620,71 @@ async function addSessionHeaders(urlPattern, headers) {
     },
   };
 
-  await chrome.declarativeNetRequest.updateSessionRules({
-    addRules: [rule],
-  });
+  // S30 fix: CDN redirect chains (e.g., cdn.example.com → edge.akamai.net)
+  // cause auth headers to be stripped because the DNR rule only matches the
+  // original host.  Add a second, broader rule that catches redirect targets.
+  // We extract the path pattern from the original urlFilter and create a
+  // permissive rule for the same resource types.  Both rules are short-lived
+  // (removed after download) so the broad match is safe.
+  let redirectRuleId = null;
+  try {
+    // Extract just the host from the pattern for initiatorDomains
+    const hostMatch = urlPattern.match(/^\|\|([^/]+)/);
+    if (hostMatch) {
+      redirectRuleId = SESSION_HEADER_BASE + ++sessionHeaderCounter;
+      const redirectRule = {
+        id: redirectRuleId,
+        priority: 1, // lower priority than the host-specific rule
+        action: { type: "modifyHeaders", requestHeaders },
+        condition: {
+          // Broad filter — matches any media/XHR request initiated from our
+          // target domain.  This covers CDN edge redirects that switch hosts.
+          initiatorDomains: [hostMatch[1]],
+          resourceTypes: ["xmlhttprequest", "media", "other"],
+        },
+      };
+      await chrome.declarativeNetRequest.updateSessionRules?.({
+        addRules: [redirectRule],
+      });
+      console.log("[BG] Added redirect-covering rule, ruleId:", redirectRuleId);
+    }
+  } catch (e) {
+    console.warn("[BG] Failed to add redirect header rule:", e.message);
+    redirectRuleId = null;
+  }
+
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules?.({
+      addRules: [rule],
+    });
+  } catch (e) {
+    console.error(
+      `[BG] Failed to add session header rule ${ruleId}:`,
+      e.message,
+    );
+    return { primaryId: ruleId, redirectId: redirectRuleId };
+  }
 
   console.log("[BG] Added session headers, ruleId:", ruleId);
-  return ruleId;
+  return { primaryId: ruleId, redirectId: redirectRuleId };
 }
 
 async function removeSessionHeaders(ruleId) {
   if (!ruleId) return;
+  // S30 fix: ruleId may be an object { primaryId, redirectId } from the
+  // updated addSessionHeaders, or a plain number from legacy callers.
+  const ids = [];
+  if (typeof ruleId === "object" && ruleId !== null) {
+    if (ruleId.primaryId) ids.push(ruleId.primaryId);
+    if (ruleId.redirectId) ids.push(ruleId.redirectId);
+  } else {
+    ids.push(ruleId);
+  }
+  if (ids.length === 0) return;
   await chrome.declarativeNetRequest
-    .updateSessionRules({ removeRuleIds: [ruleId] })
+    ?.updateSessionRules({ removeRuleIds: ids })
     .catch(() => {});
-  console.log("[BG] Removed session header rule:", ruleId);
+  console.log("[BG] Removed session header rule(s):", ids);
 }
 
 async function handleWorkerDownload(msg) {
@@ -6400,6 +8697,9 @@ async function handleWorkerDownload(msg) {
 
   const downloadId =
     "dl_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+
+  // Keep the service worker alive for the duration of this download
+  startWorkerKeepalive();
 
   let sessionRuleId = null;
   if (headers && Object.keys(headers).length > 0) {
@@ -6421,6 +8721,7 @@ async function handleWorkerDownload(msg) {
       filename: sanitize(filename || "video.mp4"),
       headers: headers || {},
       sessionRuleId,
+      tabId, // S35 fix: Pass tabId for URL refresh
     },
     (response) => {
       if (chrome.runtime.lastError) {
@@ -6448,6 +8749,60 @@ async function handleWorkerDownload(msg) {
   });
 
   return { success: true, downloadId };
+}
+
+/**
+ * S35 fix: Refresh YouTube format URLs mid-download when they expire.
+ * Re-calls getFormats() for the tab and builds a URL map (old -> new).
+ */
+async function handleRefreshYouTubeUrls(msg) {
+  const { tabId, downloadId } = msg;
+
+  if (!tabId) {
+    console.warn("[BG] URL refresh requested but no tabId provided");
+    return { success: false, error: "No tabId" };
+  }
+
+  console.log(
+    `[BG] Refreshing YouTube URLs for tab ${tabId} (download ${downloadId})`,
+  );
+
+  try {
+    const data = tabData.get(tabId);
+    if (!data) {
+      return { success: false, error: "No tab data found" };
+    }
+
+    // Store old formats
+    const oldFormats = data.formats || [];
+
+    // Force fresh format resolution (bypass cache)
+    const freshData = await getFormats(data.url, tabId, data.videoId);
+
+    if (!freshData?.formats || freshData.formats.length === 0) {
+      return { success: false, error: "No fresh formats available" };
+    }
+
+    // Build URL map: old URL -> new URL by matching itag
+    const urlMap = {};
+    for (const oldFmt of oldFormats) {
+      const newFmt = freshData.formats.find((f) => f.itag === oldFmt.itag);
+      if (newFmt && newFmt.url !== oldFmt.url) {
+        urlMap[oldFmt.url] = newFmt.url;
+      }
+    }
+
+    console.log(`[BG] URL refresh: ${Object.keys(urlMap).length} URLs updated`);
+
+    // Update tabData with fresh formats
+    tabData.set(tabId, { ...data, ...freshData });
+    persistTabData();
+
+    return { success: true, urlMap };
+  } catch (err) {
+    console.error("[BG] URL refresh failed:", err);
+    return { success: false, error: err.message };
+  }
 }
 
 const NOTIF_TAG = "video_dl_";

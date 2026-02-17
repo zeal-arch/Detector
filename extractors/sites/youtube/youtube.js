@@ -75,11 +75,30 @@ class YouTubeExtractor extends BaseExtractor {
     if (this._injected) return;
     this._injected = true;
 
-    const s = document.createElement("script");
-    s.src = chrome.runtime.getURL("extractors/sites/youtube/inject.js");
-    s.onload = () => s.remove();
-    (document.head || document.documentElement).appendChild(s);
-    console.log(this.TAG, "inject.js injected into MAIN world");
+    try {
+      const s = document.createElement("script");
+      s.src = chrome.runtime.getURL("extractors/sites/youtube/inject.js");
+      s.onload = () => s.remove();
+
+      // S49 fix: Detect CSP violations when injecting into sandboxed iframes
+      s.onerror = () => {
+        console.error(
+          this.TAG,
+          "[S49] inject.js injection failed — likely CSP violation in sandboxed iframe. " +
+            "Extension will fall back to Tier 2 (InnerTube API), but premium formats may be unavailable.",
+        );
+      };
+
+      (document.head || document.documentElement).appendChild(s);
+      console.log(this.TAG, "inject.js injected into MAIN world");
+    } catch (error) {
+      console.error(
+        this.TAG,
+        "[S49] Script injection blocked:",
+        error.message,
+        "- iframe CSP or sandbox attribute prevents injection",
+      );
+    }
   }
 
   _onInjectMessage(e) {

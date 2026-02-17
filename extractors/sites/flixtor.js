@@ -158,7 +158,10 @@
           }
         }
       } catch (e) {
-        console.warn("[Flixtor] XHR intercept error:", e);
+        // Silence CSP/cross-origin DOMExceptions from third-party XHRs (e.g. JWPlayer entitlements)
+        if (!(e instanceof DOMException)) {
+          console.warn("[Flixtor] XHR intercept error:", e.message || e);
+        }
       }
     });
     return originalXHRSend.call(this, body);
