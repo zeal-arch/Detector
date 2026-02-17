@@ -2184,6 +2184,19 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         .catch((e) => respond({ error: e.message }));
       return true;
 
+    case "FETCH_PLAYER_JS":
+      // Relay fetch of player.js for inject.js (MAIN world).
+      // YouTube's page service worker blocks in-page XHR/fetch,
+      // but background.js (extension service worker) is unaffected.
+      fetch(msg.url, { credentials: "omit", cache: "force-cache" })
+        .then((r) => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.text();
+        })
+        .then((text) => respond({ text }))
+        .catch((e) => respond({ error: e.message }));
+      return true;
+
     case "EXTRACTION_STARTED":
       if (sender.tab?.id) {
         chrome.action.setBadgeText({ text: "...", tabId: sender.tab.id });

@@ -131,7 +131,42 @@
   }
 
   window.addEventListener("message", (e) => {
-    if (!e.data || e.data.type !== MAGIC) return;
+    if (!e.data) return;
+
+    // Handle player.js fetch relay request from inject.js (MAIN world)
+    // inject.js can't fetch player.js due to YouTube's SW → relay through background.js
+    if (e.data.type === MAGIC + "_fetch_request" && e.data.url) {
+      chrome.runtime
+        .sendMessage({
+          action: "FETCH_PLAYER_JS",
+          url: e.data.url,
+          requestId: e.data.requestId,
+        })
+        .then((resp) => {
+          window.postMessage(
+            {
+              type: MAGIC + "_fetch_response",
+              requestId: e.data.requestId,
+              text: resp && resp.text ? resp.text : null,
+              error: resp && resp.error ? resp.error : null,
+            },
+            "*",
+          );
+        })
+        .catch((err) => {
+          window.postMessage(
+            {
+              type: MAGIC + "_fetch_response",
+              requestId: e.data.requestId,
+              error: err.message || "relay failed",
+            },
+            "*",
+          );
+        });
+      return;
+    }
+
+    if (e.data.type !== MAGIC) return;
 
     const videoId = getVideoId();
     if (!videoId) return;

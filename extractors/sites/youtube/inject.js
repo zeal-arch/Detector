@@ -10,6 +10,88 @@
     "Running in hybrid mode (direct global access + code extraction fallback)",
   );
 
+  /**
+   * Wait for _yt_player to be populated with a specific property.
+   * YouTube loads player.js asynchronously; on fresh navigation the
+   * globals may not exist yet when we first try to resolve them.
+   * Returns true if the property appeared, false on timeout.
+   */
+  function waitForYTGlobal(name, timeoutMs) {
+    timeoutMs = timeoutMs || 8000;
+    return new Promise(function (resolve) {
+      // Already available?
+      if (resolveYTGlobal(name) !== undefined) {
+        return resolve(true);
+      }
+      var elapsed = 0;
+      var interval = 200;
+      var timer = setInterval(function () {
+        elapsed += interval;
+        if (resolveYTGlobal(name) !== undefined) {
+          clearInterval(timer);
+          resolve(true);
+          return;
+        }
+        if (elapsed >= timeoutMs) {
+          clearInterval(timer);
+          console.warn(
+            TAG,
+            "waitForYTGlobal timeout for:",
+            name,
+            "after",
+            timeoutMs,
+            "ms",
+          );
+          resolve(false);
+        }
+      }, interval);
+    });
+  }
+
+  /**
+   * Try to read player.js source from the browser's performance/resource
+   * cache (PerformanceResourceTiming). The script tag for base.js is
+   * loaded by YouTube itself — we can use the URL it loaded to fetch from
+   * the browser's HTTP cache rather than making a new network request.
+   */
+  function getPlayerJsUrlFromPage() {
+    try {
+      // Method 1: Check <script> tags for base.js URL
+      var scripts = document.querySelectorAll("script[src]");
+      for (var i = 0; i < scripts.length; i++) {
+        var src = scripts[i].src || "";
+        if (
+          src.indexOf("/s/player/") !== -1 &&
+          src.indexOf("/base.js") !== -1
+        ) {
+          return src;
+        }
+        if (
+          src.indexOf("/s/player/") !== -1 &&
+          src.indexOf("/player_ias") !== -1
+        ) {
+          return src;
+        }
+      }
+      // Method 2: Performance resource entries
+      if (typeof performance !== "undefined" && performance.getEntriesByType) {
+        var resources = performance.getEntriesByType("resource");
+        for (var j = 0; j < resources.length; j++) {
+          var rName = resources[j].name || "";
+          if (
+            rName.indexOf("/s/player/") !== -1 &&
+            rName.indexOf("/base.js") !== -1
+          ) {
+            return rName;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(TAG, "getPlayerJsUrlFromPage error:", e.message);
+    }
+    return null;
+  }
+
   function escRe(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
@@ -777,8 +859,57 @@
       });
   }
 
+  /**
+   * Request player.js content from background.js via content script relay.
+   * This bypasses YouTube's service worker which blocks in-page XHR/fetch.
+   * inject.js (MAIN) → postMessage → content.js (ISOLATED) → chrome.runtime.sendMessage → background.js
+   */
+  function fetchPlayerJsViaBackground(url) {
+    return new Promise(function (resolve, reject) {
+      var requestId = "__ytdl_fetch_" + Date.now() + "_" + Math.random();
+      var timeout = setTimeout(function () {
+        window.removeEventListener("message", handler);
+        reject(new Error("Player.js background relay timeout (10s)"));
+      }, 10000);
+
+      function handler(e) {
+        if (
+          e.data &&
+          e.data.type === MAGIC + "_fetch_response" &&
+          e.data.requestId === requestId
+        ) {
+          window.removeEventListener("message", handler);
+          clearTimeout(timeout);
+          if (e.data.error) {
+            reject(new Error("Background fetch: " + e.data.error));
+          } else if (e.data.text && e.data.text.length > 1000) {
+            resolve(e.data.text);
+          } else {
+            reject(
+              new Error(
+                "Background fetch response too small (" +
+                  (e.data.text || "").length +
+                  " bytes)",
+              ),
+            );
+          }
+        }
+      }
+
+      window.addEventListener("message", handler);
+      window.postMessage(
+        {
+          type: MAGIC + "_fetch_request",
+          requestId: requestId,
+          url: url,
+        },
+        window.location.origin,
+      );
+    });
+  }
+
   async function fetchPlayerJs(url) {
-    var maxRetries = 4;
+    var maxRetries = 5;
     var lastErr = null;
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
@@ -793,7 +924,7 @@
               ")",
           );
           return await fetchPlayerJsFetch(url);
-        } else {
+        } else if (attempt === 4) {
           console.log(
             TAG,
             "Trying fetch() API with no-cache for player.js (attempt " +
@@ -816,6 +947,16 @@
               }
               return text;
             });
+        } else {
+          // Attempt 5: Relay through background.js service worker
+          // Background.js is not affected by YouTube's page service worker
+          console.log(
+            TAG,
+            "Trying background.js relay for player.js (attempt " +
+              attempt +
+              ")",
+          );
+          return await fetchPlayerJsViaBackground(url);
         }
       } catch (e) {
         lastErr = e;
@@ -1645,17 +1786,36 @@
       return playerCache[playerUrl];
     }
 
-    console.log(TAG, "Fetching player.js:", playerUrl);
+    // Try to discover the real player.js URL from the page if we don't have one
+    var effectiveUrl = playerUrl;
+    var pageUrl = getPlayerJsUrlFromPage();
+    if (pageUrl) {
+      console.log(TAG, "Found player.js URL from page:", pageUrl.substring(0, 80));
+      effectiveUrl = pageUrl;
+    }
+
+    console.log(TAG, "Fetching player.js:", effectiveUrl);
     var js;
     try {
-      js = await fetchPlayerJs(playerUrl);
+      js = await fetchPlayerJs(effectiveUrl);
     } catch (e) {
-      console.error(
-        TAG,
-        "Failed to fetch player.js after all retries:",
-        e.message,
-      );
-      return { cipher: null, nSig: null, sts: null, fetchFailed: true };
+      // If the primary URL failed and we have a page-discovered URL, try that
+      if (pageUrl && pageUrl !== effectiveUrl) {
+        console.log(TAG, "Retrying with page-discovered URL:", pageUrl.substring(0, 80));
+        try {
+          js = await fetchPlayerJs(pageUrl);
+        } catch (e2) {
+          console.error(TAG, "Fallback fetch also failed:", e2.message);
+        }
+      }
+      if (!js) {
+        console.error(
+          TAG,
+          "Failed to fetch player.js after all retries:",
+          e.message,
+        );
+        return { cipher: null, nSig: null, sts: null, fetchFailed: true };
+      }
     }
     if (!js || typeof js !== "string" || js.length < 1000) {
       console.warn(
@@ -1707,6 +1867,10 @@
     var externalDeps = findExternalDeps(js);
 
     // === Step 2: Try direct global access first (fast, reliable) ===
+    //
+    // On fresh navigation (typing youtube.com), the inline <script> tags
+    // that define cipher helper (eO) and N-sig wrapper (R8K) may not have
+    // executed yet. Poll for them to appear in _yt_player / window.
     var cipherActions = null;
     var nSigFn = null;
 
@@ -1715,10 +1879,53 @@
         externalDeps.cipherHelper,
         externalDeps.cipherOps,
       );
+      // If not found immediately, wait for the global to appear
+      if (!cipherActions) {
+        console.log(
+          TAG,
+          "Cipher helper not ready yet, waiting for:",
+          externalDeps.cipherHelper,
+        );
+        var cipherReady = await waitForYTGlobal(
+          externalDeps.cipherHelper,
+          6000,
+        );
+        if (cipherReady) {
+          console.log(
+            TAG,
+            "Cipher helper became available after polling:",
+            externalDeps.cipherHelper,
+          );
+          cipherActions = buildCipherActionsFromGlobal(
+            externalDeps.cipherHelper,
+            externalDeps.cipherOps,
+          );
+        }
+      }
     }
 
     if (externalDeps.nSigWrapper) {
       nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
+      // If not found immediately, wait for the global to appear
+      if (!nSigFn) {
+        console.log(
+          TAG,
+          "N-sig wrapper not ready yet, waiting for:",
+          externalDeps.nSigWrapper,
+        );
+        var nSigReady = await waitForYTGlobal(
+          externalDeps.nSigWrapper,
+          6000,
+        );
+        if (nSigReady) {
+          console.log(
+            TAG,
+            "N-sig wrapper became available after polling:",
+            externalDeps.nSigWrapper,
+          );
+          nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
+        }
+      }
     }
 
     // === Step 3: Fallback to code extraction (legacy approach) ===
@@ -1984,12 +2191,44 @@
 
   async function processVideo() {
     console.log(TAG, "Processing video...");
+
+    // On fresh navigation, page globals may not exist yet.
+    // Wait briefly for ytInitialPlayerResponse or the player element.
+    if (
+      typeof ytInitialPlayerResponse === "undefined" &&
+      !document.getElementById("movie_player")
+    ) {
+      console.log(TAG, "Page not ready yet, waiting for player data...");
+      await new Promise(function (resolve) {
+        var elapsed = 0;
+        var timer = setInterval(function () {
+          elapsed += 300;
+          try {
+            if (
+              typeof ytInitialPlayerResponse !== "undefined" ||
+              document.getElementById("movie_player") ||
+              (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("PLAYER_JS_URL"))
+            ) {
+              clearInterval(timer);
+              resolve();
+              return;
+            }
+          } catch (e) {}
+          if (elapsed >= 5000) {
+            clearInterval(timer);
+            console.warn(TAG, "Timed out waiting for page data");
+            resolve();
+          }
+        }, 300);
+      });
+    }
+
     var data = extractPageData();
 
     if (!data.playerResponse) {
       console.log(TAG, "No playerResponse on page, sending raw data");
       sendToContentScript(data);
-      return;
+      return { hasFormats: false, directCipher: false, directNSig: false, fetchFailed: false };
     }
 
     if (!data.playerUrl) {
@@ -1998,7 +2237,7 @@
         "No playerUrl, sending playerResponse without deciphering",
       );
       sendToContentScript(data);
-      return;
+      return { hasFormats: false, directCipher: false, directNSig: false, fetchFailed: false };
     }
 
     try {
@@ -2065,18 +2304,65 @@
     }
 
     sendToContentScript(data);
+
+    // Return success info for retry logic
+    return {
+      hasFormats: !!(data.resolvedFormats && data.resolvedFormats.length > 0),
+      directCipher: !!data.directCipher,
+      directNSig: !!data.directNSig,
+      fetchFailed: !!(playerData && playerData.fetchFailed),
+    };
   }
 
   var _processTimer = null;
   var _navCounter = 0;
+  var _retryCount = 0;
+  var _maxAutoRetries = 2;
 
   function scheduleProcess(delay) {
     if (_processTimer) clearTimeout(_processTimer);
     var myNav = ++_navCounter;
+    _retryCount = 0; // Reset retry count on new navigation
     _processTimer = setTimeout(function () {
       _processTimer = null;
       if (myNav !== _navCounter) return;
-      processVideo();
+      processVideo().then(function (result) {
+        if (myNav !== _navCounter) return;
+        // Auto-retry if we failed to get formats or globals weren't ready
+        if (
+          result &&
+          !result.hasFormats &&
+          _retryCount < _maxAutoRetries
+        ) {
+          _retryCount++;
+          var retryDelay = 3000 * _retryCount; // 3s, 6s
+          console.log(
+            TAG,
+            "Auto-retry " +
+              _retryCount +
+              "/" +
+              _maxAutoRetries +
+              " in " +
+              retryDelay +
+              "ms (formats:" +
+              result.hasFormats +
+              " cipher:" +
+              result.directCipher +
+              " nSig:" +
+              result.directNSig +
+              " fetchFailed:" +
+              result.fetchFailed +
+              ")",
+          );
+          // Clear player cache so we re-fetch/re-resolve
+          playerCache = {};
+          _processTimer = setTimeout(function () {
+            _processTimer = null;
+            if (myNav !== _navCounter) return;
+            processVideo();
+          }, retryDelay);
+        }
+      }).catch(function () {});
     }, delay);
   }
 
