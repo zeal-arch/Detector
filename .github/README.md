@@ -4,6 +4,8 @@ A Chrome extension that detects and downloads videos, audio, and other media fro
 
 Please respect copyright laws and terms of service when using this.
 
+THIS IS STILL UNDER ACTIVE DEVELOPMENT. Some features may be buggy or not work on all sites. If you find any issues, please open an issue on GitHub. IAM A STUDENT LOOKING TO LEARN (ALSO AN INTERNSHIP), NOT A PROFESSIONAL DEVELOPER. THANKS FOR YOUR UNDERSTANDING.
+
 ## What it does
 
 - Finds video and audio on a page automatically (no need to paste URLs)
