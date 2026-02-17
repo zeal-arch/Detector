@@ -84,10 +84,48 @@
   }
 
   /**
+   * Resolve a name from YouTube's global scope.
+   * Checks window[name] first, then _yt_player[name].
+   * YouTube 2025+ defines most player globals inside _yt_player namespace.
+   */
+  function resolveYTGlobal(name) {
+    if (typeof name !== "string" || !name) return undefined;
+    // Direct window global (legacy)
+    try {
+      if (typeof window[name] !== "undefined" && window[name] !== null) {
+        return window[name];
+      }
+    } catch (e) {}
+    // _yt_player namespace (2025+ architecture)
+    try {
+      if (
+        typeof _yt_player !== "undefined" &&
+        _yt_player &&
+        typeof _yt_player[name] !== "undefined" &&
+        _yt_player[name] !== null
+      ) {
+        return _yt_player[name];
+      }
+    } catch (e) {}
+    // window._yt_player fallback
+    try {
+      if (
+        window._yt_player &&
+        typeof window._yt_player[name] !== "undefined" &&
+        window._yt_player[name] !== null
+      ) {
+        return window._yt_player[name];
+      }
+    } catch (e) {}
+    return undefined;
+  }
+
+  /**
    * Find external dependency names from player.js code.
    * YouTube 2025+ splits key functions between player.js (base.js) and inline scripts.
    * The cipher helper (e.g., eO) and N-sig wrapper (e.g., R8K) are defined as
-   * GLOBAL variables in inline <script> tags, then referenced inside the player IIFE.
+   * properties of _yt_player (or global variables) in inline <script> tags,
+   * then referenced inside the player IIFE.
    */
   function findExternalDeps(js) {
     var result = {
@@ -195,9 +233,10 @@
         ) {
           // Check if the candidate is an array wrapper [0] or direct func
           var candidateName = ncm[1];
-          // Skip builtins and common false positives
+          // Skip JS keywords and builtins (but NOT single-letter names —
+          // YouTube minification uses them as valid wrapper names)
           if (
-            /^(new|if|for|while|return|var|let|const|Math|String|Array|Object|g|b|h|R)$/.test(
+            /^(new|if|for|while|return|var|let|const|Math|String|Array|Object|Number|JSON|Boolean)$/.test(
               candidateName,
             )
           )
@@ -262,19 +301,24 @@
       );
     }
     if (result.cipherHelper) {
+      var chResolved = resolveYTGlobal(result.cipherHelper);
       console.log(
         TAG,
         "[DIAG] Cipher helper:",
         result.cipherHelper,
-        "exists as global?",
+        "| window:",
         typeof window[result.cipherHelper],
+        "| _yt_player:",
+        typeof (window._yt_player || {})[result.cipherHelper],
+        "| resolved:",
+        typeof chResolved,
       );
-      if (window[result.cipherHelper]) {
+      if (chResolved && typeof chResolved === "object") {
         try {
           console.log(
             TAG,
             "[DIAG] Cipher helper methods:",
-            Object.keys(window[result.cipherHelper]),
+            Object.keys(chResolved),
           );
         } catch (e) {}
       }
@@ -286,23 +330,25 @@
       );
     }
     if (result.nSigWrapper) {
+      var nwResolved = resolveYTGlobal(result.nSigWrapper);
       console.log(
         TAG,
         "[DIAG] N-sig wrapper:",
         result.nSigWrapper,
-        "exists as global?",
+        "| window:",
         typeof window[result.nSigWrapper],
+        "| _yt_player:",
+        typeof (window._yt_player || {})[result.nSigWrapper],
+        "| resolved:",
+        typeof nwResolved,
       );
-      if (
-        window[result.nSigWrapper] &&
-        Array.isArray(window[result.nSigWrapper])
-      ) {
+      if (nwResolved && Array.isArray(nwResolved)) {
         console.log(
           TAG,
           "[DIAG] N-sig wrapper length:",
-          window[result.nSigWrapper].length,
+          nwResolved.length,
           "[0] type:",
-          typeof window[result.nSigWrapper][0],
+          typeof nwResolved[0],
         );
       }
     } else {
@@ -345,9 +391,23 @@
       var test = ["A", "B", "C", "D", "E", "F", "G", "H"];
       var a = test.slice();
       method(a, 3);
-      if (a.length < test.length) return "splice";
+      if (a.length < test.length) {
+        // Distinguish splice (mutates in-place) from slice (returns new)
+        // splice: a is now shorter; slice: a unchanged but result is shorter
+        return "splice";
+      }
       if (a[0] === test[3] && a[3] === test[0]) return "swap";
       if (a[0] === test[test.length - 1]) return "reverse";
+      // Check for slice: method returns a new array starting at index N
+      var c = test.slice();
+      var sliceResult = method(c, 3);
+      if (
+        Array.isArray(sliceResult) &&
+        sliceResult.length === test.length - 3 &&
+        sliceResult[0] === test[3]
+      ) {
+        return "slice";
+      }
       // Try with different arg to distinguish swap from reverse
       var b = test.slice();
       method(b, 1);
@@ -365,11 +425,23 @@
    */
   function buildCipherActionsFromGlobal(helperName, ops) {
     try {
-      var helper = window[helperName];
+      var helper = resolveYTGlobal(helperName);
       if (!helper || typeof helper !== "object") {
-        console.warn(TAG, "Cipher helper not found as global:", helperName);
+        console.warn(
+          TAG,
+          "Cipher helper not found as global or _yt_player property:",
+          helperName,
+        );
         return null;
       }
+      console.log(
+        TAG,
+        "Cipher helper resolved:",
+        helperName,
+        "(source:",
+        window[helperName] ? "window" : "_yt_player",
+        ")",
+      );
 
       var actions = [];
       var methodTypes = {};
@@ -441,16 +513,44 @@
    */
   function getNSigFromGlobal(wrapperName) {
     try {
-      var wrapper = window[wrapperName];
+      var wrapper = resolveYTGlobal(wrapperName);
       if (
         wrapper &&
         Array.isArray(wrapper) &&
         typeof wrapper[0] === "function"
       ) {
-        console.log(TAG, "N-sig function found via global:", wrapperName);
+        console.log(
+          TAG,
+          "N-sig function found via:",
+          wrapperName,
+          "(source:",
+          window[wrapperName] ? "window" : "_yt_player",
+          ")",
+        );
         return wrapper[0];
       }
-      console.warn(TAG, "N-sig wrapper not found or invalid:", wrapperName);
+      // Also check if it's a direct function (not wrapped in array)
+      if (wrapper && typeof wrapper === "function") {
+        console.log(
+          TAG,
+          "N-sig found as direct function (not array wrapped):",
+          wrapperName,
+        );
+        return wrapper;
+      }
+      console.warn(
+        TAG,
+        "N-sig wrapper not found or invalid:",
+        wrapperName,
+        "| window[",
+        wrapperName,
+        "]:",
+        typeof window[wrapperName],
+        "| _yt_player[",
+        wrapperName,
+        "]:",
+        typeof (window._yt_player || {})[wrapperName],
+      );
       return null;
     } catch (e) {
       console.warn(TAG, "getNSigFromGlobal error:", e.message);
@@ -466,20 +566,32 @@
   function extractCipherHelperFromPage(helperName) {
     try {
       var scripts = document.querySelectorAll("script:not([src])");
+      var hEsc = escRe(helperName);
       for (var i = 0; i < scripts.length; i++) {
         var text = scripts[i].textContent;
         if (!text || text.length < 10) continue;
 
         // Look for: var HELPER = { ... } or HELPER = { ... }
-        var re = new RegExp(
-          "(?:var\\s+)?" + escRe(helperName) + "\\s*=\\s*\\{",
-        );
+        var re = new RegExp("(?:var\\s+)?" + hEsc + "\\s*=\\s*\\{");
         var m = re.exec(text);
         if (m) {
           var braceIdx = m.index + m[0].lastIndexOf("{");
           var block = extractBraceBlock(text, braceIdx);
           if (block) {
             return "var " + helperName + "=" + block + ";";
+          }
+        }
+
+        // Also look for _yt_player.HELPER = { ... } or g.HELPER = { ... }
+        var nsRe = new RegExp(
+          "(?:_yt_player|g)\\s*\\.\\s*" + hEsc + "\\s*=\\s*\\{",
+        );
+        var nsm = nsRe.exec(text);
+        if (nsm) {
+          var nsBraceIdx = nsm.index + nsm[0].lastIndexOf("{");
+          var nsBlock = extractBraceBlock(text, nsBraceIdx);
+          if (nsBlock) {
+            return "var " + helperName + "=" + nsBlock + ";";
           }
         }
       }
@@ -496,19 +608,31 @@
   function extractNSigWrapperFromPage(wrapperName) {
     try {
       var scripts = document.querySelectorAll("script:not([src])");
+      var wEsc = escRe(wrapperName);
       for (var i = 0; i < scripts.length; i++) {
         var text = scripts[i].textContent;
         if (!text || text.length < 10) continue;
 
-        var re = new RegExp(
-          "(?:var\\s+)?" + escRe(wrapperName) + "\\s*=\\s*\\[",
-        );
+        var re = new RegExp("(?:var\\s+)?" + wEsc + "\\s*=\\s*\\[");
         var m = re.exec(text);
         if (m) {
           var bracketIdx = m.index + m[0].lastIndexOf("[");
           var block = extractBracketBlock(text, bracketIdx);
           if (block) {
             return "var " + wrapperName + "=" + block + ";";
+          }
+        }
+
+        // Also look for _yt_player.WRAPPER = [ ... ] or g.WRAPPER = [ ... ]
+        var nsRe = new RegExp(
+          "(?:_yt_player|g)\\s*\\.\\s*" + wEsc + "\\s*=\\s*\\[",
+        );
+        var nsm = nsRe.exec(text);
+        if (nsm) {
+          var nsBracketIdx = nsm.index + nsm[0].lastIndexOf("[");
+          var nsBlock = extractBracketBlock(text, nsBracketIdx);
+          if (nsBlock) {
+            return "var " + wrapperName + "=" + nsBlock + ";";
           }
         }
       }

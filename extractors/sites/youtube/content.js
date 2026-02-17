@@ -1,6 +1,8 @@
 (() => {
   "use strict";
 
+  console.log("[YT-DL] Content script STARTED (immediate log)");
+
   const MAGIC = "__ytdl_ext__";
   let lastVideoId = null;
   let injected = false;

@@ -19,7 +19,25 @@
     "content_security_policy": {
         "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
     },
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "detector@m3u8-video-downloader",
+            "strict_min_version": "115.0"
+        }
+    },
     "background": {
+        "scripts": [
+            "lib/drm-detection.js",
+            "lib/compat.js",
+            "lib/widevine-proto.js",
+            "lib/mp4-parser.js",
+            "lib/cenc-decryptor.js",
+            "lib/manifest-parser-drm.js",
+            "lib/remote-cdm.js",
+            "lib/drm-handler.js",
+            "extractors/site-map.js",
+            "background.js"
+        ],
         "service_worker": "background.js"
     },
     "permissions": [
@@ -244,6 +262,16 @@
         },
         {
             "matches": [
+                "<all_urls>"
+            ],
+            "js": [
+                "content/bridge.js"
+            ],
+            "run_at": "document_start",
+            "all_frames": false
+        },
+        {
+            "matches": [
                 "*://*.twitter.com/*",
                 "*://*.x.com/*"
             ],
@@ -305,6 +333,7 @@
         },
         {
             "resources": [
+                "content/eme-interceptor.js",
                 "icons/*",
                 "hooks/*.js",
                 "workers/download-worker.js",

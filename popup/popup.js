@@ -65,9 +65,12 @@ function getContainer(f) {
 
 function escapeHtml(str) {
   if (!str) return "";
-  const d = document.createElement("div");
-  d.textContent = str;
-  return d.innerHTML;
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
 }
 
 /**
@@ -268,14 +271,17 @@ function renderVideo(info) {
     title?.substring(0, 40),
   );
 
-  // DRM Warning
-  const drmWarning = drmDetected
-    ? `
+  // DRM Warning + Key Extraction UI
+  let drmSection = "";
+  if (drmDetected) {
+    drmSection = `
     <div class="drm-warning">
       <span class="drm-icon">🔒</span>
       <span class="drm-text">DRM Protected${drmType ? ` (${drmType})` : ""}${drmConfidence ? ` - ${drmConfidence} confidence` : ""}</span>
-    </div>`
-    : "";
+    </div>`;
+  }
+  // We'll append DRM key info after init fetches DRM state
+  const drmWarning = drmSection;
 
   // Login hint for YouTube
   const loginHint =
@@ -366,6 +372,7 @@ function renderVideo(info) {
             ${author ? `<span class="video-meta-tag">${escapeHtml(author)}</span>` : ""}
             ${info.clientUsed ? `<span class="video-meta-tag">· ${escapeHtml(formatSourceLabel(info.clientUsed))}</span>` : ""}
           </div>
+          ${info.nSigFailed ? `<div class="drm-warning" style="color:#e8a735;font-size:11px;margin-top:3px;">⚠ N-sig transform failed — downloads may be slow (throttled)</div>` : ""}
           ${drmWarning}
           ${loginHint}
         </div>
@@ -485,6 +492,7 @@ function renderVideo(info) {
             ${author ? `<span class="video-meta-tag">${escapeHtml(author)}</span>` : ""}
             ${info.clientUsed ? `<span class="video-meta-tag">· ${escapeHtml(formatSourceLabel(info.clientUsed))}</span>` : ""}
           </div>
+          ${info.nSigFailed ? `<div class="drm-warning" style="color:#e8a735;font-size:11px;margin-top:3px;">⚠ N-sig transform failed — downloads may be slow (throttled)</div>` : ""}
           ${drmWarning}
           ${loginHint}
         </div>
@@ -559,9 +567,34 @@ function renderSniffedStreams(streams) {
 function appendSniffedStreams(streams) {
   if (!streams || streams.length === 0) return;
 
-  const hls = streams.filter((s) => s.type === "hls");
-  const dash = streams.filter((s) => s.type === "dash");
-  const direct = streams.filter((s) => s.type === "direct");
+  // Deduplicate: remove sniffed streams whose URL already appears in VIDEO_DETECTED formats
+  const detectedUrls = new Set();
+  for (const f of currentFormats) {
+    if (f.url) {
+      try {
+        // Compare by origin+pathname to ignore query params differences
+        const u = new URL(f.url);
+        detectedUrls.add(u.origin + u.pathname);
+      } catch {
+        detectedUrls.add(f.url);
+      }
+    }
+  }
+
+  const dedupedStreams = streams.filter((s) => {
+    try {
+      const u = new URL(s.url);
+      return !detectedUrls.has(u.origin + u.pathname);
+    } catch {
+      return !detectedUrls.has(s.url);
+    }
+  });
+
+  if (dedupedStreams.length === 0) return;
+
+  const hls = dedupedStreams.filter((s) => s.type === "hls");
+  const dash = dedupedStreams.filter((s) => s.type === "dash");
+  const direct = dedupedStreams.filter((s) => s.type === "direct");
 
   let html = '<div class="section-divider">Detected Streams</div>';
   for (const s of hls) html += renderStreamItem(s);
@@ -575,20 +608,26 @@ function appendSniffedStreams(streams) {
 }
 
 function renderStreamItem(stream) {
-  const typeLabel = stream.type.toUpperCase();
-  const urlDisplay = shortenUrl(stream.url, 42);
+  const typeLabel = stream.isBlobUrl ? "BLOB" : stream.type.toUpperCase();
+  const urlDisplay = stream.isBlobUrl
+    ? "Blob video (page-scoped)"
+    : shortenUrl(stream.url, 42);
   const sizeDisplay = stream.size > 0 ? formatSize(stream.size) : "";
-  const btnLabel =
-    stream.type === "hls" || stream.type === "dash" ? "Download" : "Save";
+  const btnLabel = stream.isBlobUrl
+    ? "Save Blob"
+    : stream.type === "hls" || stream.type === "dash"
+      ? "Download"
+      : "Save";
+  const badgeClass = stream.isBlobUrl ? "direct blob" : stream.type;
 
   return `
     <div class="stream-card">
-      <span class="stream-badge ${stream.type}">${typeLabel}</span>
+      <span class="stream-badge ${badgeClass}">${typeLabel}</span>
       <div class="stream-details">
         <div class="stream-url" title="${escapeHtml(stream.url)}">${escapeHtml(urlDisplay)}</div>
-        <div class="stream-meta">${escapeHtml(stream.contentType || "")}${sizeDisplay ? " · " + sizeDisplay : ""}</div>
+        <div class="stream-meta">${escapeHtml(stream.contentType || "")}${sizeDisplay ? " · " + sizeDisplay : ""}${stream.isBlobUrl ? " · requires page context" : ""}</div>
       </div>
-      <button class="stream-dl-btn" data-url="${escapeHtml(stream.url)}" data-type="${stream.type}">${btnLabel}</button>
+      <button class="stream-dl-btn" data-url="${escapeHtml(stream.url)}" data-type="${stream.type}"${stream.isBlobUrl ? ' data-blob="true"' : ""}>${btnLabel}</button>
     </div>`;
 }
 
@@ -799,6 +838,8 @@ function resetDownloadUI() {
     btn.innerHTML = ICONS.download;
     btn.disabled = false;
     btn.onclick = null;
+    // Remove first to prevent duplicate listeners from repeated resets
+    btn.removeEventListener("click", handleDownloadClick);
     btn.addEventListener("click", handleDownloadClick);
   }
   if (select) select.disabled = false;
@@ -819,11 +860,26 @@ function attachStreamDownloadHandlers() {
       e.stopPropagation();
       const url = btn.dataset.url;
       const type = btn.dataset.type;
+      const isBlob = btn.dataset.blob === "true";
       btn.disabled = true;
       btn.textContent = "Starting...";
 
       try {
-        if (type === "hls" || type === "dash") {
+        if (isBlob) {
+          // Blob URLs require page-context download via content script injection
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const resp = await chrome.runtime.sendMessage({
+            action: "DOWNLOAD_BLOB",
+            blobUrl: url,
+            tabId: tab?.id,
+            filename: "video.mp4",
+          });
+          btn.textContent = resp?.success ? "Done!" : (resp?.error || "Failed");
+          setTimeout(() => {
+            btn.textContent = "Save Blob";
+            btn.disabled = false;
+          }, 3000);
+        } else if (type === "hls" || type === "dash") {
           const resp = await chrome.runtime.sendMessage({
             action: "START_WORKER_DOWNLOAD",
             url,
@@ -857,7 +913,7 @@ function attachStreamDownloadHandlers() {
         console.error("Stream download error:", err);
         btn.textContent = "Error";
         setTimeout(() => {
-          btn.textContent =
+          btn.textContent = isBlob ? "Save Blob" :
             type === "hls" || type === "dash" ? "Download" : "Save";
           btn.disabled = false;
         }, 3000);
@@ -1199,6 +1255,7 @@ async function init() {
 
       if (!videoId) {
         renderNoVideo();
+        await showActiveDownloads();
         return;
       }
 
@@ -1210,6 +1267,7 @@ async function init() {
 
       if (response?.error) {
         renderError("Failed to get video info", response.error);
+        await showActiveDownloads();
         return;
       }
 
@@ -1386,6 +1444,9 @@ async function init() {
   } catch (error) {
     console.error("Popup error:", error);
     renderError("Error", error.message);
+    try {
+      await showActiveDownloads();
+    } catch {}
   }
 }
 
@@ -1396,17 +1457,26 @@ document.getElementById("settingsBtn")?.addEventListener("click", () => {
 document.getElementById("refreshBtn")?.addEventListener("click", () => {
   currentView = "list";
   document.getElementById("settingsBtn")?.classList.remove("active");
-  init();
+  init()
+    .then(() => fetchAndShowDrmState())
+    .catch(() => {});
 });
 
 document.getElementById("noVideoBtn")?.addEventListener("click", () => {
   currentView = "list";
   document.getElementById("settingsBtn")?.classList.remove("active");
-  init();
+  init()
+    .then(() => fetchAndShowDrmState())
+    .catch(() => {});
 });
 
 document.getElementById("openFolderBtn")?.addEventListener("click", () => {
-  chrome.tabs.create({ url: "chrome://downloads/" });
+  const _isFirefox =
+    typeof browser !== "undefined" && !!browser.runtime?.getBrowserInfo;
+  const downloadsUrl = _isFirefox ? "about:downloads" : "chrome://downloads/";
+  (typeof browser !== "undefined" ? browser : chrome).tabs.create({
+    url: downloadsUrl,
+  });
 });
 
 document.getElementById("clearAllBtn")?.addEventListener("click", async () => {
@@ -1422,7 +1492,9 @@ document.getElementById("clearAllBtn")?.addEventListener("click", async () => {
     downloadPollTimer = null;
   }
   activeMergeInProgress = false;
-  init();
+  init()
+    .then(() => fetchAndShowDrmState())
+    .catch(() => {});
 });
 
 // ========== Update Banner Logic ==========
@@ -1459,4 +1531,186 @@ async function checkAndShowUpdate() {
 checkAndShowUpdate();
 // =============================================
 
-init();
+// ─── DRM Key Extraction UI ────────────────────────────────────────
+// Fetches DRM state from DRMHandler and displays keys / status
+// in the popup. Also handles "Copy Keys" and "Extract Keys" actions.
+
+// Cross-browser API detection (popup context)
+const _api =
+  typeof browser !== "undefined" && browser.runtime ? browser : chrome;
+
+async function fetchAndShowDrmState() {
+  try {
+    const [tab] = await _api.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (!tab) return;
+
+    const drmState = await _api.runtime.sendMessage({
+      type: "GET_DRM_STATE",
+      tabId: tab.id,
+    });
+
+    if (!drmState) return;
+
+    // Find or create the DRM panel container
+    let drmPanel = document.getElementById("drmPanel");
+
+    // Only show if DRM was detected or keys exist
+    if (!drmState.keySystem && (!drmState.keys || drmState.keys.length === 0)) {
+      if (drmPanel) drmPanel.style.display = "none";
+      return;
+    }
+
+    if (!drmPanel) {
+      drmPanel = document.createElement("div");
+      drmPanel.id = "drmPanel";
+      drmPanel.className = "drm-panel";
+      // Insert after the drm-warning if present, else at start of content
+      const existingWarning = document.querySelector(".drm-warning");
+      if (existingWarning && existingWarning.parentNode) {
+        existingWarning.parentNode.insertBefore(
+          drmPanel,
+          existingWarning.nextSibling,
+        );
+      } else {
+        const contentEl = document.getElementById("content");
+        if (contentEl && contentEl.firstChild) {
+          contentEl.insertBefore(drmPanel, contentEl.firstChild);
+        }
+      }
+    }
+
+    drmPanel.style.display = "block";
+
+    const hasKeys = drmState.keys && drmState.keys.length > 0;
+    const keySystem = drmState.drmName || drmState.keySystem || "Unknown DRM";
+
+    let keysHtml = "";
+    if (hasKeys) {
+      const keyLines = drmState.keys
+        .map((k) => {
+          const kid = (k.kid || k.key_id || "").substring(0, 16);
+          const key = (k.key || k.content_key || "").substring(0, 16);
+          return `<div class="drm-key-row"><code>${kid}…:${key}…</code></div>`;
+        })
+        .join("");
+      keysHtml = `
+        <div class="drm-keys-found">
+          <div class="drm-keys-header">
+            <span>🔑 ${drmState.keys.length} key${drmState.keys.length > 1 ? "s" : ""} extracted</span>
+          </div>
+          <div class="drm-keys-list">${keyLines}</div>
+          <div class="drm-keys-actions">
+            <button id="copyKeysBtn" class="drm-btn drm-btn-copy">Copy Keys</button>
+            <select id="copyKeysFmt" class="drm-select">
+              <option value="kid:key">kid:key</option>
+              <option value="mp4decrypt">mp4decrypt</option>
+              <option value="json">JSON</option>
+            </select>
+          </div>
+        </div>`;
+    } else if (drmState.pssh) {
+      const hasLicense = !!drmState.licenseUrl;
+      keysHtml = `
+        <div class="drm-status-row">
+          <span>📦 PSSH captured</span>
+          ${hasLicense ? "<span>📡 License URL found</span>" : "<span>⏳ Waiting for license URL...</span>"}
+          <button id="extractKeysBtn" class="drm-btn drm-btn-extract" ${hasLicense ? "" : 'disabled title="Play content first so the license URL can be detected"'}>Extract Keys</button>
+        </div>`;
+    } else {
+      keysHtml = `
+        <div class="drm-status-row">
+          <span>⏳ ${keySystem} detected — waiting for PSSH...</span>
+        </div>`;
+    }
+
+    drmPanel.innerHTML = keysHtml;
+
+    // Wire up buttons
+    const copyBtn = document.getElementById("copyKeysBtn");
+    if (copyBtn) {
+      copyBtn.onclick = async () => {
+        const fmt = document.getElementById("copyKeysFmt")?.value || "kid:key";
+        try {
+          const result = await _api.runtime.sendMessage({
+            type: "COPY_KEYS",
+            format: fmt,
+            tabId: tab.id,
+          });
+          if (result && result.text) {
+            await navigator.clipboard.writeText(result.text);
+            copyBtn.textContent = "Copied!";
+            setTimeout(() => {
+              copyBtn.textContent = "Copy Keys";
+            }, 2000);
+          }
+        } catch (e) {
+          copyBtn.textContent = "Failed";
+          setTimeout(() => {
+            copyBtn.textContent = "Copy Keys";
+          }, 2000);
+        }
+      };
+    }
+
+    const extractBtn = document.getElementById("extractKeysBtn");
+    if (extractBtn) {
+      extractBtn.onclick = async () => {
+        extractBtn.disabled = true;
+        extractBtn.textContent = "Extracting...";
+        try {
+          const result = await _api.runtime.sendMessage({
+            type: "EXTRACT_KEYS_MANUAL",
+            pssh: drmState.pssh,
+            licenseUrl: drmState.licenseUrl,
+            tabId: tab.id,
+          });
+          if (result && result.ok) {
+            extractBtn.textContent = `${result.keys?.length || 0} keys found!`;
+            setTimeout(() => fetchAndShowDrmState(), 500);
+          } else {
+            extractBtn.textContent = result?.error || "Failed";
+            extractBtn.disabled = false;
+          }
+        } catch (e) {
+          extractBtn.textContent = "Error";
+          extractBtn.disabled = false;
+        }
+      };
+    }
+  } catch (e) {
+    console.warn("[POPUP] DRM state fetch failed:", e);
+  }
+}
+
+// Debounced wrapper — multiple rapid DRM events (PSSH_CAPTURED, KEYS_UPDATED,
+// DRM_DETECTED, etc.) collapse into a single fetchAndShowDrmState call.
+let _drmDebounceTimer = null;
+function debouncedFetchDrmState() {
+  if (_drmDebounceTimer) clearTimeout(_drmDebounceTimer);
+  _drmDebounceTimer = setTimeout(() => {
+    _drmDebounceTimer = null;
+    fetchAndShowDrmState();
+  }, 300);
+}
+
+// Listen for DRM updates from background while popup is open
+_api.runtime.onMessage.addListener((msg) => {
+  if (
+    msg.type === "DRM_DETECTED" ||
+    msg.type === "PSSH_CAPTURED" ||
+    msg.type === "KEYS_UPDATED" ||
+    msg.type === "CLEARKEY_FOUND" ||
+    msg.type === "KEY_STATUS"
+  ) {
+    debouncedFetchDrmState();
+  }
+  return false; // Not sending a response
+});
+
+// Await init before fetching DRM state to avoid DOM race
+init()
+  .then(() => fetchAndShowDrmState())
+  .catch(() => {});
