@@ -400,7 +400,7 @@ class SegmentPool {
     // Check for HTML response (pirate CDNs return ad pages with HTTP 200)
     // HTML starts with <!DOCTYPE, <html, <head, <script, <body, <meta, etc.
     const head = data.slice(0, Math.min(512, data.byteLength));
-    const headStr = String.fromCharCode.apply(null, head).trim().toLowerCase();
+    const headStr = new TextDecoder("utf-8").decode(head).trim().toLowerCase();
 
     if (
       headStr.startsWith("<!doctype") ||

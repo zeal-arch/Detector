@@ -489,9 +489,12 @@
 
   // Run periodic video element scan — catches ad→content transitions
   // that bypass property setter hooks (e.g. direct attribute setting, innerHTML)
+  // NOTE: Intentionally no cleanup — this script runs in page context and
+  // the interval/observer are torn down automatically on navigation.
   var scanInterval = setInterval(scanVideoElements, 3000);
 
   // Also watch for new video elements being added to the DOM
+  // NOTE: Intentionally no observer.disconnect() — page-lifetime resource.
   if (typeof MutationObserver !== "undefined") {
     try {
       var domObserver = new MutationObserver(function (mutations) {
@@ -662,9 +665,7 @@
         },
         get: srcObjDesc.get
           ? srcObjDesc.get
-          : function () {
-              return undefined;
-            },
+          : undefined,
         configurable: true,
         enumerable: true,
       });

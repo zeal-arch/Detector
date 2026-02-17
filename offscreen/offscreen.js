@@ -20,10 +20,19 @@ let activeMergeAbort = null; // AbortController for cancelling merge downloads
 const failedPlayerUrls = new Map(); // playerUrl → timestamp of failure
 const SOLVER_FAIL_COOLDOWN = 5 * 60 * 1000; // 5 minutes before retrying a failed player
 
+// Prune expired entries from failedPlayerUrls to keep the Map bounded
+function pruneFailedPlayerUrls() {
+  const now = Date.now();
+  for (const [url, ts] of failedPlayerUrls) {
+    if (now - ts > SOLVER_FAIL_COOLDOWN) {
+      failedPlayerUrls.delete(url);
+    }
+  }
+}
+
 // S34 fix: Merge queue to prevent concurrent large merges from exhausting memory
 // Each merge holds video + audio buffers (~1-2 GB each) in memory simultaneously.
 // Serialize large merges to avoid OOM crashes.
-const mergeQueue = [];
 let activeMerge = null; // Promise for the current merge operation
 const MERGE_MEMORY_THRESHOLD = 500 * 1024 * 1024; // 500 MB — serialize if either track > this
 
@@ -148,6 +157,8 @@ function handleEvalCipher(msg, sendResponse) {
 
 function handleSolvePlayer(msg, sendResponse) {
   // Check if this player URL recently failed — skip retry within cooldown
+  // Prune expired entries to keep the Map bounded
+  pruneFailedPlayerUrls();
   const playerUrl = msg.playerUrl || "";
   const failedAt = failedPlayerUrls.get(playerUrl);
   if (failedAt && Date.now() - failedAt < SOLVER_FAIL_COOLDOWN) {
@@ -443,37 +454,23 @@ async function cleanupMergeOPFS() {
  */
 function cleanupMEMFS() {
   if (!libavInstance) return;
-  // Clean up all possible input/output filenames across all merge/transmux paths
-  for (const f of [
-    // YouTube merge (MP4 / WebM variants)
+  // All possible input/output filenames across merge/transmux paths (deduplicated)
+  const filenames = [
     "input_video.mp4",
     "input_video.webm",
     "input_audio.mp4",
     "input_audio.webm",
     "output.mp4",
     "output.webm",
-    // HLS separate audio merge (TS variants)
     "input_video.ts",
     "input_audio.ts",
     "merged_output.mp4",
-    // TS → MP4 transmux
     "input.ts",
-  ]) {
+  ];
+  for (const f of filenames) {
     try {
       libavInstance.unlink(f);
     } catch (e) {}
-  }
-  // Also clean up any readahead-backed files (streaming I/O)
-  // Must cover all extension variants: .ts (HLS transmux), .mp4 / .webm (fMP4/WebM merge)
-  for (const f of [
-    "input.ts",
-    "input_video.ts",
-    "input_audio.ts",
-    "input_video.mp4",
-    "input_audio.mp4",
-    "input_video.webm",
-    "input_audio.webm",
-  ]) {
     try {
       libavInstance.unlinkreadaheadfile(f);
     } catch (e) {}
@@ -1037,8 +1034,8 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 let videoBlob = await videoResp.blob();
                 let audioBlob = await audioResp.blob();
 
-                URL.revokeObjectURL(msgData.blobUrl);
-                URL.revokeObjectURL(msgData.audioBlobUrl);
+                // Blob URLs are revoked after merge completes (success/fallback)
+                // to keep them valid for the fallback path if merge fails.
 
                 console.log(
                   `[OFFSCREEN] Merging video (${(videoBlob.size / 1024 / 1024).toFixed(2)} MB) + audio (${(audioBlob.size / 1024 / 1024).toFixed(2)} MB) — streaming I/O`,
@@ -1145,6 +1142,10 @@ function handleStartWorkerDownload(msg, sendResponse) {
                   percent: 95,
                   filename: finalFilename,
                 });
+
+                // Revoke original blob URLs now that merge succeeded
+                URL.revokeObjectURL(msgData.blobUrl);
+                URL.revokeObjectURL(msgData.audioBlobUrl);
               } catch (mergeErr) {
                 cleanupMEMFS();
                 console.warn(
@@ -1152,12 +1153,15 @@ function handleStartWorkerDownload(msg, sendResponse) {
                   mergeErr,
                 );
                 // Fallback: download video-only (audio will be missing)
+                // Blob URLs were NOT revoked yet, so msgData.blobUrl is still valid
                 finalBlobUrl = msgData.blobUrl;
                 finalFilename = guessExtension(
                   filename,
                   msgData.mimeType || msgData.contentType,
                 );
                 finalSize = msgData.size || 0;
+                // Revoke only the audio blob URL since we're using video blob URL
+                URL.revokeObjectURL(msgData.audioBlobUrl);
               }
 
               // Clean up audio OPFS folder if present
@@ -1168,11 +1172,12 @@ function handleStartWorkerDownload(msg, sendResponse) {
               // S32 fix: Check actual blob size before transmux, not just msgData.size.
               // For HLS with chunked transfer or missing Content-Length, msgData.size
               // may be 0 or undefined, allowing multi-GB files to bypass the guard.
+              let actualSize = null; // Declared outside try so fallback can use it
               try {
                 // Fetch the blob first to get actual size
                 const tsResp = await fetch(msgData.blobUrl);
                 let tsBlob = await tsResp.blob();
-                const actualSize = tsBlob.size;
+                actualSize = tsBlob.size;
 
                 console.log(
                   `[OFFSCREEN] TS size check: reported=${msgData.size || 0}, actual=${actualSize}`,
@@ -1323,7 +1328,9 @@ function handleStartWorkerDownload(msg, sendResponse) {
                   filename,
                   msgData.mimeType || msgData.contentType,
                 );
-                finalSize = msgData.size || 0;
+                // Prefer previously computed actualSize over msgData.size (which
+                // can be 0/undefined for chunked transfers)
+                finalSize = typeof actualSize === "number" ? actualSize : (msgData.size || 0);
               }
             } else {
               finalBlobUrl = msgData.blobUrl;

@@ -360,6 +360,9 @@
     // 4a. Hook generateRequest to capture PSSH (with dedup from shaka-player)
     const originalGenerateRequest = session.generateRequest;
 
+    // PlayReady system ID GUID (matches lib/manifest-parser-drm.js)
+    const PLAYREADY_SYSTEM_ID = "9a04f079-9840-4286-ab92-e65be0885f95";
+
     session.generateRequest = stealthProxy(originalGenerateRequest, {
       apply: async function (target, thisArg, args) {
         const [initDataType, initData] = args;
@@ -379,6 +382,32 @@
             pssh: psshB64,
             initDataType: initDataType,
           });
+        }
+
+        // PlayReady license URL extraction (Section 37)
+        // Detect PlayReady initData by checking initDataType or system ID
+        const isPlayReady =
+          initDataType === "keyids" ||
+          (psshB64 && psshB64.includes("mQTweZhAQoarkuZb4IhflQ")) || // base64 of PlayReady GUID
+          (initDataType === "cenc" && initData?.byteLength > 30);
+
+        if (isPlayReady) {
+          try {
+            const rawBuf =
+              initData instanceof ArrayBuffer
+                ? new Uint8Array(initData)
+                : new Uint8Array(initData.buffer, initData.byteOffset, initData.byteLength);
+            const licenseUrl = extractPlayReadyLicenseUrl(rawBuf);
+            if (licenseUrl) {
+              _log("PlayReady license URL extracted:", licenseUrl);
+              sendToBackground("EME_LICENSE_URL_DETECTED", {
+                licenseUrl: licenseUrl,
+                source: "playready-initdata",
+              });
+            }
+          } catch (e) {
+            _log("PlayReady license URL extraction failed:", e);
+          }
         }
 
         return Reflect.apply(target, thisArg, args);

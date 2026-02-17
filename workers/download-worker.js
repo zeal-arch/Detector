@@ -373,15 +373,30 @@ async function downloadM3U8(
   const pool = new SegmentPool(MAX_CONCURRENT_SEGMENTS, MAX_SEGMENT_RETRIES, {
     onUrlRefreshNeeded: async () => {
       console.log("[Worker] Requesting fresh URLs from background...");
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
+        const URL_REFRESH_TIMEOUT = 30000; // 30s timeout
         self.postMessage({
           name: "request_url_refresh",
           data: { downloadId },
         });
         // Background will call refresh_urls message with fresh URLs
-        // Store the resolve function to be called when fresh URLs arrive
+        // Store the resolve/reject to be called when fresh URLs arrive
         const state = activeDownloads.get(downloadId);
-        if (state) state.urlRefreshResolve = resolve;
+        if (state) {
+          state.urlRefreshResolve = resolve;
+          state.urlRefreshReject = reject;
+          state.urlRefreshTimer = setTimeout(() => {
+            // Timeout — clear stored callbacks and reject
+            if (state.urlRefreshResolve) {
+              state.urlRefreshResolve = null;
+              state.urlRefreshReject = null;
+              state.urlRefreshTimer = null;
+              reject(new Error("URL refresh timed out after 30s"));
+            }
+          }, URL_REFRESH_TIMEOUT);
+        } else {
+          reject(new Error("Download state not found for URL refresh"));
+        }
       });
     },
     // S36 fix: Handle sleep/wake events
@@ -1729,10 +1744,15 @@ function handleUrlRefresh(data) {
 
   if (state.pool && urlMap) {
     console.log(`[Worker] Applying fresh URLs to pool for ${downloadId}`);
-    // Resolve the pending promise with the urlMap
+    // Clear the refresh timeout and resolve the pending promise with the urlMap
+    if (state.urlRefreshTimer) {
+      clearTimeout(state.urlRefreshTimer);
+      state.urlRefreshTimer = null;
+    }
     if (state.urlRefreshResolve) {
       state.urlRefreshResolve(urlMap);
       state.urlRefreshResolve = null;
+      state.urlRefreshReject = null;
     }
   }
 }

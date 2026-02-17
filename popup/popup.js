@@ -1597,9 +1597,21 @@ async function fetchAndShowDrmState() {
     if (hasKeys) {
       const keyLines = drmState.keys
         .map((k) => {
-          const kid = (k.kid || k.key_id || "").substring(0, 16);
-          const key = (k.key || k.content_key || "").substring(0, 16);
-          return `<div class="drm-key-row"><code>${kid}…:${key}…</code></div>`;
+          const kidFull = k.kid || k.key_id || "";
+          const keyFull = k.key || k.content_key || "";
+          const kid =
+            kidFull.length > 16
+              ? kidFull.substring(0, 8) +
+                "\u2026" +
+                kidFull.substring(kidFull.length - 8)
+              : kidFull;
+          const key =
+            keyFull.length > 16
+              ? keyFull.substring(0, 8) +
+                "\u2026" +
+                keyFull.substring(keyFull.length - 8)
+              : keyFull;
+          return `<div class="drm-key-row"><code>${kid}:${key}</code></div>`;
         })
         .join("");
       keysHtml = `
