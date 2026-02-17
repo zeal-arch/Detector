@@ -1790,7 +1790,11 @@
     var effectiveUrl = playerUrl;
     var pageUrl = getPlayerJsUrlFromPage();
     if (pageUrl) {
-      console.log(TAG, "Found player.js URL from page:", pageUrl.substring(0, 80));
+      console.log(
+        TAG,
+        "Found player.js URL from page:",
+        pageUrl.substring(0, 80),
+      );
       effectiveUrl = pageUrl;
     }
 
@@ -1801,7 +1805,11 @@
     } catch (e) {
       // If the primary URL failed and we have a page-discovered URL, try that
       if (pageUrl && pageUrl !== effectiveUrl) {
-        console.log(TAG, "Retrying with page-discovered URL:", pageUrl.substring(0, 80));
+        console.log(
+          TAG,
+          "Retrying with page-discovered URL:",
+          pageUrl.substring(0, 80),
+        );
         try {
           js = await fetchPlayerJs(pageUrl);
         } catch (e2) {
@@ -1913,10 +1921,7 @@
           "N-sig wrapper not ready yet, waiting for:",
           externalDeps.nSigWrapper,
         );
-        var nSigReady = await waitForYTGlobal(
-          externalDeps.nSigWrapper,
-          6000,
-        );
+        var nSigReady = await waitForYTGlobal(externalDeps.nSigWrapper, 6000);
         if (nSigReady) {
           console.log(
             TAG,
@@ -2207,7 +2212,9 @@
             if (
               typeof ytInitialPlayerResponse !== "undefined" ||
               document.getElementById("movie_player") ||
-              (typeof ytcfg !== "undefined" && ytcfg.get && ytcfg.get("PLAYER_JS_URL"))
+              (typeof ytcfg !== "undefined" &&
+                ytcfg.get &&
+                ytcfg.get("PLAYER_JS_URL"))
             ) {
               clearInterval(timer);
               resolve();
@@ -2228,7 +2235,12 @@
     if (!data.playerResponse) {
       console.log(TAG, "No playerResponse on page, sending raw data");
       sendToContentScript(data);
-      return { hasFormats: false, directCipher: false, directNSig: false, fetchFailed: false };
+      return {
+        hasFormats: false,
+        directCipher: false,
+        directNSig: false,
+        fetchFailed: false,
+      };
     }
 
     if (!data.playerUrl) {
@@ -2237,7 +2249,12 @@
         "No playerUrl, sending playerResponse without deciphering",
       );
       sendToContentScript(data);
-      return { hasFormats: false, directCipher: false, directNSig: false, fetchFailed: false };
+      return {
+        hasFormats: false,
+        directCipher: false,
+        directNSig: false,
+        fetchFailed: false,
+      };
     }
 
     try {
@@ -2326,43 +2343,41 @@
     _processTimer = setTimeout(function () {
       _processTimer = null;
       if (myNav !== _navCounter) return;
-      processVideo().then(function (result) {
-        if (myNav !== _navCounter) return;
-        // Auto-retry if we failed to get formats or globals weren't ready
-        if (
-          result &&
-          !result.hasFormats &&
-          _retryCount < _maxAutoRetries
-        ) {
-          _retryCount++;
-          var retryDelay = 3000 * _retryCount; // 3s, 6s
-          console.log(
-            TAG,
-            "Auto-retry " +
-              _retryCount +
-              "/" +
-              _maxAutoRetries +
-              " in " +
-              retryDelay +
-              "ms (formats:" +
-              result.hasFormats +
-              " cipher:" +
-              result.directCipher +
-              " nSig:" +
-              result.directNSig +
-              " fetchFailed:" +
-              result.fetchFailed +
-              ")",
-          );
-          // Clear player cache so we re-fetch/re-resolve
-          playerCache = {};
-          _processTimer = setTimeout(function () {
-            _processTimer = null;
-            if (myNav !== _navCounter) return;
-            processVideo();
-          }, retryDelay);
-        }
-      }).catch(function () {});
+      processVideo()
+        .then(function (result) {
+          if (myNav !== _navCounter) return;
+          // Auto-retry if we failed to get formats or globals weren't ready
+          if (result && !result.hasFormats && _retryCount < _maxAutoRetries) {
+            _retryCount++;
+            var retryDelay = 3000 * _retryCount; // 3s, 6s
+            console.log(
+              TAG,
+              "Auto-retry " +
+                _retryCount +
+                "/" +
+                _maxAutoRetries +
+                " in " +
+                retryDelay +
+                "ms (formats:" +
+                result.hasFormats +
+                " cipher:" +
+                result.directCipher +
+                " nSig:" +
+                result.directNSig +
+                " fetchFailed:" +
+                result.fetchFailed +
+                ")",
+            );
+            // Clear player cache so we re-fetch/re-resolve
+            playerCache = {};
+            _processTimer = setTimeout(function () {
+              _processTimer = null;
+              if (myNav !== _navCounter) return;
+              processVideo();
+            }, retryDelay);
+          }
+        })
+        .catch(function () {});
     }, delay);
   }
 
