@@ -467,7 +467,7 @@ var jsc = (function (meriyah, astring) {
           break;
         }
       }
-      throw "unexpected structure";
+      throw new Error("unexpected structure");
     })();
     // Find solver functions by walking the AST
     const found = { n: [], sig: [] };
@@ -480,7 +480,9 @@ var jsc = (function (meriyah, astring) {
     // Diagnostic: log extraction results for debugging
     console.log(
       `[yt.solver] Extraction: n=${found.n.length} candidates, sig=${found.sig.length} candidates` +
-        (isCase2 ? " (case 2: dual-statement IIFE)" : " (case 1: single-statement IIFE)")
+        (isCase2
+          ? " (case 2: dual-statement IIFE)"
+          : " (case 1: single-statement IIFE)"),
     );
     // Generate ONLY the solver assignment code (tiny ~2KB)
     const solverStmts = [];
@@ -510,7 +512,7 @@ var jsc = (function (meriyah, astring) {
     // Find injection point: before the IIFE's closing })
     let source = data;
     const closingIdx = source.lastIndexOf("})");
-    if (closingIdx === -1) throw "Cannot find IIFE closing";
+    if (closingIdx === -1) throw new Error("Cannot find IIFE closing");
     let insertPos = closingIdx;
     // For case 2: remove 'var window=this;' so setup code's window
     // definition takes effect inside the IIFE (replaces this=globalThis
@@ -814,7 +816,7 @@ var jsc = (function (meriyah, astring) {
                 result.endsWith(challenge)
               ) {
                 throw new Error(
-                  `n-sig validation failed: result ends with challenge`
+                  `n-sig validation failed: result ends with challenge`,
                 );
               }
               return [challenge, result];

@@ -867,14 +867,17 @@ function attachStreamDownloadHandlers() {
       try {
         if (isBlob) {
           // Blob URLs require page-context download via content script injection
-          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          const [tab] = await chrome.tabs.query({
+            active: true,
+            currentWindow: true,
+          });
           const resp = await chrome.runtime.sendMessage({
             action: "DOWNLOAD_BLOB",
             blobUrl: url,
             tabId: tab?.id,
             filename: "video.mp4",
           });
-          btn.textContent = resp?.success ? "Done!" : (resp?.error || "Failed");
+          btn.textContent = resp?.success ? "Done!" : resp?.error || "Failed";
           setTimeout(() => {
             btn.textContent = "Save Blob";
             btn.disabled = false;
@@ -913,8 +916,11 @@ function attachStreamDownloadHandlers() {
         console.error("Stream download error:", err);
         btn.textContent = "Error";
         setTimeout(() => {
-          btn.textContent = isBlob ? "Save Blob" :
-            type === "hls" || type === "dash" ? "Download" : "Save";
+          btn.textContent = isBlob
+            ? "Save Blob"
+            : type === "hls" || type === "dash"
+              ? "Download"
+              : "Save";
           btn.disabled = false;
         }, 3000);
       }
@@ -1557,8 +1563,10 @@ async function fetchAndShowDrmState() {
     // Find or create the DRM panel container
     let drmPanel = document.getElementById("drmPanel");
 
-    // Only show if DRM was detected or keys exist
-    if (!drmState.keySystem && (!drmState.keys || drmState.keys.length === 0)) {
+    const hasKeys = drmState.keys && drmState.keys.length > 0;
+    const hasPssh = !!drmState.pssh;
+    // Only show if DRM was detected or keys/pssh exist
+    if (!drmState.keySystem && !hasKeys && !hasPssh) {
       if (drmPanel) drmPanel.style.display = "none";
       return;
     }
@@ -1584,16 +1592,26 @@ async function fetchAndShowDrmState() {
 
     drmPanel.style.display = "block";
 
-    const hasKeys = drmState.keys && drmState.keys.length > 0;
     const keySystem = drmState.drmName || drmState.keySystem || "Unknown DRM";
-
     let keysHtml = "";
     if (hasKeys) {
       const keyLines = drmState.keys
         .map((k) => {
-          const kid = (k.kid || k.key_id || "").substring(0, 16);
-          const key = (k.key || k.content_key || "").substring(0, 16);
-          return `<div class="drm-key-row"><code>${kid}…:${key}…</code></div>`;
+          const kidFull = k.kid || k.key_id || "";
+          const keyFull = k.key || k.content_key || "";
+          const kid =
+            kidFull.length > 16
+              ? kidFull.substring(0, 8) +
+                "\u2026" +
+                kidFull.substring(kidFull.length - 8)
+              : kidFull;
+          const key =
+            keyFull.length > 16
+              ? keyFull.substring(0, 8) +
+                "\u2026" +
+                keyFull.substring(keyFull.length - 8)
+              : keyFull;
+          return `<div class="drm-key-row"><code>${kid}:${key}</code></div>`;
         })
         .join("");
       keysHtml = `
