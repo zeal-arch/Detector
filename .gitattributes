@@ -1,15 +1,16 @@
-# Auto detect text files and normalize line endings to LF in git
-* text=auto eol=lf
+# Auto detect text files and normalize line endings in git
+# On Windows checkout: CRLF.  On Mac/Linux checkout: LF.  In repo: always LF.
+* text=auto
 
-# JavaScript / HTML / CSS - always LF
-*.js text eol=lf
-*.mjs text eol=lf
-*.html text eol=lf
-*.css text eol=lf
-*.json text eol=lf
-*.md text eol=lf
-*.txt text eol=lf
-*.svg text eol=lf
+# Explicitly mark as text (line endings handled by core.autocrlf)
+*.js text
+*.mjs text
+*.html text
+*.css text
+*.json text
+*.md text
+*.txt text
+*.svg text
 
 # Binary files - never touch
 *.wasm binary
