@@ -396,7 +396,11 @@
             const rawBuf =
               initData instanceof ArrayBuffer
                 ? new Uint8Array(initData)
-                : new Uint8Array(initData.buffer, initData.byteOffset, initData.byteLength);
+                : new Uint8Array(
+                    initData.buffer,
+                    initData.byteOffset,
+                    initData.byteLength,
+                  );
             const licenseUrl = extractPlayReadyLicenseUrl(rawBuf);
             if (licenseUrl) {
               _log("PlayReady license URL extracted:", licenseUrl);
@@ -671,52 +675,56 @@
 
   const originalFetch = window.fetch;
 
-  window.fetch = stealthProxy(originalFetch, {
-    apply: async function (target, thisArg, args) {
-      const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
+  try {
+    window.fetch = stealthProxy(originalFetch, {
+      apply: async function (target, thisArg, args) {
+        const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
 
-      // Detect stream URLs early
-      if (isStreamUrl(url)) {
-        sendToBackground("STREAM_URL_DETECTED", {
-          url: url,
-          streamType: detectStreamType(url),
-        });
-      }
-
-      // Detect DRM license server requests (POST to license-like URLs)
-      const fetchMethod =
-        (args[1] && args[1].method) || (args[0] && args[0].method) || "GET";
-      if (fetchMethod.toUpperCase() === "POST" && isLicenseUrl(url)) {
-        reportLicenseUrl(url, fetchMethod);
-      }
-
-      // Single fetch call — never duplicate the request
-      const response = await Reflect.apply(target, thisArg, args);
-
-      try {
-        const ct = response.headers.get("content-type") || "";
-        const isManifest =
-          isManifestUrl(url) ||
-          ct.includes("mpegurl") ||
-          ct.includes("dash+xml") ||
-          ct.includes("mpd");
-
-        if (isManifest) {
-          const clone = response.clone();
-          const content = await clone.text();
-          sendToBackground("MANIFEST_DETECTED", {
+        // Detect stream URLs early
+        if (isStreamUrl(url)) {
+          sendToBackground("STREAM_URL_DETECTED", {
             url: url,
-            manifestType: detectManifestContent(url, content),
-            content: content.substring(0, 50000), // Limit size
+            streamType: detectStreamType(url),
           });
         }
-      } catch (e) {
-        // Detection failed, not fatal — original response is still returned
-      }
 
-      return response;
-    },
-  });
+        // Detect DRM license server requests (POST to license-like URLs)
+        const fetchMethod =
+          (args[1] && args[1].method) || (args[0] && args[0].method) || "GET";
+        if (fetchMethod.toUpperCase() === "POST" && isLicenseUrl(url)) {
+          reportLicenseUrl(url, fetchMethod);
+        }
+
+        // Single fetch call — never duplicate the request
+        const response = await Reflect.apply(target, thisArg, args);
+
+        try {
+          const ct = response.headers.get("content-type") || "";
+          const isManifest =
+            isManifestUrl(url) ||
+            ct.includes("mpegurl") ||
+            ct.includes("dash+xml") ||
+            ct.includes("mpd");
+
+          if (isManifest) {
+            const clone = response.clone();
+            const content = await clone.text();
+            sendToBackground("MANIFEST_DETECTED", {
+              url: url,
+              manifestType: detectManifestContent(url, content),
+              content: content.substring(0, 50000), // Limit size
+            });
+          }
+        } catch (e) {
+          // Detection failed, not fatal — original response is still returned
+        }
+
+        return response;
+      },
+    });
+  } catch (e) {
+    _log("Could not override window.fetch (read-only):", e.message);
+  }
 
   // ─── XHR Hook (with all responseType handling from WP2) ──────────
 
@@ -748,6 +756,18 @@
   XMLHttpRequest.prototype.send = stealthProxy(originalXHRSend, {
     apply: function (target, thisArg, args) {
       const url = thisArg[_xhrUrl] || "";
+
+      // Skip proxy logic for known third-party domains that we never
+      // need to inspect. This keeps our code out of the call stack
+      // so CSP violations on those domains aren't attributed to us.
+      if (
+        url &&
+        /^https?:\/\/[^/]*(jwplayer\.com|jwpltx\.com|jwpsrv\.com|googlesyndication\.com|google-analytics\.com|googletagmanager\.com|doubleclick\.net|facebook\.net|sentry\.io)\//i.test(
+          url,
+        )
+      ) {
+        return Reflect.apply(target, thisArg, args);
+      }
 
       // Guard: only attach the load listener once per XHR instance.
       // Without this, reused XHR objects (open→send→open→send) accumulate listeners.

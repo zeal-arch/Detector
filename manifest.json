@@ -252,6 +252,7 @@
                 "*://lersia.lailendemo.com/*"
             ],
             "js": [
+                "extractors/site-map.js",
                 "extractors/base.js",
                 "extractors/generic/generic.js",
                 "extractors/registry.js",
@@ -283,6 +284,60 @@
         },
         {
             "matches": [
+                "*://tmovie.tv/*",
+                "*://*.tmovie.tv/*"
+            ],
+            "js": [
+                "hooks/tmovie-antidebug-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN",
+            "all_frames": true
+        },
+        {
+            "matches": [
+                "*://net22.cc/*",
+                "*://*.net22.cc/*",
+                "*://net52.cc/*",
+                "*://*.net52.cc/*",
+                "*://net50.cc/*",
+                "*://*.net50.cc/*",
+                "*://net20.cc/*",
+                "*://*.net20.cc/*"
+            ],
+            "js": [
+                "hooks/net22-antidebug-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN",
+            "all_frames": true
+        },
+        {
+            "matches": [
+                "*://*.videasy.net/*",
+                "*://videasy.net/*",
+                "*://*.vidsrc.cc/*",
+                "*://vidsrc.cc/*",
+                "*://*.vidsrc.to/*",
+                "*://vidsrc.to/*",
+                "*://*.vidsrc.me/*",
+                "*://vidsrc.me/*",
+                "*://*.vidsrc.in/*",
+                "*://vidsrc.in/*",
+                "*://*.vidsrc.net/*",
+                "*://vidsrc.net/*",
+                "*://*.vidsrc.xyz/*",
+                "*://vidsrc.xyz/*"
+            ],
+            "js": [
+                "hooks/videasy-source-hook.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN",
+            "all_frames": true
+        },
+        {
+            "matches": [
                 "<all_urls>"
             ],
             "exclude_matches": [
@@ -311,6 +366,7 @@
                 "*://lersia.lailendemo.com/*"
             ],
             "js": [
+                "extractors/site-map.js",
                 "hooks/generic-network-hook.js"
             ],
             "run_at": "document_start",
