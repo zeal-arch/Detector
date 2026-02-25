@@ -23,7 +23,11 @@ function formatSize(bytes) {
 
 function formatDuration(seconds) {
   if (!seconds) return "";
+  // Handle pre-formatted strings like "45:30" or "1:23:45"
+  if (typeof seconds === "string" && /^\d+:\d{2}(:\d{2})?$/.test(seconds))
+    return seconds;
   const s = Number(seconds);
+  if (!isFinite(s) || s <= 0) return "";
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
@@ -173,6 +177,8 @@ let activeMergeInProgress = false;
 let tabVideoId = null; // videoId extracted directly from the tab URL (ground truth)
 let mergePollTimer = null;
 let downloadPollTimer = null;
+let activeWorkerDownloadId = null; // Track the current worker download started from this popup session
+let currentTabId = null; // Track the active tab ID for inline vs banner matching
 
 window.addEventListener("unload", () => {
   if (mergePollTimer) {
@@ -209,7 +215,7 @@ function renderNoVideo() {
     <div class="state-container">
       <div class="state-icon-wrap float-anim">${ICONS.fileVideo}</div>
       <span class="state-title">Waiting for content</span>
-      <span class="state-text">Play a video on the current page to detect downloadable streams.</span>
+      <span class="state-text">Play a video on the current page to detect downloadable streams and if you are playing and there isnt any pop showing or if the video doesnt look like a downloadble REFERESH THE ENTIER PAGE.</span>
       <button class="state-btn" id="retryBtn">Refresh</button>
     </div>`;
   document.getElementById("retryBtn")?.addEventListener("click", init);
@@ -412,10 +418,11 @@ function renderVideo(info) {
         fmt.url.includes(".mpd");
 
       if (isHLS || isDASH) {
-        workerDownload(fmt.url, isHLS ? "hls" : "dash", filename);
-      } else {
-        downloadFormat(fmt.url, filename);
+        workerDownload(fmt.url, isHLS ? "hls" : "dash", filename, fmt.headers);
+        // workerDownload handles UI state (Stop button + inline progress)
+        return;
       }
+      downloadFormat(fmt.url, filename);
       const btn = document.getElementById("dlBtn");
       if (btn) {
         btn.innerHTML = "Starting...";
@@ -688,10 +695,11 @@ function handleDownloadClick() {
         fmt.url.includes(".mpd");
 
       if (isHLS || isDASH) {
-        workerDownload(fmt.url, isHLS ? "hls" : "dash", filename);
-      } else {
-        downloadFormat(fmt.url, filename);
+        workerDownload(fmt.url, isHLS ? "hls" : "dash", filename, fmt.headers);
+        // workerDownload handles UI state (Stop button + inline progress)
+        return;
       }
+      downloadFormat(fmt.url, filename);
       btn.innerHTML = "Starting...";
       btn.disabled = true;
       setTimeout(() => {
@@ -723,18 +731,46 @@ async function downloadFormat(url, filename) {
  * @param {string} type - The download type, e.g. "hls", "dash", or "direct".
  * @param {string} filename - The desired filename for the downloaded file.
  */
-async function workerDownload(url, type, filename) {
+async function workerDownload(url, type, filename, headers) {
   try {
     const resp = await chrome.runtime.sendMessage({
       action: "START_WORKER_DOWNLOAD",
       url,
       type,
       filename,
+      headers: headers || undefined,
+      tabId: currentTabId,
       // Include video metadata for persistent display
       videoTitle: currentVideoTitle || null,
       videoThumbnail: currentVideoInfo?.thumbnail || null,
     });
     if (resp?.success) {
+      activeWorkerDownloadId = resp.downloadId || null;
+
+      // Transform card UI for active download (like mergeDownload does)
+      const btn = document.getElementById("dlBtn");
+      const select = document.getElementById("qualitySelect");
+      if (select) select.disabled = true;
+      if (btn) {
+        btn.className = "dl-btn dl-btn-stop";
+        btn.innerHTML = `${ICONS.stop} Stop`;
+        btn.disabled = false;
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.innerHTML = "Cancelling...";
+          try {
+            await chrome.runtime.sendMessage({
+              action: "CANCEL_WORKER_DOWNLOAD",
+              downloadId: activeWorkerDownloadId,
+            });
+          } catch {}
+          setTimeout(() => {
+            resetDownloadUI();
+            activeWorkerDownloadId = null;
+          }, 1500);
+        };
+      }
+      showProgress(0, "Starting download...");
       startDownloadPoll();
     } else {
       console.error("Worker download failed:", resp?.error);
@@ -831,6 +867,7 @@ async function mergeDownload(
 }
 
 function resetDownloadUI() {
+  activeWorkerDownloadId = null;
   const btn = document.getElementById("dlBtn");
   const select = document.getElementById("qualitySelect");
   if (btn) {
@@ -932,9 +969,10 @@ function showProgress(percent, message) {
   const wrap = document.getElementById("progressWrap");
   const fill = document.getElementById("progressFill");
   const text = document.getElementById("progressText");
+  const pct = Math.max(0, Math.min(100, percent));
   if (wrap) wrap.style.display = "flex";
-  if (fill) fill.style.width = `${percent}%`;
-  if (text) text.textContent = message || `${percent}%`;
+  if (fill) fill.style.width = `${pct}%`;
+  if (text) text.textContent = message || `${pct}%`;
 }
 
 function hideProgress() {
@@ -1045,11 +1083,12 @@ function startMergePoll() {
 }
 
 /**
- * Begin a periodic check of session storage for active downloads and render/update download banners in the UI.
+ * Begin a periodic check of session storage for active downloads and render/update the UI.
  *
  * If a poll is already active this is a no-op. While running, the function:
- * - Creates or updates per-download banners showing progress, percentage, and an optional thumbnail and title.
- * - Converts completed or errored downloads into final banners and removes them after a short delay.
+ * - For same-tab downloads (matching activeWorkerDownloadId or tabId): updates inline card progress.
+ * - For other-tab downloads: creates/updates per-download banners with a Stop button.
+ * - Converts completed or errored downloads into final states and resets after a delay.
  * - Stops polling and clears banners when there are no active downloads.
  */
 function startDownloadPoll() {
@@ -1068,76 +1107,131 @@ function startDownloadPoll() {
 
       let hasActive = false;
       for (const [dlId, dl] of Object.entries(downloads)) {
-        const existing = document.getElementById(`dl-banner-${dlId}`);
-        const hasMetadata = dl.videoTitle || dl.videoThumbnail;
+        // Determine if this download belongs to the current tab (show inline)
+        const isSameTab =
+          activeWorkerDownloadId === dlId ||
+          (dl.tabId && dl.tabId === currentTabId);
 
         if (dl.phase === "complete" || dl.phase === "error") {
-          if (existing) {
-            existing.className = `banner ${dl.phase === "complete" ? "complete" : "error"}`;
-            const icon = dl.phase === "complete" ? "✓" : "✗";
-            if (hasMetadata) {
-              const thumbHtml = dl.videoThumbnail
-                ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
-                : "";
-              const titleHtml = dl.videoTitle
-                ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
-                : "";
-              existing.innerHTML = `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div></div></div>`;
-            } else {
-              existing.innerHTML = `<div class="banner-row">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div>`;
+          const icon = dl.phase === "complete" ? "✓" : "✗";
+          if (isSameTab) {
+            // Complete/error for inline download — update card
+            const msg =
+              dl.phase === "complete"
+                ? "Saved! Check your downloads folder"
+                : dl.message || "Download failed";
+            showProgress(dl.phase === "complete" ? 100 : 0, `${icon} ${msg}`);
+            const fill = document.getElementById("progressFill");
+            if (fill)
+              fill.classList.add(dl.phase === "complete" ? "done" : "error");
+            const btn = document.getElementById("dlBtn");
+            if (btn) {
+              btn.className = `dl-btn ${dl.phase === "complete" ? "dl-btn-done" : "dl-btn-primary"}`;
+              btn.innerHTML =
+                dl.phase === "complete"
+                  ? `${ICONS.check} Done`
+                  : `${ICONS.download} Retry`;
+              btn.onclick = null;
             }
-            setTimeout(() => existing.remove(), 5000);
+            setTimeout(() => {
+              resetDownloadUI();
+            }, 4000);
+          } else {
+            // Complete/error for banner download
+            const existing = document.getElementById(`dl-banner-${dlId}`);
+            if (existing) {
+              existing.className = `banner ${dl.phase === "complete" ? "complete" : "error"}`;
+              const hasMetadata = dl.videoTitle || dl.videoThumbnail;
+              if (hasMetadata) {
+                const thumbHtml = dl.videoThumbnail
+                  ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
+                  : "";
+                const titleHtml = dl.videoTitle
+                  ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
+                  : "";
+                existing.innerHTML = `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div></div></div>`;
+              } else {
+                existing.innerHTML = `<div class="banner-row">${icon} ${escapeHtml(dl.message || dl.filename || "")}</div>`;
+              }
+              setTimeout(() => existing.remove(), 5000);
+            }
           }
         } else {
           hasActive = true;
-          const pct = Math.round(dl.percent || 0);
+          const pct = Math.max(0, Math.round(dl.percent || 0));
 
-          if (existing) {
-            const msgEl = existing.querySelector(".banner-msg");
-            const pctEl = existing.querySelector(".banner-pct");
-            const barEl = existing.querySelector(".banner-bar-fill");
-            if (msgEl) msgEl.textContent = dl.message || "Downloading...";
-            if (pctEl) pctEl.textContent = `${pct}%`;
-            if (barEl) barEl.style.width = `${pct}%`;
+          if (isSameTab) {
+            // Update inline card progress
+            showProgress(pct, dl.message || "Downloading...");
           } else {
-            const banner = document.createElement("div");
-            banner.className = "banner active";
-            banner.id = `dl-banner-${dlId}`;
-            if (hasMetadata) {
-              const thumbHtml = dl.videoThumbnail
-                ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
-                : "";
-              const titleHtml = dl.videoTitle
-                ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
-                : "";
-              banner.innerHTML = `<div class="banner-video-row">
-                ${thumbHtml}
-                <div class="banner-video-info">
-                  ${titleHtml}
-                  <div class="banner-row" style="margin-top:4px">
+            // Show/update banner for other-tab download
+            const existing = document.getElementById(`dl-banner-${dlId}`);
+            if (existing) {
+              const msgEl = existing.querySelector(".banner-msg");
+              const pctEl = existing.querySelector(".banner-pct");
+              const barEl = existing.querySelector(".banner-bar-fill");
+              if (msgEl) msgEl.textContent = dl.message || "Downloading...";
+              if (pctEl) pctEl.textContent = `${pct}%`;
+              if (barEl) barEl.style.width = `${pct}%`;
+            } else {
+              const banner = document.createElement("div");
+              banner.className = "banner active";
+              banner.id = `dl-banner-${dlId}`;
+              const hasMetadata = dl.videoTitle || dl.videoThumbnail;
+              const stopBtnHtml = `<button class="banner-stop-btn" data-dlid="${dlId}" title="Cancel download">${ICONS.stop}</button>`;
+              if (hasMetadata) {
+                const thumbHtml = dl.videoThumbnail
+                  ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
+                  : "";
+                const titleHtml = dl.videoTitle
+                  ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
+                  : "";
+                banner.innerHTML = `<div class="banner-video-row">
+                  ${thumbHtml}
+                  <div class="banner-video-info">
+                    ${titleHtml}
+                    <div class="banner-row" style="margin-top:4px">
+                      <span class="banner-spinner"></span>
+                      <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
+                      <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                      ${stopBtnHtml}
+                    </div>
+                    <div class="banner-bar-bg">
+                      <div class="banner-bar-fill" style="width: ${pct}%"></div>
+                    </div>
+                  </div>
+                </div>`;
+              } else {
+                banner.innerHTML = `
+                  <div class="banner-row">
                     <span class="banner-spinner"></span>
                     <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
                     <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                    ${stopBtnHtml}
                   </div>
                   <div class="banner-bar-bg">
                     <div class="banner-bar-fill" style="width: ${pct}%"></div>
-                  </div>
-                </div>
-              </div>`;
-            } else {
-              banner.innerHTML = `
-                <div class="banner-row">
-                  <span class="banner-spinner"></span>
-                  <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
-                  <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
-                </div>
-                <div class="banner-bar-bg">
-                  <div class="banner-bar-fill" style="width: ${pct}%"></div>
-                </div>`;
+                  </div>`;
+              }
+              if (content.firstChild)
+                content.insertBefore(banner, content.firstChild);
+              else content.appendChild(banner);
+
+              // Attach stop handler
+              const stopBtn = banner.querySelector(".banner-stop-btn");
+              if (stopBtn) {
+                stopBtn.onclick = async () => {
+                  stopBtn.disabled = true;
+                  stopBtn.textContent = "...";
+                  try {
+                    await chrome.runtime.sendMessage({
+                      action: "CANCEL_WORKER_DOWNLOAD",
+                      downloadId: dlId,
+                    });
+                  } catch {}
+                };
+              }
             }
-            if (content.firstChild)
-              content.insertBefore(banner, content.firstChild);
-            else content.appendChild(banner);
           }
         }
       }
@@ -1151,14 +1245,11 @@ function startDownloadPoll() {
 }
 
 /**
- * Render banners for current active downloads stored in session storage.
+ * Render UI for current active downloads stored in session storage.
  *
- * Retrieves `activeDownloads` from `chrome.storage.session` and creates a banner
- * for each entry under the page `content` element. Each banner reflects the
- * download's phase: "complete" (success), "error" (failure), or active
- * (in-progress). When available, video metadata (`videoTitle`, `videoThumbnail`)
- * is shown; active banners display percentage progress and a progress bar and
- * will trigger the download poll to keep UI in sync.
+ * For same-tab downloads: restores inline card progress (Stop button, progress bar).
+ * For other-tab downloads: creates banners with Stop buttons.
+ * Completed/error states show appropriate status in banner or inline.
  */
 async function showActiveDownloads() {
   try {
@@ -1167,10 +1258,7 @@ async function showActiveDownloads() {
     if (!downloads || Object.keys(downloads).length === 0) return;
 
     for (const [dlId, dl] of Object.entries(downloads)) {
-      const banner = document.createElement("div");
-      banner.id = `dl-banner-${dlId}`;
-
-      // Build video info section if metadata is available
+      const isSameTab = dl.tabId && dl.tabId === currentTabId;
       const hasMetadata = dl.videoTitle || dl.videoThumbnail;
       const thumbHtml = dl.videoThumbnail
         ? `<img src="${escapeHtml(dl.videoThumbnail)}" class="banner-thumb" alt="" />`
@@ -1179,19 +1267,53 @@ async function showActiveDownloads() {
         ? `<div class="banner-title">${escapeHtml(dl.videoTitle)}</div>`
         : "";
 
-      if (dl.phase === "complete") {
-        banner.className = "banner complete";
+      if (dl.phase === "complete" || dl.phase === "error") {
+        // Show completed/errored downloads as banners (even for same tab, since card may have reset)
+        const banner = document.createElement("div");
+        banner.id = `dl-banner-${dlId}`;
+        const icon = dl.phase === "complete" ? "✓" : "✗";
+        banner.className = `banner ${dl.phase === "complete" ? "complete" : "error"}`;
         banner.innerHTML = hasMetadata
-          ? `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✓ ${escapeHtml(dl.filename || "Download complete")}</div></div></div>`
-          : `<div class="banner-row">✓ ${escapeHtml(dl.filename || "Download complete")}</div>`;
-      } else if (dl.phase === "error") {
-        banner.className = "banner error";
-        banner.innerHTML = hasMetadata
-          ? `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">✗ ${escapeHtml(dl.message || "Download failed")}</div></div></div>`
-          : `<div class="banner-row">✗ ${escapeHtml(dl.message || "Download failed")}</div>`;
+          ? `<div class="banner-video-row">${thumbHtml}<div class="banner-video-info">${titleHtml}<div class="banner-status">${icon} ${escapeHtml(dl.filename || dl.message || "")}</div></div></div>`
+          : `<div class="banner-row">${icon} ${escapeHtml(dl.filename || dl.message || "")}</div>`;
+        if (content.firstChild)
+          content.insertBefore(banner, content.firstChild);
+        else content.appendChild(banner);
+      } else if (isSameTab) {
+        // Active download for this tab — restore inline card progress
+        activeWorkerDownloadId = dlId;
+        const pct = Math.max(0, Math.round(dl.percent || 0));
+        showProgress(pct, dl.message || "Downloading...");
+
+        const btn = document.getElementById("dlBtn");
+        const select = document.getElementById("qualitySelect");
+        if (select) select.disabled = true;
+        if (btn) {
+          btn.className = "dl-btn dl-btn-stop";
+          btn.innerHTML = `${ICONS.stop} Stop`;
+          btn.disabled = false;
+          btn.onclick = async () => {
+            btn.disabled = true;
+            btn.innerHTML = "Cancelling...";
+            try {
+              await chrome.runtime.sendMessage({
+                action: "CANCEL_WORKER_DOWNLOAD",
+                downloadId: dlId,
+              });
+            } catch {}
+            setTimeout(() => {
+              resetDownloadUI();
+            }, 1500);
+          };
+        }
+        startDownloadPoll();
       } else {
+        // Active download for another tab — show banner with Stop
+        const banner = document.createElement("div");
         banner.className = "banner active";
-        const pct = Math.round(dl.percent || 0);
+        banner.id = `dl-banner-${dlId}`;
+        const pct = Math.max(0, Math.round(dl.percent || 0));
+        const stopBtnHtml = `<button class="banner-stop-btn" data-dlid="${dlId}" title="Cancel download">${ICONS.stop}</button>`;
         banner.innerHTML = hasMetadata
           ? `<div class="banner-video-row">
               ${thumbHtml}
@@ -1201,6 +1323,7 @@ async function showActiveDownloads() {
                   <span class="banner-spinner"></span>
                   <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
                   <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+                  ${stopBtnHtml}
                 </div>
                 <div class="banner-bar-bg">
                   <div class="banner-bar-fill" style="width: ${pct}%"></div>
@@ -1211,15 +1334,31 @@ async function showActiveDownloads() {
               <span class="banner-spinner"></span>
               <span class="banner-msg">${escapeHtml(dl.message || "Downloading...")}</span>
               <span class="banner-pct" style="margin-left:auto;font-weight:500">${pct}%</span>
+              ${stopBtnHtml}
             </div>
             <div class="banner-bar-bg">
               <div class="banner-bar-fill" style="width: ${pct}%"></div>
             </div>`;
+        if (content.firstChild)
+          content.insertBefore(banner, content.firstChild);
+        else content.appendChild(banner);
+
+        // Attach stop handler
+        const stopBtn = banner.querySelector(".banner-stop-btn");
+        if (stopBtn) {
+          stopBtn.onclick = async () => {
+            stopBtn.disabled = true;
+            stopBtn.textContent = "...";
+            try {
+              await chrome.runtime.sendMessage({
+                action: "CANCEL_WORKER_DOWNLOAD",
+                downloadId: dlId,
+              });
+            } catch {}
+          };
+        }
         startDownloadPoll();
       }
-
-      if (content.firstChild) content.insertBefore(banner, content.firstChild);
-      else content.appendChild(banner);
     }
   } catch {}
 }
@@ -1246,6 +1385,7 @@ async function init() {
       active: true,
       currentWindow: true,
     });
+    currentTabId = tab?.id || null;
     const isYouTube = tab?.url?.match(
       /youtube\.com\/(watch|shorts|embed|live)/,
     );

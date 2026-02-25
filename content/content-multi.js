@@ -62,6 +62,25 @@
       });
     }
 
+    if (type === "SPECIALIST_DURATION_UPDATE" && source === "SITE_SPECIALIST") {
+      relayToBackground({
+        action: "SPECIALIST_DURATION_UPDATE",
+        duration: data?.duration,
+        pageUrl: window.location.href,
+      });
+    }
+
+    if (
+      type === "SPECIALIST_THUMBNAIL_UPDATE" &&
+      source === "SITE_SPECIALIST"
+    ) {
+      relayToBackground({
+        action: "SPECIALIST_THUMBNAIL_UPDATE",
+        thumbnail: data?.thumbnail,
+        pageUrl: window.location.href,
+      });
+    }
+
     if (type === "LALHLIMPUII_JAHAU_DETECTED" && source) {
       console.log(
         "[Multi-DL] Relaying LALHLIMPUII_JAHAU detection from:",

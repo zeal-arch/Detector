@@ -74,6 +74,57 @@ function createMockEnv() {
     clearInterval,
     Promise,
   };
+  // YouTube's player.js is wrapped in (function(g){...})(window._yt_player || ...).
+  // N-sig functions extracted from inside the IIFE may reference `g` (the parameter).
+  // Provide a Proxy-based mock so these references don't throw ReferenceError.
+  // The Proxy returns stub functions for unknown properties, preventing
+  // "g.YB is not a function" crashes when the bundler misses a dependency.
+  const ytPlayerMock = new Proxy(
+    {},
+    {
+      get(target, prop) {
+        if (prop in target) return target[prop];
+        // Symbol properties and internal JS methods — pass through
+        if (typeof prop === "symbol") return undefined;
+        // Return a no-op function stub for any unknown property access.
+        // This won't produce correct results, but prevents fatal crashes
+        // so that validation can detect the transform failed and fall back
+        // to the full player.js AST solver (Try 3).
+        const stub = function () {
+          return undefined;
+        };
+        console.warn("[Sandbox] Mock g." + String(prop) + " accessed (stub)");
+        target[prop] = stub; // cache it for repeated access
+        return stub;
+      },
+      set(target, prop, value) {
+        target[prop] = value;
+        return true;
+      },
+    },
+  );
+  mockWindow._yt_player = ytPlayerMock;
+  mockWindow.g = ytPlayerMock;
+  // Other common IIFE parameter names YouTube has used historically
+  mockWindow.h = new Proxy(
+    {},
+    {
+      get(target, prop) {
+        if (prop in target) return target[prop];
+        if (typeof prop === "symbol") return undefined;
+        const stub = function () {
+          return undefined;
+        };
+        target[prop] = stub;
+        return stub;
+      },
+      set(target, prop, value) {
+        target[prop] = value;
+        return true;
+      },
+    },
+  );
+
   mockWindow.window = mockWindow;
   mockWindow.self = mockWindow;
   mockWindow.globalThis = mockWindow;

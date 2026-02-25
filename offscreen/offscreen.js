@@ -116,7 +116,7 @@ function handleEvalNSig(msg, sendResponse) {
 
   setTimeout(() => {
     if (pending.has(id)) {
-      console.warn("[OFFSCREEN] N-sig sandbox eval timed out after 10s");
+      console.log("[OFFSCREEN] N-sig sandbox eval timed out after 10s");
       pending.get(id)({
         error: "Sandbox timeout",
         results: [],
@@ -144,7 +144,7 @@ function handleEvalCipher(msg, sendResponse) {
 
   setTimeout(() => {
     if (pending.has(id)) {
-      console.warn("[OFFSCREEN] Cipher sandbox eval timed out after 10s");
+      console.log("[OFFSCREEN] Cipher sandbox eval timed out after 10s");
       pending.get(id)({
         error: "Sandbox cipher timeout",
         results: [],
@@ -162,7 +162,7 @@ function handleSolvePlayer(msg, sendResponse) {
   const playerUrl = msg.playerUrl || "";
   const failedAt = failedPlayerUrls.get(playerUrl);
   if (failedAt && Date.now() - failedAt < SOLVER_FAIL_COOLDOWN) {
-    console.warn(
+    console.log(
       `[OFFSCREEN] Skipping solver for recently-failed player URL (cooldown active): ${playerUrl}`,
     );
     sendResponse({
@@ -193,7 +193,7 @@ function handleSolvePlayer(msg, sendResponse) {
   // Use a generous 30s timeout
   setTimeout(() => {
     if (pending.has(id)) {
-      console.warn("[OFFSCREEN] Player solver timed out after 30s");
+      console.log("[OFFSCREEN] Player solver timed out after 30s");
       // Mark this player URL as failed to prevent retry storms
       if (playerUrl) {
         failedPlayerUrls.set(playerUrl, Date.now());
@@ -213,7 +213,7 @@ function handleSolvePlayer(msg, sendResponse) {
         sandbox.src = src;
         console.log("[OFFSCREEN] Sandbox iframe reloaded after solver timeout");
       } catch (e) {
-        console.warn("[OFFSCREEN] Failed to reload sandbox iframe:", e.message);
+        console.log("[OFFSCREEN] Failed to reload sandbox iframe:", e.message);
       }
     }
   }, 30000);
@@ -331,7 +331,7 @@ async function downloadToBuffer(url, label, signal, onProgress) {
     } catch (fetchErr) {
       // Network error (QUIC protocol error, connection reset, DNS failure, etc.)
       if (fetchErr.name === "AbortError") throw fetchErr;
-      console.warn(
+      console.log(
         `[OFFSCREEN] Network error downloading ${label} (attempt ${attempt + 1}/3): ${fetchErr.message}`,
       );
       lastStatus = 0;
@@ -443,7 +443,7 @@ async function cleanupMergeOPFS() {
     }
     console.log(`[OFFSCREEN] OPFS cleanup done (removed ${removed} entries)`);
   } catch (e) {
-    console.warn("[OFFSCREEN] OPFS cleanup error:", e.message);
+    console.log("[OFFSCREEN] OPFS cleanup error:", e.message);
   }
 }
 
@@ -560,10 +560,7 @@ async function probeInputFile(libav, filename) {
     try {
       await libav.avformat_close_input_js(fmt_ctx);
     } catch (closeErr) {
-      console.warn(
-        `[OFFSCREEN] Probe close warning for ${filename}:`,
-        closeErr,
-      );
+      console.log(`[OFFSCREEN] Probe close warning for ${filename}:`, closeErr);
     }
 
     console.log(
@@ -573,7 +570,7 @@ async function probeInputFile(libav, filename) {
     );
     return info;
   } catch (e) {
-    console.warn(`[OFFSCREEN] Pre-flight probe of ${filename} failed:`, e);
+    console.log(`[OFFSCREEN] Pre-flight probe of ${filename} failed:`, e);
     return {
       valid: false,
       hasVideo: false,
@@ -636,7 +633,7 @@ async function handleMergeAndDownload(msg, sendResponse) {
     );
   } catch (e) {
     // HEAD may fail, continue anyway
-    console.warn("[OFFSCREEN] Failed to estimate merge size:", e.message);
+    console.log("[OFFSCREEN] Failed to estimate merge size:", e.message);
   }
 
   // Queue the merge if it's large
@@ -896,7 +893,7 @@ async function _doMerge(msg, sendResponse) {
     if (isCancelled) {
       console.log("[OFFSCREEN] Merge cancelled by user");
     } else {
-      console.error(
+      console.log(
         "[OFFSCREEN] Merge failed:",
         err.name,
         err.message,
@@ -947,6 +944,76 @@ function ensureMp4Extension(filename) {
 
 const activeWorkers = new Map();
 
+function persistTrueparadiseHosts(hosts) {
+  if (!Array.isArray(hosts) || hosts.length === 0) return;
+
+  const sanitized = [
+    ...new Set(hosts.filter((h) => typeof h === "string" && h)),
+  ];
+  if (sanitized.length === 0) return;
+
+  // Prefer direct storage when available, otherwise delegate to background.
+  function sendViaBackground() {
+    chrome.runtime.sendMessage(
+      {
+        target: "background",
+        action: "SET_TRUEPARADISE_HOSTS",
+        hosts: sanitized,
+      },
+      () => {
+        // ignore runtime.lastError here; persistence is best-effort
+      },
+    );
+  }
+
+  if (chrome?.storage?.local?.set) {
+    try {
+      chrome.storage.local
+        .set({ trueparadiseHosts: sanitized })
+        .catch(() => sendViaBackground());
+      return;
+    } catch {
+      /* storage API threw synchronously — fall through */
+    }
+  }
+
+  sendViaBackground();
+}
+
+function loadTrueparadiseHosts(callback) {
+  if (typeof callback !== "function") return;
+
+  // Prefer direct storage when available, otherwise delegate to background.
+  function loadViaBackground() {
+    chrome.runtime.sendMessage(
+      {
+        target: "background",
+        action: "GET_TRUEPARADISE_HOSTS",
+      },
+      (response) => {
+        callback(response?.hosts || []);
+      },
+    );
+  }
+
+  if (chrome?.storage?.local?.get) {
+    try {
+      chrome.storage.local.get("trueparadiseHosts", (result) => {
+        if (chrome.runtime.lastError) {
+          loadViaBackground();
+          return;
+        }
+        callback(result?.trueparadiseHosts || []);
+      });
+      return;
+    } catch {
+      /* storage API threw synchronously — fall through */
+    }
+  }
+
+  loadViaBackground();
+}
+
 function handleStartWorkerDownload(msg, sendResponse) {
   const { downloadId, url, type, filename, headers, sessionRuleId, tabId } =
     msg;
@@ -976,6 +1043,13 @@ function handleStartWorkerDownload(msg, sendResponse) {
           });
           break;
 
+        case "persist_hosts":
+          // Worker discovered new CDN mirror hosts — persist to storage
+          if (msgData?.hosts?.length) {
+            persistTrueparadiseHosts(msgData.hosts);
+          }
+          break;
+
         case "request_url_refresh":
           // S35 fix: Worker detected YouTube URL expiry, request fresh URLs
           console.log("[OFFSCREEN] Worker requesting URL refresh");
@@ -997,7 +1071,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                   },
                 });
               } else {
-                console.warn(
+                console.log(
                   "[OFFSCREEN] URL refresh failed:",
                   refreshResponse?.error,
                 );
@@ -1024,7 +1098,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                   downloadId,
                   phase: "merging",
                   message: "Merging video + audio tracks...",
-                  percent: 85,
+                  percent: 86,
                   filename,
                 });
 
@@ -1149,7 +1223,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 URL.revokeObjectURL(msgData.audioBlobUrl);
               } catch (mergeErr) {
                 cleanupMEMFS();
-                console.warn(
+                console.log(
                   "[OFFSCREEN] Audio merge failed, downloading video only:",
                   mergeErr,
                 );
@@ -1185,7 +1259,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 );
 
                 if (actualSize >= TRANSMUX_MAX) {
-                  console.warn(
+                  console.log(
                     `[OFFSCREEN] File too large for transmux (${(actualSize / 1024 / 1024 / 1024).toFixed(2)} GB > ${(TRANSMUX_MAX / 1024 / 1024 / 1024).toFixed(2)} GB). Delivering as raw .ts`,
                   );
 
@@ -1203,7 +1277,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                     downloadId,
                     phase: "transmuxing",
                     message: "Converting TS → MP4...",
-                    percent: 85,
+                    percent: 86,
                     filename,
                   });
 
@@ -1312,7 +1386,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 }
               } catch (transmuxErr) {
                 cleanupMEMFS();
-                console.warn(
+                console.log(
                   "[OFFSCREEN] Transmux failed or skipped, falling back to raw TS:",
                   transmuxErr,
                 );
@@ -1337,7 +1411,25 @@ function handleStartWorkerDownload(msg, sendResponse) {
                     : msgData.size || 0;
               }
             } else {
-              finalBlobUrl = msgData.blobUrl;
+              // No transmux needed — but the blob URL was created by the Web
+              // Worker whose context will be terminated shortly.  Re-materialize
+              // the blob in the offscreen document so Chrome's download manager
+              // can read from it even after worker.terminate().
+              try {
+                const passResp = await fetch(msgData.blobUrl);
+                const passBlob = await passResp.blob();
+                URL.revokeObjectURL(msgData.blobUrl); // free worker's blob
+                finalBlobUrl = URL.createObjectURL(passBlob);
+                console.log(
+                  `[OFFSCREEN] Re-materialized worker blob in offscreen context (${(passBlob.size / 1024 / 1024).toFixed(1)} MB)`,
+                );
+              } catch (reMatErr) {
+                console.warn(
+                  "[OFFSCREEN] Re-materialize failed, using worker blob URL:",
+                  reMatErr.message,
+                );
+                finalBlobUrl = msgData.blobUrl;
+              }
               const ct = msgData.mimeType || msgData.contentType;
               finalFilename = msgData.needsMerge
                 ? filename
@@ -1345,66 +1437,95 @@ function handleStartWorkerDownload(msg, sendResponse) {
               finalSize = msgData.size || 0;
             }
 
+            // Send a final "saving" progress before download delegation
+            bc.postMessage({
+              type: "WORKER_PROGRESS",
+              downloadId,
+              phase: "saving",
+              message: "Saving file...",
+              percent: 97,
+              filename: finalFilename || filename,
+            });
+
             const opfsCleanup = msgData.opfsCleanupInfo || null;
 
-            chrome.downloads.download(
-              {
-                url: finalBlobUrl,
-                filename: finalFilename,
-                saveAs: true,
-              },
-              (dlId) => {
-                if (chrome.runtime.lastError) {
-                  console.error(
-                    "[OFFSCREEN] Worker download error:",
-                    chrome.runtime.lastError.message,
-                  );
-
-                  URL.revokeObjectURL(finalBlobUrl);
-                  if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
-                  return;
-                }
-
-                const onChanged = (delta) => {
-                  if (delta.id !== dlId) return;
-                  if (
-                    delta.state &&
-                    (delta.state.current === "complete" ||
-                      delta.state.current === "interrupted")
-                  ) {
-                    chrome.downloads.onChanged.removeListener(onChanged);
-                    console.log(
-                      `[OFFSCREEN] Download ${dlId} ${delta.state.current} — cleaning up`,
-                    );
-                    URL.revokeObjectURL(finalBlobUrl);
-                    if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
-                  }
-                };
-                chrome.downloads.onChanged.addListener(onChanged);
-
-                setTimeout(
-                  () => {
-                    chrome.downloads.onChanged.removeListener(onChanged);
-                    URL.revokeObjectURL(finalBlobUrl);
-                    if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
-                  },
-                  30 * 60 * 1000, // 30min safety net (primary cleanup is via onChanged listener)
-                );
-              },
-            );
+            // chrome.downloads is NOT available in offscreen documents —
+            // delegate to the background service worker which owns the API.
+            //
+            // IMPORTANT: worker.terminate() is deferred to the cleanup handler
+            // (or safety net timeout) so the worker's OPFS file handles remain
+            // valid until Chrome's download manager has finished reading blob data.
+            const terminateWorker = () => {
+              try {
+                worker.terminate();
+              } catch (e) {}
+              activeWorkers.delete(downloadId);
+              cleanupAllHeaders();
+            };
 
             chrome.runtime
               .sendMessage({
                 target: "background",
-                action: "WORKER_COMPLETE",
-                downloadId,
-                success: true,
+                action: "OFFSCREEN_DOWNLOAD",
+                url: finalBlobUrl,
                 filename: finalFilename,
+                downloadId,
                 size: finalSize,
               })
-              .catch(() => {});
+              .then((resp) => {
+                if (!resp || !resp.success) {
+                  console.log(
+                    "[OFFSCREEN] Background download failed:",
+                    resp?.error,
+                  );
+                  URL.revokeObjectURL(finalBlobUrl);
+                  if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
+                  terminateWorker();
+                  return;
+                }
+                console.log(
+                  `[OFFSCREEN] Download delegated to background (dlId=${resp.dlId})`,
+                );
+                // Background will notify us when the download completes so
+                // we can clean up the blob URL and OPFS files.
+                const cleanupHandler = (cmsg) => {
+                  if (
+                    cmsg.action === "DOWNLOAD_CLEANUP" &&
+                    cmsg.dlId === resp.dlId
+                  ) {
+                    chrome.runtime.onMessage.removeListener(cleanupHandler);
+                    console.log(
+                      `[OFFSCREEN] Download ${resp.dlId} ${cmsg.state} — cleaning up`,
+                    );
+                    URL.revokeObjectURL(finalBlobUrl);
+                    if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
+                    terminateWorker();
+                  }
+                };
+                chrome.runtime.onMessage.addListener(cleanupHandler);
+
+                // 30-min safety net
+                setTimeout(
+                  () => {
+                    chrome.runtime.onMessage.removeListener(cleanupHandler);
+                    URL.revokeObjectURL(finalBlobUrl);
+                    if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
+                    terminateWorker();
+                  },
+                  30 * 60 * 1000,
+                );
+              })
+              .catch((err) => {
+                console.log(
+                  "[OFFSCREEN] Failed to contact background for download:",
+                  err,
+                );
+                URL.revokeObjectURL(finalBlobUrl);
+                if (opfsCleanup) cleanupOPFS(opfsCleanup.folder);
+                terminateWorker();
+              });
           } catch (err) {
-            console.error("[OFFSCREEN] Worker result handling error:", err);
+            console.log("[OFFSCREEN] Worker result handling error:", err);
             chrome.runtime
               .sendMessage({
                 target: "background",
@@ -1415,15 +1536,15 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 filename,
               })
               .catch(() => {});
+            worker.terminate();
+            activeWorkers.delete(downloadId);
+            cleanupAllHeaders();
           }
 
-          worker.terminate();
-          activeWorkers.delete(downloadId);
-          cleanupAllHeaders();
           break;
 
         case "download_error":
-          console.error("[OFFSCREEN] Worker error:", msgData.error);
+          console.log("[OFFSCREEN] Worker error:", msgData.error);
           // Clean up any OPFS folders created for this download
           cleanupOPFSByPrefix(`m3u8_${downloadId}_`);
           chrome.runtime
@@ -1467,7 +1588,7 @@ function handleStartWorkerDownload(msg, sendResponse) {
     };
 
     worker.onerror = (e) => {
-      console.error("[OFFSCREEN] Worker crash:", e.message);
+      console.log("[OFFSCREEN] Worker crash:", e.message);
       chrome.runtime
         .sendMessage({
           target: "background",
@@ -1496,10 +1617,20 @@ function handleStartWorkerDownload(msg, sendResponse) {
       },
     });
 
+    // Load persisted CDN mirror hosts into the worker's pool
+    loadTrueparadiseHosts((hosts) => {
+      if (hosts?.length) {
+        worker.postMessage({
+          name: "load_hosts",
+          data: { hosts },
+        });
+      }
+    });
+
     console.log(`[OFFSCREEN] Started download worker: ${downloadId} (${type})`);
     sendResponse({ success: true, downloadId });
   } catch (err) {
-    console.error("[OFFSCREEN] Failed to start worker:", err);
+    console.log("[OFFSCREEN] Failed to start worker:", err);
     cleanupAllHeaders();
     sendResponse({ success: false, error: err.message });
   }
@@ -1532,7 +1663,7 @@ async function cleanupOPFS(folderName) {
     await root.removeEntry(folderName, { recursive: true });
     console.log(`[OFFSCREEN] OPFS cleanup: removed ${folderName}`);
   } catch (e) {
-    console.warn(`[OFFSCREEN] OPFS cleanup failed (non-critical):`, e.message);
+    console.log(`[OFFSCREEN] OPFS cleanup failed (non-critical):`, e.message);
   }
 }
 
@@ -1551,7 +1682,7 @@ async function cleanupOPFSByPrefix(prefix) {
       }
     }
   } catch (e) {
-    console.warn(`[OFFSCREEN] OPFS prefix cleanup error:`, e.message);
+    console.log(`[OFFSCREEN] OPFS prefix cleanup error:`, e.message);
   }
 }
 

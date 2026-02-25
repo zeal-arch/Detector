@@ -203,6 +203,26 @@
   }
 
   /**
+   * Check whether a variable name is exported to `_yt_player` (a.k.a. `g`)
+   * inside the player.js IIFE.  Variables assigned via `g.NAME = ...` become
+   * properties of `_yt_player` and are accessible from the page.  Variables
+   * declared with `var NAME = ...` inside the IIFE are closure-local and will
+   * NEVER appear on `_yt_player` or `window`.
+   *
+   * Returns true if exported, false if closure-local / not found.
+   */
+  function isExportedToYTPlayer(js, name) {
+    if (!name) return false;
+    var esc = escRe(name);
+    // g.NAME = ... (common in player IIFE that receives _yt_player as g)
+    if (new RegExp("[;,}\\n]\\s*g\\s*\\." + esc + "\\s*=").test(js))
+      return true;
+    // _yt_player.NAME = ... (outside IIFE, e.g. inline <script>)
+    if (new RegExp("_yt_player\\s*\\." + esc + "\\s*=").test(js)) return true;
+    return false;
+  }
+
+  /**
    * Find external dependency names from player.js code.
    * YouTube 2025+ splits key functions between player.js (base.js) and inline scripts.
    * The cipher helper (e.g., eO) and N-sig wrapper (e.g., R8K) are defined as
@@ -220,11 +240,15 @@
     };
 
     // Find the lookup array: var NAME = "...".split("DELIM") with 50+ elements
+    // Support both single and double-quoted strings (YouTube 2025+ uses single quotes)
+    // Use alternation since single-quoted strings may contain " and vice versa
     var lookupRe =
-      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/g;
     var lm;
     while ((lm = lookupRe.exec(js)) !== null) {
-      var parts = lm[2].split(lm[3]);
+      var lookupStr = lm[2] || lm[3];
+      var lookupDelim = lm[4] || lm[5];
+      var parts = lookupStr.split(lookupDelim);
       if (parts.length > 50) {
         result.lookupName = lm[1];
         result.lookupArray = parts;
@@ -914,17 +938,11 @@
 
     for (var attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        if (attempt <= 2) {
-          return await fetchPlayerJsXHR(url);
-        } else if (attempt === 3) {
-          console.log(
-            TAG,
-            "Trying fetch() API with force-cache for player.js (attempt " +
-              attempt +
-              ")",
-          );
+        if (attempt === 1) {
+          // Attempt 1: fetch() with force-cache (fastest, avoids network)
           return await fetchPlayerJsFetch(url);
-        } else if (attempt === 4) {
+        } else if (attempt === 2) {
+          // Attempt 2: fetch() with no-cache (bypass stale cache)
           console.log(
             TAG,
             "Trying fetch() API with no-cache for player.js (attempt " +
@@ -941,6 +959,33 @@
               if (!text || text.length < 1000) {
                 throw new Error(
                   "Player.js no-cache response empty or too small (" +
+                    (text || "").length +
+                    " bytes)",
+                );
+              }
+              return text;
+            });
+        } else if (attempt === 3) {
+          // Attempt 3: XHR (may fail due to YouTube service worker)
+          return await fetchPlayerJsXHR(url);
+        } else if (attempt === 4) {
+          // Attempt 4: fetch() with cache: "reload" (force fresh)
+          console.log(
+            TAG,
+            "Trying fetch() with cache reload for player.js (attempt " +
+              attempt +
+              ")",
+          );
+          return await fetch(url, { credentials: "omit", cache: "reload" })
+            .then(function (resp) {
+              if (!resp.ok)
+                throw new Error("Player.js fetch HTTP " + resp.status);
+              return resp.text();
+            })
+            .then(function (text) {
+              if (!text || text.length < 1000) {
+                throw new Error(
+                  "Player.js reload response empty or too small (" +
                     (text || "").length +
                     " bytes)",
                 );
@@ -1089,10 +1134,12 @@
       /[$_a-zA-Z0-9]+\.set\((?:[$_a-zA-Z0-9]+\.[$_a-zA-Z0-9]+\|\|)?"signature",\s*([$_a-zA-Z0-9]+)\s*\(/,
       /\.set\([^,]+,encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
       /=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(\w+\.s\)\)/,
-      /&&\(\w+=([a-zA-Z0-9$]+)\("[^"]*",decodeURIComponent/,
+      /&&\(\w+=([a-zA-Z0-9$]+)\(["'][^"']*["'],decodeURIComponent/,
       /&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/,
       /\.set\("signature",\s*([a-zA-Z0-9$]+)\(/,
       /\.set\([^,]+,\s*([a-zA-Z0-9$]{2,})\(decodeURIComponent/,
+      // 2025+ dispatch cipher: funcName(NUMBER, decodeURIComponent(*.s))
+      /=([a-zA-Z0-9$]{2,})\(\d+\s*,\s*decodeURIComponent\(\w+\.s\)\)/,
     ];
 
     for (var i = 0; i < patterns.length; i++) {
@@ -1103,11 +1150,11 @@
       }
     }
 
-    // Fallback: find by split("") pattern
+    // Fallback: find by split("") or split('') pattern
     var splitJoinPatterns = [
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*\((\w+)\)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*(\w+)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
+      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{\s*\2\s*=\s*\2\.split\(\s*(?:""|'')\s*\)/m,
+      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*\((\w+)\)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*(?:""|'')\s*\)/m,
+      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*(\w+)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*(?:""|'')\s*\)/m,
     ];
     for (var j = 0; j < splitJoinPatterns.length; j++) {
       var m = js.match(splitJoinPatterns[j]);
@@ -1168,21 +1215,25 @@
       ", decodeURIComponent(...))",
     );
 
-    // Find lookup array: var NAME = "...".split("DELIM") with 50+ elements
+    // Find lookup array: var NAME = "...".split("DELIM") or '...'.split(';') with 50+ elements
+    // Support both single and double-quoted strings (YouTube 2025+ uses single quotes)
+    // Use alternation since single-quoted strings may contain " and vice versa
     var lookupArrayRe =
-      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/g;
     var lookupMatch = null;
     var lookupName = null;
     var lookupRaw = null;
     var lookupDelim = null;
     var lm;
     while ((lm = lookupArrayRe.exec(js)) !== null) {
-      var parts = lm[2].split(lm[3]);
+      var lookupStr = lm[2] || lm[3];
+      var lookupDlm = lm[4] || lm[5];
+      var parts = lookupStr.split(lookupDlm);
       if (parts.length > 50) {
         lookupMatch = lm;
         lookupName = lm[1];
-        lookupRaw = lm[2];
-        lookupDelim = lm[3];
+        lookupRaw = lookupStr;
+        lookupDelim = lookupDlm;
         break;
       }
     }
@@ -1325,16 +1376,22 @@
     if (!helperBlock) return null;
 
     // Build self-contained code
+    // Choose quote char that's safe for the content (if content has " use ', and vice versa)
+    var q = lookupRaw.indexOf('"') !== -1 ? "'" : '"';
     var argName = "_sig_";
     var paramStr = paramNames.length > 0 ? paramNames.join(",") : "b,N";
     var code =
       "var " +
       lookupName +
-      '="' +
+      "=" +
+      q +
       lookupRaw +
-      '".split("' +
+      q +
+      ".split(" +
+      q +
       lookupDelim +
-      '");\n' +
+      q +
+      ");\n" +
       "var " +
       helperName +
       "=" +
@@ -1498,7 +1555,7 @@
             escRe(argName) +
             "\\s*=\\s*" +
             escRe(argName) +
-            '\\.split\\(\\s*""\\s*\\)\\s*;?',
+            "\\.split\\(\\s*(?:\"\"|''\)\\s*\\)\\s*;?",
         ),
         "",
       ) +
@@ -1837,9 +1894,9 @@
 
     // DIAGNOSTIC: Dump key structural signatures from player.js
     console.log(TAG, "[DIAG] ====== PLAYER.JS STRUCTURE DUMP ======");
-    // Check for split("DELIM") large arrays
+    // Check for split("DELIM") large arrays (support both quote types)
     var bigArrays = js.match(
-      /([a-zA-Z0-9$_]+)\s*=\s*"[^"]{200,}"\s*\.\s*split\s*\(/g,
+      /([a-zA-Z0-9$_]+)\s*=\s*(?:"[^"]{200,}"|'[^']{200,}')\s*\.\s*split\s*\(/g,
     );
     console.log(
       TAG,
@@ -1874,63 +1931,119 @@
     // === Step 1: Find external dependency names (2025+ architecture) ===
     var externalDeps = findExternalDeps(js);
 
-    // === Step 2: Try direct global access first (fast, reliable) ===
+    // === Step 2: Try direct global access (fast path) ===
     //
-    // On fresh navigation (typing youtube.com), the inline <script> tags
-    // that define cipher helper (eO) and N-sig wrapper (R8K) may not have
-    // executed yet. Poll for them to appear in _yt_player / window.
+    // Check if cipher helper and N-sig wrapper are exported to _yt_player
+    // (via `g.NAME = ...` inside the IIFE).  If they are NOT exported, they
+    // are closure-local variables and will NEVER appear on window/_yt_player.
+    // In that case, skip the expensive polling entirely (saves ~3s).
     var cipherActions = null;
     var nSigFn = null;
 
-    if (externalDeps.cipherHelper && externalDeps.cipherOps.length > 0) {
+    var cipherHelperExported = isExportedToYTPlayer(
+      js,
+      externalDeps.cipherHelper,
+    );
+    var nSigWrapperExported = isExportedToYTPlayer(
+      js,
+      externalDeps.nSigWrapper,
+    );
+
+    console.log(
+      TAG,
+      "IIFE export check — cipherHelper:",
+      externalDeps.cipherHelper || "none",
+      cipherHelperExported ? "(exported)" : "(IIFE-local)",
+      "| nSigWrapper:",
+      externalDeps.nSigWrapper || "none",
+      nSigWrapperExported ? "(exported)" : "(IIFE-local)",
+    );
+
+    // Only attempt global access for exported names
+    if (
+      cipherHelperExported &&
+      externalDeps.cipherHelper &&
+      externalDeps.cipherOps.length > 0
+    ) {
       cipherActions = buildCipherActionsFromGlobal(
         externalDeps.cipherHelper,
         externalDeps.cipherOps,
       );
-      // If not found immediately, wait for the global to appear
-      if (!cipherActions) {
-        console.log(
-          TAG,
-          "Cipher helper not ready yet, waiting for:",
-          externalDeps.cipherHelper,
-        );
-        var cipherReady = await waitForYTGlobal(
-          externalDeps.cipherHelper,
-          6000,
-        );
-        if (cipherReady) {
-          console.log(
-            TAG,
-            "Cipher helper became available after polling:",
-            externalDeps.cipherHelper,
-          );
-          cipherActions = buildCipherActionsFromGlobal(
-            externalDeps.cipherHelper,
-            externalDeps.cipherOps,
-          );
-        }
-      }
     }
 
-    if (externalDeps.nSigWrapper) {
+    if (nSigWrapperExported && externalDeps.nSigWrapper) {
       nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
-      // If not found immediately, wait for the global to appear
-      if (!nSigFn) {
+    }
+
+    // Only poll for globals that ARE exported but not yet available
+    // (timing gap on fresh page load).  IIFE-locals are skipped entirely.
+    if (
+      (cipherHelperExported &&
+        externalDeps.cipherHelper &&
+        externalDeps.cipherOps.length > 0 &&
+        !cipherActions) ||
+      (nSigWrapperExported && externalDeps.nSigWrapper && !nSigFn)
+    ) {
+      var pollPromises = [];
+
+      if (!cipherActions && cipherHelperExported && externalDeps.cipherHelper) {
         console.log(
           TAG,
-          "N-sig wrapper not ready yet, waiting for:",
+          "Cipher helper exported but not ready, polling for:",
+          externalDeps.cipherHelper,
+        );
+        pollPromises.push(
+          waitForYTGlobal(externalDeps.cipherHelper, 1500).then(
+            function (ready) {
+              if (ready) {
+                console.log(
+                  TAG,
+                  "Cipher helper became available after polling:",
+                  externalDeps.cipherHelper,
+                );
+                cipherActions = buildCipherActionsFromGlobal(
+                  externalDeps.cipherHelper,
+                  externalDeps.cipherOps,
+                );
+              }
+            },
+          ),
+        );
+      }
+
+      if (!nSigFn && nSigWrapperExported && externalDeps.nSigWrapper) {
+        console.log(
+          TAG,
+          "N-sig wrapper exported but not ready, polling for:",
           externalDeps.nSigWrapper,
         );
-        var nSigReady = await waitForYTGlobal(externalDeps.nSigWrapper, 6000);
-        if (nSigReady) {
-          console.log(
-            TAG,
-            "N-sig wrapper became available after polling:",
-            externalDeps.nSigWrapper,
-          );
-          nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
-        }
+        pollPromises.push(
+          waitForYTGlobal(externalDeps.nSigWrapper, 1500).then(
+            function (ready) {
+              if (ready) {
+                console.log(
+                  TAG,
+                  "N-sig wrapper became available after polling:",
+                  externalDeps.nSigWrapper,
+                );
+                nSigFn = getNSigFromGlobal(externalDeps.nSigWrapper);
+              }
+            },
+          ),
+        );
       }
+
+      await Promise.all(pollPromises);
+    } else if (
+      !cipherHelperExported &&
+      !nSigWrapperExported &&
+      (externalDeps.cipherHelper || externalDeps.nSigWrapper)
+    ) {
+      console.log(
+        TAG,
+        "Both deps are IIFE-local — skipping global polling (saves ~3s). " +
+          "Background.js will handle extraction via AST solver.",
+      );
     }
 
     // === Step 3: Fallback to code extraction (legacy approach) ===
@@ -2233,8 +2346,22 @@
     var data = extractPageData();
 
     if (!data.playerResponse) {
-      console.log(TAG, "No playerResponse on page, sending raw data");
-      sendToContentScript(data);
+      // Only send if we have at least a videoId or playerUrl — background.js
+      // can use these to kick off its own pipeline.  Sending completely empty
+      // data wastes a round-trip and may cause pendingRequests to latch onto
+      // the empty payload.
+      if (data.videoId || data.playerUrl) {
+        console.log(
+          TAG,
+          "No playerResponse yet, sending metadata (videoId/playerUrl) to background",
+        );
+        sendToContentScript(data);
+      } else {
+        console.log(
+          TAG,
+          "No playerResponse and no metadata — skipping send (retry will fire)",
+        );
+      }
       return {
         hasFormats: false,
         directCipher: false,
@@ -2294,6 +2421,17 @@
       data.directCipher = !!playerData.cipherActions;
       data.directNSig = !!playerData.nSigFn;
 
+      // Signal to background.js that deps are IIFE-local — it should rely
+      // on its own player.js fetch + AST solver rather than inject.js code.
+      data.depsAreIIFELocal =
+        !!(
+          playerData.externalDeps &&
+          (playerData.externalDeps.cipherHelper ||
+            playerData.externalDeps.nSigWrapper)
+        ) &&
+        !data.directCipher &&
+        !data.directNSig;
+
       if (
         playerData.extractionErrors &&
         playerData.extractionErrors.length > 0
@@ -2310,10 +2448,13 @@
         playerData.cipherActions
           ? "✓(direct)"
           : data.cipherCode
-            ? "✓(code)"
+            ? "✓(code→bg)"
             : "✗",
         "| nSig:",
-        playerData.nSigFn ? "✓(direct)" : data.nSigCode ? "✓(code)" : "✗",
+        playerData.nSigFn ? "✓(direct)" : data.nSigCode ? "✓(code→bg)" : "✗",
+        data.depsAreIIFELocal
+          ? "| deps=IIFE-local (background.js will use AST solver)"
+          : "",
       );
     } catch (e) {
       console.warn(TAG, "Format resolution failed:", e.message);
@@ -2323,10 +2464,21 @@
     sendToContentScript(data);
 
     // Return success info for retry logic
+    // codeExtracted: true when cipher/nSig code was extracted and sent to
+    // background.js for sandbox eval — inject.js reports 0 local formats but
+    // background.js will handle resolution via its Tier 1/2/3 pipeline.
+    // Also true when deps are IIFE-local — background.js has its own
+    // player.js fetch + AST solver that doesn't need inject.js code.
+    var codeExtracted = !!(
+      data.cipherCode ||
+      data.nSigCode ||
+      data.depsAreIIFELocal
+    );
     return {
       hasFormats: !!(data.resolvedFormats && data.resolvedFormats.length > 0),
       directCipher: !!data.directCipher,
       directNSig: !!data.directNSig,
+      codeExtracted: codeExtracted,
       fetchFailed: !!(playerData && playerData.fetchFailed),
     };
   }
@@ -2346,8 +2498,16 @@
       processVideo()
         .then(function (result) {
           if (myNav !== _navCounter) return;
-          // Auto-retry if we failed to get formats or globals weren't ready
-          if (result && !result.hasFormats && _retryCount < _maxAutoRetries) {
+          // Auto-retry if we failed to get formats AND code extraction also
+          // failed. When code was extracted (cipher/nSig as code strings),
+          // the data was already sent to background.js for sandbox eval —
+          // retrying inject.js processing won't help.
+          if (
+            result &&
+            !result.hasFormats &&
+            !result.codeExtracted &&
+            _retryCount < _maxAutoRetries
+          ) {
             _retryCount++;
             var retryDelay = 3000 * _retryCount; // 3s, 6s
             console.log(
@@ -2364,6 +2524,8 @@
                 result.directCipher +
                 " nSig:" +
                 result.directNSig +
+                " codeExtracted:" +
+                result.codeExtracted +
                 " fetchFailed:" +
                 result.fetchFailed +
                 ")",

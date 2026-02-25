@@ -10,57 +10,218 @@
   let detectionAttempted = false;
 
   const SPECIALIST_SITES = [
+    // Video platforms
     "youtube.com",
     "youtu.be",
     "vimeo.com",
+    "dailymotion.com",
+    "rutube.ru",
+    "rumble.com",
+    "bitchute.com",
+    "odysee.com",
+    "peertube.tv",
+    "dtube.video",
+    "vlare.tv",
+    "metacafe.com",
+    "newgrounds.com",
+    "streamable.com",
+    "coub.com",
+
+    // Social media
+    "facebook.com",
+    "fb.watch",
+    "reddit.com",
+    "tiktok.com",
+    "snapchat.com",
+    "pinterest.com",
+    "linkedin.com",
+    "tumblr.com",
     "vk.com",
     "vk.ru",
     "vkvideo.ru",
-    "facebook.com",
-    "instagram.com",
-    "iq.com",
     "ok.ru",
-    "canva.com",
-    "tiktok.com",
+    "weibo.com",
+    "bluesky.app",
+    "bsky.app",
+    "likee.video",
+    "triller.co",
+    "instagram.com",
     "twitter.com",
     "x.com",
-    "twitch.tv",
-    "reddit.com",
-    "dailymotion.com",
-    "streamable.com",
-    "9gag.com",
-    "imgur.com",
-    "rumble.com",
-    "bitchute.com",
 
-    "flixtor.li",
-    "flixtor.to",
-    "flixtor.id",
-
+    // Streaming services
     "netflix.com",
-    "hulu.com",
     "disneyplus.com",
     "hbomax.com",
     "max.com",
+    "hulu.com",
     "primevideo.com",
     "amazon.com",
     "peacocktv.com",
     "paramountplus.com",
+    "starz.com",
+    "showtime.com",
+    "britbox.com",
+    "crunchyroll.com",
+    "funimation.com",
+    "curiositystream.com",
+    "nebula.tv",
+    "dropout.tv",
+    "plex.tv",
+    "tubi.tv",
+    "tubitv.com",
+    "plutotv.com",
+    "pluto.tv",
+    "roku.com",
+    "therokuchannel.roku.com",
+    "crackle.com",
+    "popcornflix.com",
+    "popcornmovies.org",
+    "flixtor.to",
+    "flixtor.li",
+    "flixtor.id",
+    "flixtor.se",
+    "flixtor.is",
+    "flixtor.tw",
+    "flixtor.win",
+    "vudu.com",
+    "amcplus.com",
+    "discoveryplus.com",
+    "vhx.tv",
+
+    // Live streaming
+    "twitch.tv",
+    "kick.com",
+    "dlive.tv",
+    "trovo.live",
+    "caffeine.tv",
+    "afreecatv.com",
+    "twitcasting.tv",
+    "huya.com",
+
+    // Audio / music
+    "soundcloud.com",
+    "spotify.com",
+    "deezer.com",
+    "bandcamp.com",
+    "audiomack.com",
+    "mixcloud.com",
+    "iheart.com",
+    "tunein.com",
+    "podbean.com",
+    "spreaker.com",
+    "anchor.fm",
+    "last.fm",
+    "vevo.com",
+
+    // News
+    "cnn.com",
+    "foxnews.com",
+    "bbc.co.uk",
+    "bbc.com",
+    "reuters.com",
+    "bloomberg.com",
+    "cbsnews.com",
+    "nbcnews.com",
+    "aljazeera.com",
+    "france24.com",
+    "dw.com",
+    "skynews.com",
+    "sky.com",
+    "nytimes.com",
+    "washingtonpost.com",
     "espn.com",
+    "abcnews.go.com",
+
+    // Asian platforms
+    "bilibili.com",
+    "acfun.cn",
+    "iq.com",
+    "iqiyi.com",
+    "youku.com",
+    "mgtv.com",
+    "douyin.com",
+    "niconico.jp",
+    "nicovideo.jp",
+    "naver.com",
+    "vlive.tv",
+    "daum.net",
+    "hotstar.com",
+    "sonyliv.com",
+    "zee5.com",
+    "viu.com",
+    "shahid.mbc.net",
+    "tver.jp",
+    "abema.tv",
+
+    // Education
+    "coursera.org",
+    "udemy.com",
+    "skillshare.com",
+    "masterclass.com",
+    "khanacademy.org",
+    "egghead.io",
+    "pluralsight.com",
+    "ted.com",
+
+    // Public broadcasters
+    "ard.de",
+    "ardmediathek.de",
+    "zdf.de",
+    "arte.tv",
+    "france.tv",
+    "rai.it",
+    "raiplay.it",
+    "itv.com",
+    "channel4.com",
+    "svtplay.se",
+    "svt.se",
+    "nrk.no",
+    "dr.dk",
+    "ertflix.gr",
+    "9now.com.au",
+    "sbs.com.au",
+    "nhk.or.jp",
+    "cctv.com",
+    "cda.pl",
+
+    // Hosting / tools / misc
+    "imgur.com",
+    "flickr.com",
+    "archive.org",
+    "dropbox.com",
+    "loom.com",
+    "vidyard.com",
+    "wistia.com",
+    "canva.com",
+    "floatplane.com",
+    "patreon.com",
+    "steam.com",
+    "steampowered.com",
+    "medal.tv",
+    "gfycat.com",
+    "redgifs.com",
+    "telegram.org",
+    "t.me",
+    "web.telegram.org",
+    "globo.com",
+    "globoplay.com",
+
+    // Embed / player CDNs
+    "brightcove.com",
+    "players.brightcove.net",
+    "jwplayer.com",
+    "cdn.jwplayer.com",
+    "kaltura.com",
+
+    // Sports / gaming
+    "mlb.com",
     "nba.com",
     "nfl.com",
-    "mlb.com",
-    "cnn.com",
-    "bbc.com",
-    "foxnews.com",
-    "nbcnews.com",
-    "soundcloud.com",
-    "bandcamp.com",
-    "mixcloud.com",
-    "spotify.com",
-    "udemy.com",
-    "coursera.org",
-    "skillshare.com",
+    "gamespot.com",
+    "ign.com",
+    "cspan.org",
+    "9gag.com",
   ];
 
   const hostname = window.location.hostname
@@ -118,7 +279,6 @@
 
   function detectJWPlayer(html) {
     const patterns = [
-
       /jwplayer\s*\([^)]*\)\.setup\s*\(\s*(\{[\s\S]*?\})\s*\)/gi,
 
       /jwplayer_files\s*=\s*(\[[^\]]+\])/gi,
@@ -157,9 +317,7 @@
               type: getVideoType(videoUrl),
             };
           }
-        } catch (e) {
-
-        }
+        } catch (e) {}
       }
     }
 
@@ -176,7 +334,6 @@
   }
 
   function detectBrightcove(html) {
-
     const accountMatch = html.match(/data-account=["'](\d+)["']/);
     const playerMatch = html.match(/data-player=["']([^"']+)["']/);
     const videoMatch = html.match(/data-video-id=["'](\d+)["']/);
@@ -221,7 +378,6 @@
     const videos = doc.querySelectorAll("video");
 
     for (const video of videos) {
-
       if (video.offsetWidth < 100 || video.offsetHeight < 50) continue;
 
       if (video.src && isValidVideoUrl(video.src)) {
@@ -273,7 +429,6 @@
     for (const selector of selectors) {
       const meta = doc.querySelector(selector);
       if (meta?.content && isValidVideoUrl(meta.content)) {
-
         const ogTitle = doc.querySelector('meta[property="og:title"]')?.content;
         const ogImage = doc.querySelector('meta[property="og:image"]')?.content;
         const ogDesc = doc.querySelector(
@@ -305,7 +460,6 @@
         const items = Array.isArray(json) ? json : [json];
 
         for (const item of items) {
-
           if (item["@type"] === "VideoObject") {
             const videoUrl = item.contentUrl || item.embedUrl || item.url;
             if (videoUrl && isValidVideoUrl(videoUrl)) {
@@ -338,16 +492,13 @@
             }
           }
         }
-      } catch (e) {
-
-      }
+      } catch (e) {}
     }
 
     return null;
   }
 
   function detectVideoJS(html, doc) {
-
     const advancedMatch = html.match(
       /\bvideojs\s*\(.+?([a-zA-Z0-9_$]+)\.src\s*\(\s*((?:\[.+?\]|\{.+?\}))\s*\)\s*;/s,
     );
@@ -356,7 +507,6 @@
       const sourcesStr = advancedMatch[2];
 
       try {
-
         const sources = JSON.parse(sourcesStr.replace(/'/g, '"'));
         const sourceList = Array.isArray(sources) ? sources : [sources];
 
@@ -422,7 +572,6 @@
             console.debug("[GenericIE] Failed to parse Video.js subtitle:", e);
           }
         }
-
       } catch (e) {
         console.debug(
           "[GenericIE] Failed to parse Video.js advanced pattern:",
@@ -436,7 +585,6 @@
     );
 
     for (const el of vjsElements) {
-
       const setup = el.dataset.setup;
       if (setup) {
         try {
@@ -486,7 +634,6 @@
 
   function detectYouTubeEmbed(html) {
     const patterns = [
-
       /src=["'](?:https?:)?\/\/(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]{11})[^"']*/gi,
 
       /data-youtube-id=["']([a-zA-Z0-9_-]{11})["']/gi,
@@ -565,7 +712,6 @@
   }
 
   function detectDirectUrls(html) {
-
     let found = filterVideoUrls(
       html.match(/flashvars:\s*['"](.*?&)?file=(http[^'"&]*)/gi),
     );
@@ -643,7 +789,6 @@
     }
 
     const videoPatterns = [
-
       /(https?:\/\/[^"'\s<>]+\.m3u8(?:\?[^"'\s<>]*)?)/gi,
 
       /(https?:\/\/[^"'\s<>]+\.mpd(?:\?[^"'\s<>]*)?)/gi,
@@ -797,7 +942,6 @@
   }
 
   function detectKVSPlayer(html) {
-
     const kvsMatch =
       html.match(
         /<script\b[^>]+?\bsrc\s*=\s*["']https?:\/\/(?:[^"'?#])+\/kt_player\.js\?v=(\d+(?:\.\d+)+)["']/i,
@@ -940,7 +1084,6 @@
   }
 
   function detectWistia(html) {
-
     const wistiaId = html.match(/wistia_async_([a-zA-Z0-9]+)/);
     if (wistiaId) {
       return {
@@ -1199,7 +1342,6 @@
   }
 
   function detectSMIL(html) {
-
     const smilPatterns = [
       /(https?:\/\/[^"'\s<>]+\.smil(?:\?[^"'\s<>]*)?)/gi,
       /["']([^"'\s]+\.smil(?:\?[^"']*)?)['"]/gi,
@@ -1220,7 +1362,6 @@
   }
 
   function detectXSPF(html) {
-
     const xspfPattern = /(https?:\/\/[^"'\s<>]+\.xspf(?:\?[^"'\s<>]*)?)/gi;
     const match = xspfPattern.exec(html);
 
@@ -1236,7 +1377,6 @@
   }
 
   function detectF4M(html) {
-
     const f4mPattern = /(https?:\/\/[^"'\s<>]+\.f4m(?:\?[^"'\s<>]*)?)/gi;
     const match = f4mPattern.exec(html);
 
@@ -1252,7 +1392,6 @@
   }
 
   function detectISM(html) {
-
     const ismPattern =
       /(https?:\/\/[^"'\s<>]+\.(?:ism|isml)\/[Mm]anifest(?:\([^)]*\))?(?:\?[^"'\s<>]*)?)/gi;
     const match = ismPattern.exec(html);
@@ -1269,7 +1408,6 @@
   }
 
   function detectMetaRefresh(html, doc) {
-
     const REDIRECT_REGEX = /[\d]{0,2};\s*(?:URL|url)=['"]?([^'">\s]+)['"]?/;
 
     const metaRefresh = doc.querySelector('meta[http-equiv="refresh" i]');
@@ -1302,7 +1440,6 @@
   }
 
   function detectTwitterPlayerStream(doc) {
-
     const playerStream = doc.querySelector(
       'meta[property="twitter:player:stream"], meta[name="twitter:player:stream"]',
     );
@@ -1323,7 +1460,6 @@
   }
 
   function detectTwitterPlayer(doc) {
-
     const twitterPlayer = doc.querySelector(
       'meta[property="twitter:player"], meta[name="twitter:player"]',
     );
@@ -1392,9 +1528,7 @@
       const pathname = new URL(url, window.location.href).pathname;
       const ext = pathname.split(".").pop().toLowerCase();
       if (EXCLUDED_EXTS.includes(ext)) return false;
-    } catch (e) {
-
-    }
+    } catch (e) {}
 
     const videoExtensions = [
       ".mp4",
@@ -1471,7 +1605,7 @@
     const html = document.documentElement.outerHTML;
     const doc = document;
 
-    console.log("[GenericIE] Starting pattern detection...");
+    console.log("[GenericIE] Starting GOD-mode pattern detection...");
 
     const detectors = [
       () => detectJWPlayer(html),
@@ -1507,21 +1641,621 @@
       () => detectCloudflareStream(html),
       () => detectBunnyCDN(html),
       () => detectTwitterPlayer(doc),
+      // ── New GOD-mode detectors ──
+      () => detectHLSjs(html),
+      () => detectShakaPlayer(html),
+      () => detectDashjs(html),
+      () => detectClappr(html),
+      () => detectBitmovin(html),
+      () => detectTHEOplayer(html),
+      () => detectMUXPlayer(html, doc),
+      () => detectAMPVideo(doc),
+      () => detectSSRFrameworkData(),
+      () => detectWordPressVideo(html, doc),
+      () => detectCDNUrls(html),
+      () => detectBase64Urls(html),
+      () => detectDataAttributes(doc),
+      () => detectConfigObjects(html),
+      () => detectReactPlayerConfig(html),
+      () => detectPeerTube(html),
+      () => detectMediaCMS(html, doc),
     ];
 
+    // GOD MODE: Collect ALL matches, not just the first
+    let foundCount = 0;
     for (const detector of detectors) {
       try {
         const result = detector();
         if (result && result.url) {
           notifyBackground(result);
-          return;
+          foundCount++;
         }
       } catch (e) {
         console.error("[GenericIE] Detector error:", e);
       }
     }
 
-    console.log("[GenericIE] No patterns matched");
+    if (foundCount === 0) {
+      console.log("[GenericIE] No patterns matched");
+    } else {
+      console.log("[GenericIE] GOD-mode found", foundCount, "video sources");
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // NEW DETECTORS — HLS.js, Shaka, dash.js, Clappr, Bitmovin, THEO
+  // ═══════════════════════════════════════════════════════════════════════
+
+  function detectHLSjs(html) {
+    // HLS.js config patterns
+    var hlsPatterns = [
+      /new\s+Hls\s*\(\s*(\{[\s\S]*?\})\s*\)/i,
+      /Hls\.loadSource\s*\(\s*["']([^"']+)["']\s*\)/i,
+      /hls\.loadSource\s*\(\s*["']([^"']+)["']\s*\)/i,
+      /hlsUrl\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i,
+      /hlsSrc\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i,
+    ];
+
+    for (var p of hlsPatterns) {
+      var m = html.match(p);
+      if (m) {
+        var url = m[1];
+        if (url.startsWith("{")) {
+          // Parse config object for source URL
+          try {
+            var srcMatch = url.match(/["']?src["']?\s*:\s*["']([^"']+)["']/);
+            if (srcMatch) url = srcMatch[1];
+            else continue;
+          } catch (e) {
+            continue;
+          }
+        }
+        if (isValidVideoUrl(url) || /\.m3u8/i.test(url)) {
+          return { url: resolveUrl(url), source: "hlsjs", type: "HLS" };
+        }
+      }
+    }
+    return null;
+  }
+
+  function detectShakaPlayer(html) {
+    var patterns = [
+      /player\.load\s*\(\s*["']([^"']+\.(?:m3u8|mpd)[^"']*)["']\s*\)/i,
+      /shaka\.Player[^]*?load\s*\(\s*["']([^"']+)["']\s*\)/i,
+      /manifestUri\s*[:=]\s*["']([^"']+\.(?:m3u8|mpd)[^"']*)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && isValidVideoUrl(m[1])) {
+        return {
+          url: resolveUrl(m[1]),
+          source: "shaka_player",
+          type: getVideoType(m[1]),
+        };
+      }
+    }
+    return null;
+  }
+
+  function detectDashjs(html) {
+    var patterns = [
+      /dashjs\.MediaPlayer[^]*?attachSource\s*\(\s*["']([^"']+)["']\s*\)/i,
+      /player\.attachSource\s*\(\s*["']([^"']+\.mpd[^"']*)["']\s*\)/i,
+      /dash\.MediaPlayer[^]*?attachSource\s*\(\s*["']([^"']+)["']\s*\)/i,
+      /dashManifestUrl\s*[:=]\s*["']([^"']+\.mpd[^"']*)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && (isValidVideoUrl(m[1]) || /\.mpd/i.test(m[1]))) {
+        return { url: resolveUrl(m[1]), source: "dashjs", type: "DASH" };
+      }
+    }
+    return null;
+  }
+
+  function detectClappr(html) {
+    var patterns = [
+      /new\s+Clappr\.Player\s*\(\s*\{[\s\S]*?source\s*:\s*["']([^"']+)["']/i,
+      /new\s+Clappr\.Player\s*\(\s*\{[\s\S]*?sources\s*:\s*\[\s*["']([^"']+)["']/i,
+      /clapprConfig[^}]*source\s*:\s*["']([^"']+)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && isValidVideoUrl(m[1])) {
+        return {
+          url: resolveUrl(m[1]),
+          source: "clappr",
+          type: getVideoType(m[1]),
+        };
+      }
+    }
+    return null;
+  }
+
+  function detectBitmovin(html) {
+    var patterns = [
+      /bitmovin\.player[^]*?source\s*:\s*\{[\s\S]*?(?:hls|dash|progressive)\s*:\s*["']([^"']+)["']/i,
+      /new\s+bitmovin\.player\.Player[^]*?["']?(?:hls|dash|progressive)["']?\s*:\s*["']([^"']+)["']/i,
+      /bitmovinConfig[^}]*(?:hls|dash)\s*:\s*["']([^"']+)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && isValidVideoUrl(m[1])) {
+        return {
+          url: resolveUrl(m[1]),
+          source: "bitmovin",
+          type: getVideoType(m[1]),
+        };
+      }
+    }
+    return null;
+  }
+
+  function detectTHEOplayer(html) {
+    var patterns = [
+      /THEOplayer\.Player[^]*?source\s*:\s*\{[\s\S]*?src\s*:\s*["']([^"']+)["']/i,
+      /new\s+THEOplayer\.Player[^]*?src\s*:\s*["']([^"']+)["']/i,
+      /theoplayer[^}]*src\s*:\s*["']([^"']+\.(?:m3u8|mpd)[^"']*)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && isValidVideoUrl(m[1])) {
+        return {
+          url: resolveUrl(m[1]),
+          source: "theoplayer",
+          type: getVideoType(m[1]),
+        };
+      }
+    }
+    return null;
+  }
+
+  function detectMUXPlayer(html, doc) {
+    // Custom element: <mux-player playback-id="xxx">
+    var muxEls = doc.querySelectorAll(
+      "mux-player[playback-id], mux-video[playback-id]",
+    );
+    for (var el of muxEls) {
+      var pbId = el.getAttribute("playback-id");
+      if (pbId) {
+        return {
+          url: "https://stream.mux.com/" + pbId + ".m3u8",
+          source: "mux_player",
+          type: "HLS",
+          title:
+            el.getAttribute("metadata-video-title") || el.getAttribute("title"),
+        };
+      }
+    }
+
+    // Script-based MUX config
+    var muxMatch = html.match(/playbackId\s*[:=]\s*["']([a-zA-Z0-9]+)["']/i);
+    if (muxMatch) {
+      return {
+        url: "https://stream.mux.com/" + muxMatch[1] + ".m3u8",
+        source: "mux_config",
+        type: "HLS",
+      };
+    }
+
+    return null;
+  }
+
+  function detectAMPVideo(doc) {
+    var ampVideos = doc.querySelectorAll(
+      "amp-video[src], amp-video source[src]",
+    );
+    for (var el of ampVideos) {
+      var src = el.getAttribute("src");
+      if (src && isValidVideoUrl(src)) {
+        return {
+          url: resolveUrl(src),
+          source: "amp_video",
+          type: getVideoType(src),
+          width: parseInt(el.getAttribute("width")) || 0,
+          height: parseInt(el.getAttribute("height")) || 0,
+        };
+      }
+    }
+
+    var ampIframes = doc.querySelectorAll("amp-iframe[src]");
+    for (var iframe of ampIframes) {
+      var iframeSrc = iframe.getAttribute("src");
+      if (iframeSrc && /player|embed|video|stream/i.test(iframeSrc)) {
+        return {
+          url: resolveUrl(iframeSrc),
+          source: "amp_iframe",
+          type: "embed",
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function detectSSRFrameworkData() {
+    // __NEXT_DATA__ (Next.js)
+    var nextData = window.__NEXT_DATA__;
+    if (nextData) {
+      try {
+        var json = JSON.stringify(nextData);
+        if (json.length < 2000000) {
+          var m3u8 = json.match(/(https?:\/\/[^"\\]+\.m3u8[^"\\]*)/i);
+          if (m3u8 && isValidVideoUrl(m3u8[1])) {
+            return {
+              url: m3u8[1].replace(/\\\//g, "/"),
+              source: "nextjs_data",
+              type: "HLS",
+            };
+          }
+          var mpd = json.match(/(https?:\/\/[^"\\]+\.mpd[^"\\]*)/i);
+          if (mpd && isValidVideoUrl(mpd[1])) {
+            return {
+              url: mpd[1].replace(/\\\//g, "/"),
+              source: "nextjs_data",
+              type: "DASH",
+            };
+          }
+          var mp4 = json.match(/(https?:\/\/[^"\\]+\.mp4[^"\\]*)/i);
+          if (mp4 && isValidVideoUrl(mp4[1])) {
+            return {
+              url: mp4[1].replace(/\\\//g, "/"),
+              source: "nextjs_data",
+              type: "MP4",
+            };
+          }
+        }
+      } catch (e) {}
+    }
+
+    // __NUXT__ (Nuxt.js)
+    var nuxtData = window.__NUXT__;
+    if (nuxtData) {
+      try {
+        var nuxtJson = JSON.stringify(nuxtData);
+        if (nuxtJson.length < 2000000) {
+          var nm3u8 = nuxtJson.match(/(https?:\/\/[^"\\]+\.m3u8[^"\\]*)/i);
+          if (nm3u8 && isValidVideoUrl(nm3u8[1])) {
+            return {
+              url: nm3u8[1].replace(/\\\//g, "/"),
+              source: "nuxt_data",
+              type: "HLS",
+            };
+          }
+          var nmp4 = nuxtJson.match(/(https?:\/\/[^"\\]+\.mp4[^"\\]*)/i);
+          if (nmp4 && isValidVideoUrl(nmp4[1])) {
+            return {
+              url: nmp4[1].replace(/\\\//g, "/"),
+              source: "nuxt_data",
+              type: "MP4",
+            };
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Generic SSR state objects
+    var ssrKeys = [
+      "__INITIAL_STATE__",
+      "__DATA__",
+      "__PRELOADED_STATE__",
+      "__APP_DATA__",
+      "__PAGE_DATA__",
+    ];
+    for (var k of ssrKeys) {
+      try {
+        var data = window[k];
+        if (!data) continue;
+        var sJson = JSON.stringify(data);
+        if (sJson.length > 2000000) continue;
+        var sM3u8 = sJson.match(/(https?:\/\/[^"\\]+\.m3u8[^"\\]*)/i);
+        if (sM3u8)
+          return {
+            url: sM3u8[1].replace(/\\\//g, "/"),
+            source: "ssr_" + k,
+            type: "HLS",
+          };
+        var sMpd = sJson.match(/(https?:\/\/[^"\\]+\.mpd[^"\\]*)/i);
+        if (sMpd)
+          return {
+            url: sMpd[1].replace(/\\\//g, "/"),
+            source: "ssr_" + k,
+            type: "DASH",
+          };
+        var sMp4 = sJson.match(/(https?:\/\/[^"\\]+\.mp4[^"\\]*)/i);
+        if (sMp4)
+          return {
+            url: sMp4[1].replace(/\\\//g, "/"),
+            source: "ssr_" + k,
+            type: "MP4",
+          };
+      } catch (e) {}
+    }
+
+    return null;
+  }
+
+  function detectWordPressVideo(html, doc) {
+    // WordPress video shortcode / block
+    var wpBlock = doc.querySelector(
+      ".wp-block-video video, .wp-video video, .video-player video",
+    );
+    if (wpBlock) {
+      var src = wpBlock.src || wpBlock.querySelector("source")?.src;
+      if (src && isValidVideoUrl(src)) {
+        return {
+          url: resolveUrl(src),
+          source: "wordpress_video",
+          type: getVideoType(src),
+        };
+      }
+    }
+
+    // WordPress playlist shortcode (wp-playlist-script)
+    var wpPlaylist = doc.querySelector(
+      'script.wp-playlist-script[type="application/json"]',
+    );
+    if (wpPlaylist) {
+      try {
+        var plData = JSON.parse(wpPlaylist.textContent);
+        if (plData.tracks && plData.tracks.length > 0) {
+          var track = plData.tracks[0];
+          if (track.src && isValidVideoUrl(track.src)) {
+            return {
+              url: resolveUrl(track.src),
+              source: "wordpress_playlist",
+              type: getVideoType(track.src),
+              title: track.title,
+            };
+          }
+        }
+      } catch (e) {}
+    }
+
+    // WordPress embed blocks
+    var wpEmbed = html.match(/wp-embedded-content[^>]*src=["']([^"']+)["']/i);
+    if (wpEmbed && isValidVideoUrl(wpEmbed[1])) {
+      return {
+        url: resolveUrl(wpEmbed[1]),
+        source: "wordpress_embed",
+        type: "embed",
+      };
+    }
+
+    return null;
+  }
+
+  function detectCDNUrls(html) {
+    // Known video CDN patterns
+    var cdnPatterns = [
+      {
+        regex:
+          /https?:\/\/[a-z0-9]+\.cloudfront\.net\/[^"'\s<>]*?\.(?:m3u8|mpd|mp4)[^"'\s<>]*/i,
+        name: "cloudfront",
+      },
+      {
+        regex:
+          /https?:\/\/[^"'\s<>]*\.akamaized\.net\/[^"'\s<>]*?\.(?:m3u8|mpd|mp4)[^"'\s<>]*/i,
+        name: "akamai",
+      },
+      {
+        regex: /https?:\/\/stream\.mux\.com\/[a-zA-Z0-9]+\.m3u8[^"'\s<>]*/i,
+        name: "mux",
+      },
+      {
+        regex:
+          /https?:\/\/[^"'\s<>]*\.b-cdn\.net\/[^"'\s<>]*?\.(?:m3u8|mp4)[^"'\s<>]*/i,
+        name: "bunnycdn",
+      },
+      {
+        regex:
+          /https?:\/\/[^"'\s<>]*\.azureedge\.net\/[^"'\s<>]*?\.(?:m3u8|mpd|mp4)[^"'\s<>]*/i,
+        name: "azure",
+      },
+      {
+        regex: /https?:\/\/cdn\.jwplayer\.com\/manifests\/[^"'\s<>]*/i,
+        name: "jwplatform",
+      },
+      {
+        regex:
+          /https?:\/\/content\.jwplatform\.com\/[^"'\s<>]*?\.(?:m3u8|mp4)[^"'\s<>]*/i,
+        name: "jwplatform",
+      },
+      {
+        regex:
+          /https?:\/\/[^"'\s<>]*vimeocdn\.com\/[^"'\s<>]*?\.(?:m3u8|mp4)[^"'\s<>]*/i,
+        name: "vimeo_cdn",
+      },
+    ];
+
+    for (var p of cdnPatterns) {
+      var m = html.match(p.regex);
+      if (m) {
+        var url = m[0].replace(/['"<>\s;,)}\]]+$/, "");
+        if (isValidVideoUrl(url) && !/thumb|poster|preview/i.test(url)) {
+          return {
+            url: resolveUrl(url),
+            source: "cdn_" + p.name,
+            type: getVideoType(url),
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  function detectBase64Urls(html) {
+    // atob("...") patterns containing video URLs
+    var atobMatches = html.matchAll(
+      /atob\s*\(\s*["']([A-Za-z0-9+/=]{20,})["']\s*\)/g,
+    );
+    for (var m of atobMatches) {
+      try {
+        var decoded = atob(m[1]);
+        if (/^https?:\/\//.test(decoded) && isValidVideoUrl(decoded)) {
+          return {
+            url: decoded,
+            source: "base64_decoded",
+            type: getVideoType(decoded),
+          };
+        }
+      } catch (e) {}
+    }
+
+    // Base64-encoded inline data that might be a JSON with video URLs
+    var b64JsonMatches = html.matchAll(/["']([A-Za-z0-9+/=]{40,})["']/g);
+    var checked = 0;
+    for (var m2 of b64JsonMatches) {
+      if (checked++ > 50) break; // Limit to avoid performance issues
+      try {
+        var decoded2 = atob(m2[1]);
+        if (/https?:\/\/.*\.(?:m3u8|mpd|mp4)/i.test(decoded2)) {
+          var urlMatch = decoded2.match(
+            /(https?:\/\/[^\s"'<>]+\.(?:m3u8|mpd|mp4)[^\s"'<>]*)/i,
+          );
+          if (urlMatch && isValidVideoUrl(urlMatch[1])) {
+            return {
+              url: urlMatch[1],
+              source: "base64_json",
+              type: getVideoType(urlMatch[1]),
+            };
+          }
+        }
+      } catch (e) {}
+    }
+
+    return null;
+  }
+
+  function detectDataAttributes(doc) {
+    var attrs = [
+      "data-video-url",
+      "data-video-src",
+      "data-video",
+      "data-stream-url",
+      "data-hls",
+      "data-hls-url",
+      "data-dash-url",
+      "data-mpd",
+      "data-mp4",
+      "data-media-url",
+      "data-file",
+      "data-source",
+    ];
+
+    for (var attr of attrs) {
+      var els = doc.querySelectorAll("[" + attr + "]");
+      for (var el of els) {
+        var val = el.getAttribute(attr);
+        if (val && isValidVideoUrl(val)) {
+          return {
+            url: resolveUrl(val),
+            source: "data_attr_" + attr,
+            type: getVideoType(val),
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  function detectConfigObjects(html) {
+    // Common config object patterns
+    var configPatterns = [
+      /(?:player|video|media|stream)Config\s*=\s*(\{[\s\S]{10,2000}?\});/i,
+      /(?:player|video|media|stream)Options\s*=\s*(\{[\s\S]{10,2000}?\});/i,
+      /(?:player|video|media|stream)Settings\s*=\s*(\{[\s\S]{10,2000}?\});/i,
+    ];
+
+    for (var pat of configPatterns) {
+      var m = html.match(pat);
+      if (!m) continue;
+      try {
+        var json = m[1]
+          .replace(/'/g, '"')
+          .replace(/(\w+)\s*:/g, '"$1":')
+          .replace(/,\s*}/g, "}");
+        var urlMatch = json.match(
+          /["'](?:src|file|url|source|stream|hls|dash|mp4)["']\s*:\s*["'](https?:\/\/[^"']+)["']/i,
+        );
+        if (urlMatch && isValidVideoUrl(urlMatch[1])) {
+          return {
+            url: resolveUrl(urlMatch[1]),
+            source: "config_object",
+            type: getVideoType(urlMatch[1]),
+          };
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function detectReactPlayerConfig(html) {
+    // ReactPlayer / react-player patterns
+    var patterns = [
+      /ReactPlayer[^}]*url\s*[:=]\s*["']([^"']+)["']/i,
+      /react-player[^}]*url\s*[:=]\s*["']([^"']+)["']/i,
+      /<ReactPlayer[^>]*url=\{?\s*["']([^"']+)["']/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m && isValidVideoUrl(m[1])) {
+        return {
+          url: resolveUrl(m[1]),
+          source: "react_player",
+          type: getVideoType(m[1]),
+        };
+      }
+    }
+    return null;
+  }
+
+  function detectPeerTube(html) {
+    var match = html.match(
+      /src=["'](https?:\/\/[^"']*\/videos\/embed\/[^"']+)["']/i,
+    );
+    if (match) {
+      return { url: match[1], source: "peertube", type: "peertube" };
+    }
+
+    var apiMatch = html.match(/\/api\/v\d+\/videos\/([a-f0-9-]+)/i);
+    if (apiMatch) {
+      return {
+        url: window.location.origin + "/api/v1/videos/" + apiMatch[1],
+        source: "peertube_api",
+        type: "peertube",
+      };
+    }
+    return null;
+  }
+
+  function detectMediaCMS(html, doc) {
+    // Detect generic media CMS patterns (Plex-like, Jellyfin-like, etc.)
+    var patterns = [
+      /\/emby\/videos\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*/i,
+      /\/Items\/[^"'\s]*\/stream\.[^"'\s]*/i,
+      /\/Videos\/[^"'\s]*\/(?:master|main)\.m3u8[^"'\s]*/i,
+    ];
+
+    for (var p of patterns) {
+      var m = html.match(p);
+      if (m) {
+        var url = m[0];
+        if (!url.startsWith("http")) url = window.location.origin + url;
+        return {
+          url: resolveUrl(url),
+          source: "media_cms",
+          type: getVideoType(url),
+        };
+      }
+    }
+    return null;
   }
 
   if (document.readyState === "loading") {

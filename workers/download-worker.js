@@ -1,9 +1,300 @@
 importScripts("segment-pool.js");
 
 const MAX_CONCURRENT_SEGMENTS = 6;
-const MAX_SEGMENT_RETRIES = 6; // Increased from 3 — yt-dlp uses 10, 6 is balanced for browser context
+const MAX_SEGMENT_RETRIES = 6; // Increased from 3 â€” yt-dlp uses 10, 6 is balanced for browser context
 const SEGMENT_TIMEOUT = 30000;
 const MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024 * 1024;
+
+// Pirate CDN domains that inject interstitial ads into segment responses.
+// For these domains, normal maxAdRetries (3) is far too low - they serve
+// ad responses (text/html, text/javascript, image/png, etc.) on 50-70%
+// of requests at random. We need 20+ retries per segment.
+const PIRATE_CDN_DOMAINS = [
+  "trueparadise.workers.dev",
+  "rabbitstream.net",
+  "megacloud.tv",
+  "vidplay.site",
+  "filemoon.sx",
+  "dokicloud.one",
+  "rapid-cloud.co",
+  "vidstreaming.io",
+  "streamwish.to",
+  "vidhide.com",
+  "closeload.top",
+  "filelions.to",
+];
+
+function isPirateCDN(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return PIRATE_CDN_DOMAINS.some((d) => host === d || host.endsWith("." + d));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract a direct-origin URL from a trueparadise.workers.dev CDN URL.
+ * The CDN Worker proxies requests to the origin host embedded in the URL path:
+ *   https://one.trueparadise.workers.dev/quietlynx14.site/file2/path/res/seg
+ *                                       ^^^^^^^^^^^^^^^^^
+ *                                       origin host
+ * By fetching directly from the origin we bypass the Worker's ad injection.
+ * Returns null for non-trueparadise URLs or if the path structure is unexpected.
+ */
+function getDirectOriginUrl(cdnUrl) {
+  try {
+    const url = new URL(cdnUrl);
+    if (!url.hostname.includes("trueparadise.workers.dev")) return null;
+    // pathname: /quietlynx14.site/file2/encrypted_path/res_b64/seg_b64
+    const parts = url.pathname.split("/").filter((p) => p);
+    if (parts.length < 3) return null; // need at least host + file2 + path
+    const originHost = parts[0]; // e.g. "quietlynx14.site"
+    const restPath = "/" + parts.slice(1).join("/");
+    return `https://${originHost}${restPath}`;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Trueparadise origin host rotation ────────────────────────────────
+// The CDN Worker load-balances across multiple mirror hosts.  The encrypted
+// path is host-agnostic: same path works on any mirror.  When the Worker
+// starts ad-blocking one host, rotating to a different mirror may get a
+// fresh "ad budget" while the first host cools down.
+//
+// We track per-host ad rates and prefer mirrors with lower ad injection.
+// New mirrors are auto-discovered from every m3u8 playlist we parse.
+
+/**
+ * Manages a pool of trueparadise CDN mirror hosts with per-host ad-rate
+ * tracking and weighted selection.  Hosts that serve fewer ads get more
+ * traffic; hosts above 80% ad rate enter a 30-second cooldown.
+ */
+class TrueparadiseHostPool {
+  constructor(seedHosts) {
+    // Map<hostname, { requests, ads, successes, lastAdTime, cooldownUntil }>
+    this._hosts = new Map();
+    this._cooldownMs = 30000; // 30s cooldown for hot hosts
+    this._hotThreshold = 0.8; // ad rate above this triggers cooldown
+    this._minSamples = 5; // min requests before using ad-rate for selection
+
+    for (const h of seedHosts) {
+      this._hosts.set(h, this._newStats());
+    }
+  }
+
+  _newStats() {
+    return {
+      requests: 0,
+      ads: 0,
+      successes: 0,
+      lastAdTime: 0,
+      cooldownUntil: 0,
+    };
+  }
+
+  /** Register a newly discovered host */
+  addHost(host) {
+    if (!host || this._hosts.has(host)) return false;
+    this._hosts.set(host, this._newStats());
+    console.log(
+      `[HostPool] Discovered new mirror: ${host} (${this._hosts.size} total)`,
+    );
+    this._persistToStorage();
+    return true;
+  }
+
+  /** All known hostnames */
+  get hosts() {
+    return [...this._hosts.keys()];
+  }
+
+  get size() {
+    return this._hosts.size;
+  }
+
+  /** Record a successful (non-ad) fetch from a host */
+  recordSuccess(host) {
+    const s = this._hosts.get(host);
+    if (!s) return;
+    s.requests++;
+    s.successes++;
+  }
+
+  /** Record an ad response from a host */
+  recordAd(host) {
+    const s = this._hosts.get(host);
+    if (!s) return;
+    s.requests++;
+    s.ads++;
+    s.lastAdTime = Date.now();
+
+    // If ad rate exceeds threshold after enough samples, start cooldown
+    if (
+      s.requests >= this._minSamples &&
+      s.ads / s.requests > this._hotThreshold
+    ) {
+      s.cooldownUntil = Date.now() + this._cooldownMs;
+    }
+  }
+
+  /** Get the ad rate for a host (0-1), or -1 if not enough data */
+  adRate(host) {
+    const s = this._hosts.get(host);
+    if (!s || s.requests < this._minSamples) return -1;
+    return s.ads / s.requests;
+  }
+
+  /**
+   * Pick the best available host, avoiding `excludeHost`.
+   * Strategy: among non-cooldown hosts, pick the one with the lowest ad rate.
+   * If all hosts are in cooldown, pick the one whose cooldown expires soonest.
+   * Ties broken randomly to distribute load.
+   */
+  bestHost(excludeHost) {
+    const now = Date.now();
+    const candidates = [];
+    let allCooling = true;
+
+    for (const [host, stats] of this._hosts) {
+      if (host === excludeHost) continue;
+      const isCooling = stats.cooldownUntil > now;
+      if (!isCooling) allCooling = false;
+      candidates.push({ host, stats, isCooling });
+    }
+
+    if (candidates.length === 0)
+      return excludeHost || this._hosts.keys().next().value;
+
+    if (allCooling) {
+      // All in cooldown — pick the one that cools down soonest
+      candidates.sort((a, b) => a.stats.cooldownUntil - b.stats.cooldownUntil);
+      return candidates[0].host;
+    }
+
+    // Filter out cooling hosts
+    const available = candidates.filter((c) => !c.isCooling);
+
+    // Among available, sort by ad rate (ascending). Hosts with < minSamples
+    // go first (untested = optimistic).
+    available.sort((a, b) => {
+      const rateA =
+        a.stats.requests >= this._minSamples
+          ? a.stats.ads / a.stats.requests
+          : -1;
+      const rateB =
+        b.stats.requests >= this._minSamples
+          ? b.stats.ads / b.stats.requests
+          : -1;
+      if (rateA === -1 && rateB === -1) return Math.random() - 0.5; // both untested
+      if (rateA === -1) return -1; // prefer untested
+      if (rateB === -1) return 1;
+      if (Math.abs(rateA - rateB) < 0.05) return Math.random() - 0.5; // tie-break randomly
+      return rateA - rateB;
+    });
+
+    return available[0].host;
+  }
+
+  /**
+   * Rewrite a trueparadise CDN URL to use a different origin host.
+   * Picks the best host based on ad-rate tracking.
+   *
+   * @param {string} cdnUrl       Original trueparadise CDN URL
+   * @param {string} [excludeHost]  Host to avoid (the one that just served an ad)
+   * @returns {string} URL with a better origin host, or original if only 1 host
+   */
+  rotateUrl(cdnUrl, excludeHost) {
+    try {
+      const url = new URL(cdnUrl);
+      if (!url.hostname.includes("trueparadise.workers.dev")) return cdnUrl;
+      const parts = url.pathname.split("/").filter((p) => p);
+      if (parts.length < 3) return cdnUrl;
+      const currentHost = parts[0];
+
+      const newHost = this.bestHost(excludeHost || currentHost);
+      if (newHost === currentHost) return cdnUrl;
+
+      parts[0] = newHost;
+      url.pathname = "/" + parts.join("/");
+      return url.href;
+    } catch {
+      return cdnUrl;
+    }
+  }
+
+  /** Extract origin host from a trueparadise URL */
+  static extractHost(cdnUrl) {
+    try {
+      const url = new URL(cdnUrl);
+      if (!url.hostname.includes("trueparadise.workers.dev")) return null;
+      const parts = url.pathname.split("/").filter((p) => p);
+      return parts.length >= 3 ? parts[0] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Auto-discover host from a URL */
+  discover(url) {
+    const host = TrueparadiseHostPool.extractHost(url);
+    if (host) this.addHost(host);
+  }
+
+  /** Merge previously persisted hosts into the pool */
+  loadPersistedHosts(hostArray) {
+    if (!Array.isArray(hostArray)) return;
+    let added = 0;
+    for (const h of hostArray) {
+      if (typeof h === "string" && h && !this._hosts.has(h)) {
+        this._hosts.set(h, this._newStats());
+        added++;
+      }
+    }
+    if (added > 0) {
+      console.log(
+        `[HostPool] Loaded ${added} persisted hosts (${this._hosts.size} total)`,
+      );
+    }
+  }
+
+  /** Notify the main thread to persist the current host list */
+  _persistToStorage() {
+    try {
+      self.postMessage({
+        name: "persist_hosts",
+        data: { hosts: this.hosts },
+      });
+    } catch {
+      /* Worker may be terminating */
+    }
+  }
+
+  /** Summary string for logging */
+  summary() {
+    const lines = [];
+    for (const [host, s] of this._hosts) {
+      const rate =
+        s.requests > 0 ? ((s.ads / s.requests) * 100).toFixed(0) : "?";
+      const cooling = s.cooldownUntil > Date.now() ? " [COOLING]" : "";
+      lines.push(`  ${host}: ${s.requests} req, ${rate}% ads${cooling}`);
+    }
+    return lines.join("\n");
+  }
+}
+
+// Global host pool instance — shared across all downloads in this Worker
+const trueparadisePool = new TrueparadiseHostPool([
+  // Seed hosts discovered from network captures.  New hosts are auto-added
+  // at runtime when we parse m3u8 playlists from trueparadise URLs.
+  "skyember44.online",
+  "quietlynx14.site",
+  "nightbreeze17.site",
+  "aurorabird6.live",
+  "sparkdeer21.online",
+]);
+
 const OPFS_ENABLED =
   typeof navigator !== "undefined" && navigator.storage?.getDirectory;
 const RAM_THRESHOLD = 100 * 1024 * 1024;
@@ -66,6 +357,11 @@ self.onmessage = async (e) => {
     case "refresh_urls":
       // S35 fix: Handle URL refresh from background (YouTube URL expiry)
       handleUrlRefresh(data);
+      break;
+
+    case "load_hosts":
+      // Restore persisted hosts into the global pool on worker start
+      trueparadisePool.loadPersistedHosts(data.hosts);
       break;
 
     case "ping":
@@ -149,7 +445,7 @@ async function downloadHttpDirect(downloadId, url, filename, headers = {}) {
   for (let attempt = 0; attempt <= MAX_DIRECT_RETRIES; attempt++) {
     try {
       resp = await fetch(url, { headers, cache: "no-cache" });
-      if (resp.ok) break; // 2xx — success
+      if (resp.ok) break; // 2xx â€” success
 
       // Retryable HTTP status codes
       if (resp.status === 429 || resp.status >= 500) {
@@ -165,7 +461,7 @@ async function downloadHttpDirect(downloadId, url, filename, headers = {}) {
           DIRECT_BACKOFF_CAP,
         );
         const delay = Math.max(retryAfterMs, backoff);
-        console.warn(
+        console.log(
           `[Worker] Direct download: HTTP ${resp.status}, retry ${attempt + 1}/${MAX_DIRECT_RETRIES} in ${Math.round(delay)}ms`,
         );
         reportProgress(
@@ -192,7 +488,7 @@ async function downloadHttpDirect(downloadId, url, filename, headers = {}) {
         DIRECT_BACKOFF_BASE * Math.pow(2, attempt) + Math.random() * 500,
         DIRECT_BACKOFF_CAP,
       );
-      console.warn(
+      console.log(
         `[Worker] Direct download: ${err.message}, retry ${attempt + 1}/${MAX_DIRECT_RETRIES} in ${Math.round(delay)}ms`,
       );
       await new Promise((r) => setTimeout(r, delay));
@@ -221,7 +517,7 @@ async function downloadHttpDirect(downloadId, url, filename, headers = {}) {
     }
 
     if (contentLength > 0) {
-      const pct = Math.floor((downloaded / contentLength) * 100);
+      const pct = Math.min(Math.floor((downloaded / contentLength) * 80), 80);
       if (pct > lastPct) {
         lastPct = pct;
         reportProgress(
@@ -241,7 +537,7 @@ async function downloadHttpDirect(downloadId, url, filename, headers = {}) {
     }
   }
 
-  reportProgress(downloadId, "finalizing", 95, "Preparing file...");
+  reportProgress(downloadId, "finalizing", 84, "Preparing file...");
 
   const blob = new Blob(chunks, { type: contentType });
   const blobUrl = URL.createObjectURL(blob);
@@ -351,6 +647,12 @@ async function downloadM3U8(
   if (segments.length === 0)
     throw new Error("No segments found in media playlist");
 
+  // Auto-discover trueparadise mirror hosts from the playlist URL + segments
+  trueparadisePool.discover(masterUrl);
+  for (const seg of segments) {
+    trueparadisePool.discover(seg.url);
+  }
+
   const firstSegmentUrl = segments[0]?.url || "";
   const isAudioOnly =
     /audio/i.test(manifestText) || /\.aac|\.mp3/i.test(firstSegmentUrl);
@@ -369,8 +671,29 @@ async function downloadM3U8(
   const keyMap = await resolveAllM3U8Keys(segments, headers);
   const hasEncryption = keyMap.size > 0;
 
+  // Pirate CDNs inject ads into ~50-70% of segment requests; need high retry count
+  const pirateCDN = isPirateCDN(masterUrl);
+
   // S35 fix: Add URL refresh callback for YouTube URL expiry
-  const pool = new SegmentPool(MAX_CONCURRENT_SEGMENTS, MAX_SEGMENT_RETRIES, {
+  // Pirate CDN concurrency: 3 mimics normal player buffering behaviour.
+  // Higher values trigger the Worker's bot detection which then locks into
+  // 100% ad injection or outright connection refusal ("Failed to fetch").
+  // Combined with 200ms spacing this gives ~3-5 req/s (vs player's ~0.3 req/s)
+  // — aggressive enough to finish in minutes, gentle enough to avoid bans.
+  const pirateConcurrency = pirateCDN ? 3 : MAX_CONCURRENT_SEGMENTS;
+  const pirateRetries = pirateCDN ? 15 : MAX_SEGMENT_RETRIES;
+  const pool = new SegmentPool(pirateConcurrency, pirateRetries, {
+    isPirateCDN: pirateCDN,
+    maxAdRetries: pirateCDN ? 80 : 3,
+    adRetryDelayMs: pirateCDN ? 0 : 1000, // jitter handled inline for pirate CDNs
+    requestSpacingMs: pirateCDN ? 200 : 50, // space out requests to avoid rate detection
+    timeoutMs: pirateCDN ? 15000 : 30000, // shorter timeout — don't block a slot for 30s on a dropped connection
+    originUrlRewriter: pirateCDN ? getDirectOriginUrl : null,
+    hostRotator: pirateCDN
+      ? (url, exclude) => trueparadisePool.rotateUrl(url, exclude)
+      : null,
+    hostRotationInterval: pirateCDN ? 3 : 5,
+    hostPool: pirateCDN ? trueparadisePool : null,
     onUrlRefreshNeeded: async () => {
       console.log("[Worker] Requesting fresh URLs from background...");
       return new Promise((resolve, reject) => {
@@ -386,7 +709,7 @@ async function downloadM3U8(
           state.urlRefreshResolve = resolve;
           state.urlRefreshReject = reject;
           state.urlRefreshTimer = setTimeout(() => {
-            // Timeout — clear stored callbacks and reject
+            // Timeout â€” clear stored callbacks and reject
             if (state.urlRefreshResolve) {
               state.urlRefreshResolve = null;
               state.urlRefreshReject = null;
@@ -401,7 +724,7 @@ async function downloadM3U8(
     },
     // S36 fix: Handle sleep/wake events
     onSleepWakeDetected: (event) => {
-      console.warn(
+      console.log(
         `[Worker] System sleep/wake detected during download ${downloadId}: ${Math.round(event.timeDrift / 1000)}s gap`,
       );
       reportProgress(
@@ -413,7 +736,7 @@ async function downloadM3U8(
     },
     // S40 fix: Handle network changes (WiFi switch, mobile data toggle)
     onNetworkChange: (event) => {
-      console.warn(
+      console.log(
         `[Worker] Network change detected during download ${downloadId}: ${event.effectiveType}`,
       );
       reportProgress(
@@ -474,7 +797,7 @@ async function downloadM3U8(
       lastSpeedBytes = totalBytesDownloaded;
     }
     return currentSpeed > 0
-      ? ` • ${formatBytes(Math.round(currentSpeed))}/s`
+      ? ` â€¢ ${formatBytes(Math.round(currentSpeed))}/s`
       : "";
   }
 
@@ -491,7 +814,7 @@ async function downloadM3U8(
         if (hasEncryption && seg.key?.method === "AES-128" && seg.key?.uri) {
           const segKey = keyMap.get(seg.key.uri);
           if (!segKey) {
-            console.error(
+            console.log(
               `[Worker] No key found for segment ${i} (uri: ${seg.key.uri})`,
             );
             throw new Error(`Missing decryption key for segment ${i}`);
@@ -510,18 +833,15 @@ async function downloadM3U8(
             `[Worker] Skipped duplicate segment ${i} (hash=${segHash})`,
           );
           completedSegments++;
-          const pct = Math.floor(
-            (completedSegments / mediaSegments.length) * 100,
+          const pct = Math.min(
+            Math.floor((completedSegments / mediaSegments.length) * 80),
+            80,
           );
-          const adStats =
-            pool.stats.adBlocked > 0
-              ? ` | ${pool.stats.adBlocked} ads blocked`
-              : "";
           reportProgress(
             downloadId,
             "downloading",
             pct,
-            `${completedSegments} / ${mediaSegments.length} segments${skippedDupes ? ` (${skippedDupes} dupes skipped)` : ""}${adStats}`,
+            `${completedSegments} / ${mediaSegments.length} segments${skippedDupes ? ` (${skippedDupes} dupes skipped)` : ""}`,
           );
           return;
         }
@@ -550,7 +870,7 @@ async function downloadM3U8(
               writeSuccess = true;
             } catch (opfsErr) {
               if (attempts >= maxAttempts) {
-                console.error(
+                console.log(
                   `[Worker] OPFS write failed after ${attempts} attempts for segment ${i}:`,
                   opfsErr.message,
                 );
@@ -558,7 +878,7 @@ async function downloadM3U8(
                   `OPFS write failed (possibly after system sleep): ${opfsErr.message}`,
                 );
               }
-              console.warn(
+              console.log(
                 `[Worker] OPFS write attempt ${attempts} failed for segment ${i}, retrying... (${opfsErr.message})`,
               );
               // Wait a bit before retry to allow system to stabilize after wake
@@ -571,18 +891,15 @@ async function downloadM3U8(
 
         completedSegments++;
 
-        const pct = Math.floor(
-          (completedSegments / mediaSegments.length) * 100,
+        const pct = Math.min(
+          Math.floor((completedSegments / mediaSegments.length) * 80),
+          80,
         );
-        const adStats =
-          pool.stats.adBlocked > 0
-            ? ` | ${pool.stats.adBlocked} ads blocked`
-            : "";
         reportProgress(
           downloadId,
           "downloading",
           pct,
-          `${completedSegments} / ${mediaSegments.length} segments${adStats}${getSpeedStr()}`,
+          `${completedSegments} / ${mediaSegments.length} segments${getSpeedStr()}`,
         );
       })
       .catch((err) => {
@@ -590,12 +907,13 @@ async function downloadM3U8(
         // First segment is always fatal (like yt-dlp's is_fatal logic)
         if (i === 0) throw err;
         skippedFragments++;
-        console.warn(
+        console.log(
           `[Worker] Skipping unavailable segment ${i}: ${err.message} (${skippedFragments} skipped so far)`,
         );
         completedSegments++;
-        const pct = Math.floor(
-          (completedSegments / mediaSegments.length) * 100,
+        const pct = Math.min(
+          Math.floor((completedSegments / mediaSegments.length) * 80),
+          80,
         );
         reportProgress(
           downloadId,
@@ -610,9 +928,43 @@ async function downloadM3U8(
 
   if (isCancelled(downloadId)) throw new Error("Cancelled");
 
-  reportProgress(downloadId, "merging", 90, "Concatenating segments...");
+  reportProgress(downloadId, "merging", 82, "Concatenating segments...");
 
-  const isTS = mediaSegments.some((s) => /\.ts(\?|$)/i.test(s.url));
+  // URL-based TS detection (works for standard CDNs with .ts extensions)
+  let isTS = mediaSegments.some((s) => /\.ts(\?|$)/i.test(s.url));
+
+  // Content-based fallback: pirate CDNs (trueparadise etc.) use hashed filenames
+  // without .ts extensions, but the actual content is still MPEG-TS.
+  // Check the first downloaded segment's magic byte (0x47 = TS sync byte).
+  if (!isTS) {
+    if (useOPFS) {
+      try {
+        const seg0Name = `seg_${String(0).padStart(5, "0")}.bin`;
+        const seg0Handle = await opfsDir.getFileHandle(seg0Name);
+        const seg0File = await seg0Handle.getFile();
+        if (seg0File.size > 0) {
+          const header = new Uint8Array(
+            await seg0File.slice(0, 1).arrayBuffer(),
+          );
+          if (header[0] === 0x47) {
+            isTS = true;
+            console.log(
+              "[Worker] MPEG-TS detected via magic byte (OPFS seg 0)",
+            );
+          }
+        }
+      } catch (e) {
+        // seg 0 may already be merged/deleted in some edge cases — ignore
+      }
+    } else {
+      const firstSeg = segmentData.find((s) => s && s.byteLength > 0);
+      if (firstSeg && firstSeg[0] === 0x47) {
+        isTS = true;
+        console.log("[Worker] MPEG-TS detected via magic byte (memory seg 0)");
+      }
+    }
+  }
+
   const outputMimeType = isTS ? "video/mp2t" : "video/mp4";
   let outputBlob;
   let outputFilename = filename || "video.mp4";
@@ -623,9 +975,24 @@ async function downloadM3U8(
   // Detect audio codec from first downloaded segment's magic bytes (fallback)
   let detectedAudioCodec = null;
   if (isTS) {
-    const firstSeg = useOPFS
-      ? null
-      : segmentData.find((s) => s && s.byteLength > 0);
+    let firstSeg = null;
+    if (useOPFS) {
+      // Read first segment from OPFS for codec detection (before merge deletes it)
+      try {
+        const seg0Name = `seg_${String(0).padStart(5, "0")}.bin`;
+        const seg0Handle = await opfsDir.getFileHandle(seg0Name);
+        const seg0File = await seg0Handle.getFile();
+        if (seg0File.size > 188) {
+          firstSeg = new Uint8Array(
+            await seg0File
+              .slice(0, Math.min(seg0File.size, 32768))
+              .arrayBuffer(),
+          );
+        }
+      } catch (e) {}
+    } else {
+      firstSeg = segmentData.find((s) => s && s.byteLength > 0);
+    }
     if (firstSeg) {
       detectedAudioCodec = detectAudioCodecFromTS(firstSeg);
       if (detectedAudioCodec) {
@@ -653,7 +1020,7 @@ async function downloadM3U8(
         const buffer = await file.arrayBuffer();
         mergedAccess.write(new Uint8Array(buffer), { at: writeOffset });
         writeOffset += buffer.byteLength;
-        // Delete segment file immediately after merge — frees disk space progressively
+        // Delete segment file immediately after merge â€” frees disk space progressively
         await opfsDir.removeEntry(segName).catch(() => {});
       } catch (e) {}
     }
@@ -684,13 +1051,13 @@ async function downloadM3U8(
       if (seg) {
         merged.set(seg, offset);
         offset += seg.byteLength;
-        segmentData[si] = null; // Free segment immediately after copying — reduces peak RAM
+        segmentData[si] = null; // Free segment immediately after copying â€” reduces peak RAM
       }
     }
     outputBlob = new Blob([merged], { type: outputMimeType });
   }
 
-  reportProgress(downloadId, "finalizing", 95, "Preparing file...");
+  reportProgress(downloadId, "finalizing", 84, "Preparing file...");
 
   const blobUrl = URL.createObjectURL(outputBlob);
 
@@ -771,7 +1138,7 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
       dashSpeedStart = now;
       dashLastSpeedBytes = dashBytesDownloaded;
     }
-    return dashSpeed > 0 ? ` • ${formatBytes(Math.round(dashSpeed))}/s` : "";
+    return dashSpeed > 0 ? ` â€¢ ${formatBytes(Math.round(dashSpeed))}/s` : "";
   }
 
   reportProgress(downloadId, "downloading", 0, `0 / ${total} segments`);
@@ -793,7 +1160,7 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
           reportProgress(
             downloadId,
             "downloading",
-            Math.floor((completed / total) * 100),
+            Math.min(Math.floor((completed / total) * 80), 80),
             `${completed} / ${total} segments`,
           );
           return;
@@ -809,7 +1176,7 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
         reportProgress(
           downloadId,
           "downloading",
-          Math.floor((completed / total) * 100),
+          Math.min(Math.floor((completed / total) * 80), 80),
           `${completed} / ${total} segments${skippedFragments ? ` (${skippedFragments} skipped)` : ""}${getDashSpeedStr()}`,
         );
       })
@@ -818,14 +1185,14 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
         // First segment of each track is always fatal (use seg.index, not allSegments index i)
         if (seg.index === 0 || (seg.index === undefined && i === 0)) throw err;
         skippedFragments++;
-        console.warn(
+        console.log(
           `[Worker] Skipping unavailable DASH segment ${i} (${seg.track}): ${err.message}`,
         );
         completed++;
         reportProgress(
           downloadId,
           "downloading",
-          Math.floor((completed / total) * 100),
+          Math.min(Math.floor((completed / total) * 80), 80),
           `${completed} / ${total} segments (${skippedFragments} skipped)`,
         );
       }),
@@ -835,7 +1202,7 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
 
   if (isCancelled(downloadId)) throw new Error("Cancelled");
 
-  reportProgress(downloadId, "merging", 90, "Concatenating...");
+  reportProgress(downloadId, "merging", 82, "Concatenating...");
 
   videoChunks.sort((a, b) => a.index - b.index);
   audioChunks.sort((a, b) => a.index - b.index);
@@ -916,8 +1283,8 @@ async function downloadMergedStreams(
     const totalBytes = videoTotal + audioTotal;
     if (totalBytes <= 0) return;
     const pct = Math.min(
-      Math.floor(((videoDL + audioDL) / totalBytes) * 85),
-      85,
+      Math.floor(((videoDL + audioDL) / totalBytes) * 80),
+      80,
     );
     if (pct <= lastPct) return;
     lastPct = pct;
@@ -938,7 +1305,7 @@ async function downloadMergedStreams(
   const videoBlobUrl = URL.createObjectURL(videoBlob);
   const audioBlobUrl = URL.createObjectURL(audioBlob);
 
-  reportProgress(downloadId, "merging", 90, "Tracks ready for merge...");
+  reportProgress(downloadId, "merging", 82, "Tracks ready for merge...");
 
   return {
     blobUrl: videoBlobUrl,
@@ -990,7 +1357,7 @@ async function fetchFullFile(downloadId, url, headers, label, onProgress) {
   if (onProgress) onProgress(0, contentLength);
 
   if (contentLength > 0) {
-    // Pre-allocate buffer when size is known — avoids 2× peak memory
+    // Pre-allocate buffer when size is known â€” avoids 2Ã— peak memory
     const result = new Uint8Array(contentLength);
     while (true) {
       if (isCancelled(downloadId)) {
@@ -1114,14 +1481,14 @@ function parseM3U8MediaPlaylist(text, baseUrl) {
   // Track durations per discontinuity region for ad heuristic
   const regionDurations = [];
   let currentRegionDuration = 0;
-  // ── EXT-X-BYTERANGE state (RFC 8216 §4.3.2.2) ──
+  // â”€â”€ EXT-X-BYTERANGE state (RFC 8216 Â§4.3.2.2) â”€â”€
   // Tracks pending byte-range for the next segment URI.
   // If offset is omitted, it equals the byte after the end of the previous
   // sub-range of the same resource.
   let pendingByteRange = null;
   let lastByteEnd = 0; // running end-offset for implicit offset calculation
 
-  // ── Pass 1: Detect vendor-specific ad markers (yt-dlp technique) ──
+  // â”€â”€ Pass 1: Detect vendor-specific ad markers (yt-dlp technique) â”€â”€
   function isAdFragmentStart(s) {
     return (
       (s.startsWith("#ANVATO-SEGMENT-INFO") && s.includes("type=ad")) ||
@@ -1136,7 +1503,7 @@ function parseM3U8MediaPlaylist(text, baseUrl) {
     );
   }
 
-  // ── Pass 1: Build segments with ad flags ──
+  // â”€â”€ Pass 1: Build segments with ad flags â”€â”€
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
@@ -1167,7 +1534,7 @@ function parseM3U8MediaPlaylist(text, baseUrl) {
       continue;
     }
 
-    // ── EXT-X-BYTERANGE (RFC 8216 §4.3.2.2) ──
+    // â”€â”€ EXT-X-BYTERANGE (RFC 8216 Â§4.3.2.2) â”€â”€
     // Format: #EXT-X-BYTERANGE:<length>[@<offset>]
     // If offset is omitted, it starts at the byte following the previous
     // sub-range of the same resource or 0 if there is no previous sub-range.
@@ -1201,7 +1568,7 @@ function parseM3U8MediaPlaylist(text, baseUrl) {
     if (line.startsWith("#EXT-X-MAP:")) {
       const attrs = parseM3U8Attrs(line.substring("#EXT-X-MAP:".length));
       if (attrs.URI) {
-        // Parse optional BYTERANGE attribute on #EXT-X-MAP (RFC 8216 §4.3.2.5)
+        // Parse optional BYTERANGE attribute on #EXT-X-MAP (RFC 8216 Â§4.3.2.5)
         let mapByteRange = null;
         if (attrs.BYTERANGE) {
           const brVal = attrs.BYTERANGE.replace(/"/g, "");
@@ -1285,7 +1652,7 @@ function parseM3U8MediaPlaylist(text, baseUrl) {
     regionDurations.push(currentRegionDuration);
   }
 
-  // ── Pass 2 (optional): Detect short discontinuity regions as ads ──
+  // â”€â”€ Pass 2 (optional): Detect short discontinuity regions as ads â”€â”€
   // If we have multiple discontinuity regions, very short ones (< 15s total)
   // surrounded by long regions are likely ad breaks
   if (discontinuityCount > 0 && regionDurations.length > 2) {
@@ -1352,7 +1719,7 @@ function parseM3U8Attrs(str) {
  * to different URIs will have each key fetched and imported once.
  */
 async function resolveAllM3U8Keys(segments, headers) {
-  const keyMap = new Map(); // uri → CryptoKey
+  const keyMap = new Map(); // uri â†’ CryptoKey
   const uniqueUris = new Set();
 
   for (const seg of segments) {
@@ -1366,7 +1733,7 @@ async function resolveAllM3U8Keys(segments, headers) {
   console.log(`[Worker] Resolving ${uniqueUris.size} unique encryption key(s)`);
 
   // Notify background about key server domains that may need DNR header rules.
-  // The main stream DNR rule only covers the segment host — key URIs may be
+  // The main stream DNR rule only covers the segment host â€” key URIs may be
   // on a different domain that also needs Referer/auth headers.
   try {
     const keyHosts = new Set();
@@ -1391,7 +1758,7 @@ async function resolveAllM3U8Keys(segments, headers) {
       const keyData = await resp.arrayBuffer();
 
       if (keyData.byteLength !== 16) {
-        console.warn(
+        console.log(
           `[Worker] Key from ${uri} is ${keyData.byteLength} bytes (expected 16). Attempting import anyway.`,
         );
       }
@@ -1406,7 +1773,7 @@ async function resolveAllM3U8Keys(segments, headers) {
       keyMap.set(uri, cryptoKey);
       console.log(`[Worker] Imported key from ${uri}`);
     } catch (err) {
-      console.error(`[Worker] Failed to resolve key ${uri}:`, err.message);
+      console.log(`[Worker] Failed to resolve key ${uri}:`, err.message);
       throw err;
     }
   }
@@ -1738,7 +2105,7 @@ function handleUrlRefresh(data) {
   const { downloadId, urlMap } = data;
   const state = activeDownloads.get(downloadId);
   if (!state) {
-    console.warn(`[Worker] URL refresh for unknown download ${downloadId}`);
+    console.log(`[Worker] URL refresh for unknown download ${downloadId}`);
     return;
   }
 
@@ -1780,14 +2147,14 @@ function formatBytes(bytes) {
 
 /**
  * Extract audio codec identifier from HLS CODECS attribute string.
- * e.g. "avc1.640028,mp4a.40.2" → "aac"
- *      "avc1.640028,mp4a.40.5" → "aac"
- *      "avc1.640028,ac-3"      → "ac3"
- *      "avc1.640028,ec-3"      → "eac3"
- *      "avc1.640028,opus"      → "opus"
- *      "avc1.640028,vorbis"    → "vorbis"
- *      "avc1.640028,mp4a.69"   → "mp3"
- *      "avc1.640028,mp4a.6B"   → "mp3"
+ * e.g. "avc1.640028,mp4a.40.2" â†’ "aac"
+ *      "avc1.640028,mp4a.40.5" â†’ "aac"
+ *      "avc1.640028,ac-3"      â†’ "ac3"
+ *      "avc1.640028,ec-3"      â†’ "eac3"
+ *      "avc1.640028,opus"      â†’ "opus"
+ *      "avc1.640028,vorbis"    â†’ "vorbis"
+ *      "avc1.640028,mp4a.69"   â†’ "mp3"
+ *      "avc1.640028,mp4a.6B"   â†’ "mp3"
  */
 function extractAudioCodecFromCodecs(codecsStr) {
   if (!codecsStr) return null;
@@ -1799,7 +2166,7 @@ function extractAudioCodecFromCodecs(codecsStr) {
     if (p.startsWith("mp4a.40.")) return "aac";
     // MP3 in MP4 (mp4a.69 or mp4a.6b)
     if (p === "mp4a.69" || p === "mp4a.6b") return "mp3";
-    // Generic mp4a without sub-profile — assume AAC
+    // Generic mp4a without sub-profile â€” assume AAC
     if (p.startsWith("mp4a.")) return "aac";
     // Opus
     if (p === "opus" || p.startsWith("opus")) return "opus";
@@ -1891,7 +2258,7 @@ function detectAudioCodecFromTS(data) {
           case 0x87:
             return "eac3"; // E-AC-3
           case 0x06: // PES private data (could be AC-3 or other)
-            // Ambiguous — don't guess, let ffprobe handle it
+            // Ambiguous â€” don't guess, let ffprobe handle it
             break;
         }
       }

@@ -1,6 +1,30 @@
 (function () {
   "use strict";
 
+  // Bail out immediately if this site has a specialist extractor.
+  // SITE_EXTRACTOR_MAP is loaded before this script via manifest.json.
+  if (typeof SITE_EXTRACTOR_MAP !== "undefined") {
+    var _h = window.location.hostname.replace(/^www\./, "");
+    var _found = false;
+    if (SITE_EXTRACTOR_MAP[_h]) _found = true;
+    if (!_found) {
+      var _parts = _h.split(".");
+      for (var _i = 1; _i < _parts.length - 1; _i++) {
+        if (SITE_EXTRACTOR_MAP[_parts.slice(_i).join(".")]) {
+          _found = true;
+          break;
+        }
+      }
+    }
+    if (_found) {
+      console.log(
+        "[GenericHook] Specialist site detected, skipping generic network hooks for:",
+        _h,
+      );
+      return;
+    }
+  }
+
   const MAGIC = "__generic_extractor__";
   const seen = new Set();
   const blobMap = new Map();
@@ -52,7 +76,12 @@
     "vembed.net",
     "multiembed.mov",
     "2embed.cc",
+    "vidsrc.cc",
     "vidsrc.me",
+    "vidsrc.to",
+    "vidsrc.in",
+    "vidsrc.net",
+    "vidsrc.xyz",
     "autoembed.cc",
     "flixhq.to",
     "sflix.to",
@@ -113,7 +142,14 @@
   function checkUrl(url, extraData) {
     extraData = extraData || {};
     if (!url || typeof url !== "string") return;
+
+    // Handle protocol-relative URLs
+    if (url.startsWith("//")) url = "https:" + url;
+
     if (seen.has(url)) return;
+
+    // If a site specialist has loaded on this page, defer to it
+    if (window.__SPECIALIST_DETECTED) return;
 
     // Skip known ad/tracker URLs to avoid false positive detections
     for (var i = 0; i < AD_URL_PATTERNS.length; i++) {
@@ -142,12 +178,26 @@
     }
 
     if (/\/video\/|\.(mp4|webm)(\?|#|$)/i.test(url) && url.length < 500) {
-      if (/cdn|media|stream|video|content/i.test(url)) {
+      if (/cdn|media|stream|video|content|storage|download|assets/i.test(url)) {
         seen.add(url);
         window.postMessage(
           { type: MAGIC, url: url, direct: true, ...extraData },
           "*",
         );
+      }
+    }
+
+    // Also catch .ts segment URLs that indicate an active HLS stream
+    if (/\.ts(\?|#|$)/i.test(url) && url.length < 500) {
+      if (/seg|chunk|fragment|media|cdn|stream|video/i.test(url)) {
+        // Don't report individual segments, but signal HLS activity
+        if (!window.__hlsSegmentDetected) {
+          window.__hlsSegmentDetected = true;
+          window.postMessage(
+            { type: MAGIC, hlsSegmentsDetected: true, sampleUrl: url },
+            "*",
+          );
+        }
       }
     }
   }
@@ -156,6 +206,7 @@
   function checkResponseForHLS(url, text) {
     if (!text || typeof text !== "string") return;
     if (seen.has(url)) return;
+    if (window.__SPECIALIST_DETECTED) return;
     var trimmed = text.trimStart();
 
     // HLS manifest detection
@@ -165,9 +216,9 @@
       return;
     }
 
-    // DASH MPD manifest detection
+    // DASH MPD manifest detection (XML or JSON-based)
     if (
-      trimmed.startsWith("<?xml") &&
+      (trimmed.startsWith("<?xml") || trimmed.startsWith("<MPD")) &&
       (trimmed.includes("<MPD") || trimmed.includes("<mpd"))
     ) {
       seen.add(url);
@@ -227,6 +278,163 @@
                 "*",
               );
             }
+          }
+        }
+      }
+
+      // Deep JSON response scanning — parse JSON and extract from video-related keys
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          var jsonData = JSON.parse(trimmed);
+          deepScanJsonForVideoUrls(jsonData, 0);
+        } catch (e) {
+          // Not valid JSON, try regex fallback for video URLs in response body
+        }
+      }
+
+      // Also extract direct video URLs from JSON API responses (mp4/webm)
+      var videoUrlMatches = text.match(
+        /(?:https?:)?\/\/[^\s"'<>\\]+\.(?:mp4|webm)(?:\?[^\s"'<>\\]*)?/gi,
+      );
+      if (videoUrlMatches) {
+        for (var v = 0; v < videoUrlMatches.length; v++) {
+          var vUrl = videoUrlMatches[v];
+          if (vUrl.startsWith("//")) vUrl = "https:" + vUrl;
+          if (!seen.has(vUrl) && vUrl.length < 500) {
+            // Only report if URL looks like actual content (has CDN/media markers)
+            if (
+              /cdn|media|stream|video|content|storage|download|assets/i.test(
+                vUrl,
+              )
+            ) {
+              var isAdVid = false;
+              for (var av = 0; av < AD_URL_PATTERNS.length; av++) {
+                if (AD_URL_PATTERNS[av].test(vUrl)) {
+                  isAdVid = true;
+                  break;
+                }
+              }
+              if (!isAdVid) {
+                seen.add(vUrl);
+                window.postMessage(
+                  {
+                    type: MAGIC,
+                    url: vUrl,
+                    direct: true,
+                    extractedFromResponse: true,
+                  },
+                  "*",
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Deep JSON scanner for finding video URLs in nested API response objects
+  var JSON_VIDEO_KEYS = [
+    "file",
+    "src",
+    "source",
+    "url",
+    "video_url",
+    "videoUrl",
+    "video_src",
+    "streamUrl",
+    "stream_url",
+    "hlsUrl",
+    "hls_url",
+    "dashUrl",
+    "dash_url",
+    "manifestUrl",
+    "manifest_url",
+    "playbackUrl",
+    "playback_url",
+    "contentUrl",
+    "content_url",
+    "mediaUrl",
+    "media_url",
+    "mp4",
+    "download_url",
+    "clip_url",
+    "videoSrc",
+    "video_file",
+    "path",
+  ];
+
+  function deepScanJsonForVideoUrls(obj, depth) {
+    if (!obj || depth > 8) return;
+
+    if (typeof obj === "string") {
+      // Check if this string value is a video URL
+      if (
+        /^https?:\/\//.test(obj) &&
+        /\.(m3u8|mpd|mp4|webm|mov|flv)(\?|$)/i.test(obj)
+      ) {
+        if (!seen.has(obj) && obj.length < 500) {
+          var isAd = false;
+          for (var i = 0; i < AD_URL_PATTERNS.length; i++) {
+            if (AD_URL_PATTERNS[i].test(obj)) {
+              isAd = true;
+              break;
+            }
+          }
+          if (!isAd) {
+            seen.add(obj);
+            var isDirect = /\.(mp4|webm|mov|flv)(\?|$)/i.test(obj);
+            window.postMessage(
+              {
+                type: MAGIC,
+                url: obj,
+                direct: isDirect,
+                extractedFromResponse: true,
+                jsonDeepScan: true,
+              },
+              "*",
+            );
+          }
+        }
+      }
+      return;
+    }
+
+    if (Array.isArray(obj)) {
+      for (var a = 0; a < obj.length && a < 100; a++) {
+        deepScanJsonForVideoUrls(obj[a], depth + 1);
+      }
+      return;
+    }
+
+    if (typeof obj === "object") {
+      var keys = Object.keys(obj);
+      for (var k = 0; k < keys.length && k < 200; k++) {
+        var key = keys[k];
+        var val = obj[key];
+        var lowerKey = key.toLowerCase();
+
+        // Priority scan: check known video keys first
+        var isVideoKey = false;
+        for (var j = 0; j < JSON_VIDEO_KEYS.length; j++) {
+          if (lowerKey === JSON_VIDEO_KEYS[j].toLowerCase()) {
+            isVideoKey = true;
+            break;
+          }
+        }
+
+        if (isVideoKey && typeof val === "string") {
+          deepScanJsonForVideoUrls(val, depth + 1);
+        } else if (typeof val === "object" && val !== null) {
+          deepScanJsonForVideoUrls(val, depth + 1);
+        } else if (
+          typeof val === "string" &&
+          val.length > 15 &&
+          val.length < 500
+        ) {
+          // Also check non-video-key strings that contain video extensions
+          if (/\.(?:m3u8|mpd)(\?|$)/i.test(val)) {
+            deepScanJsonForVideoUrls(val, depth + 1);
           }
         }
       }
@@ -351,8 +559,20 @@
 
   const origSetAttribute = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name, value) {
-    if ((name === "src" || name === "data-src") && typeof value === "string") {
-      checkUrl(value);
+    if (typeof value === "string") {
+      if (
+        name === "src" ||
+        name === "data-src" ||
+        name === "data-video-url" ||
+        name === "data-video-src" ||
+        name === "data-stream-url" ||
+        name === "data-hls" ||
+        name === "data-dash-url" ||
+        name === "data-m3u8" ||
+        name === "data-mpd"
+      ) {
+        checkUrl(value);
+      }
     }
     return origSetAttribute.call(this, name, value);
   };
@@ -455,6 +675,7 @@
   // appearing, (3) source elements being added/changed.
 
   const videoSrcTracker = new Map(); // element → last known src
+  var durationReported = false; // Only report duration once
 
   function scanVideoElements() {
     try {
@@ -482,6 +703,24 @@
               });
             }
           }
+        }
+
+        // Report video duration to parent (for iframe hook → background relay)
+        if (
+          !durationReported &&
+          video.duration &&
+          isFinite(video.duration) &&
+          video.duration > 30
+        ) {
+          durationReported = true;
+          window.postMessage(
+            {
+              type: "__generic_extractor_duration__",
+              duration: video.duration,
+              frameUrl: window.location.href,
+            },
+            "*",
+          );
         }
       }
     } catch (e) {}
@@ -663,9 +902,7 @@
           }
           return origSrcObjSet.call(this, value);
         },
-        get: srcObjDesc.get
-          ? srcObjDesc.get
-          : undefined,
+        get: srcObjDesc.get ? srcObjDesc.get : undefined,
         configurable: true,
         enumerable: true,
       });
@@ -789,7 +1026,430 @@
     } catch (e) {}
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // WebSocket interception — detect video URLs delivered via WS
+  // ═══════════════════════════════════════════════════════════════════════
+  if (typeof WebSocket !== "undefined") {
+    try {
+      var OrigWebSocket = WebSocket;
+      var wsMessageCount = 0;
+
+      window.WebSocket = function (url, protocols) {
+        var ws = protocols
+          ? new OrigWebSocket(url, protocols)
+          : new OrigWebSocket(url);
+
+        // Check if the WebSocket URL itself points to a video service
+        if (url && typeof url === "string") {
+          if (/stream|video|media|player|hls|dash/i.test(url)) {
+            window.postMessage(
+              {
+                type: MAGIC,
+                webSocketDetected: true,
+                wsUrl: String(url),
+              },
+              "*",
+            );
+          }
+        }
+
+        // Intercept incoming messages for video URLs
+        var origAddEventListener = ws.addEventListener.bind(ws);
+        ws.addEventListener = function (type, listener, options) {
+          if (type === "message") {
+            var wrappedListener = function (event) {
+              wsMessageCount++;
+              // Only inspect every 5th message to avoid performance impact
+              if (wsMessageCount % 5 === 1) {
+                try {
+                  var data = typeof event.data === "string" ? event.data : null;
+                  if (data && data.length < 50000) {
+                    // Check for video URLs in WS message
+                    var m3u8Match = data.match(
+                      /(https?:\/\/[^\s"'<>\\]+\.m3u8(?:\?[^\s"'<>\\]*)?)/i,
+                    );
+                    if (m3u8Match && !seen.has(m3u8Match[1])) {
+                      seen.add(m3u8Match[1]);
+                      window.postMessage(
+                        {
+                          type: MAGIC,
+                          url: m3u8Match[1],
+                          wsSource: true,
+                        },
+                        "*",
+                      );
+                    }
+                    var mpdMatch = data.match(
+                      /(https?:\/\/[^\s"'<>\\]+\.mpd(?:\?[^\s"'<>\\]*)?)/i,
+                    );
+                    if (mpdMatch && !seen.has(mpdMatch[1])) {
+                      seen.add(mpdMatch[1]);
+                      window.postMessage(
+                        {
+                          type: MAGIC,
+                          url: mpdMatch[1],
+                          wsSource: true,
+                        },
+                        "*",
+                      );
+                    }
+                    var mp4Match = data.match(
+                      /(https?:\/\/[^\s"'<>\\]+\.mp4(?:\?[^\s"'<>\\]*)?)/i,
+                    );
+                    if (
+                      mp4Match &&
+                      !seen.has(mp4Match[1]) &&
+                      /cdn|media|stream|video|content/i.test(mp4Match[1])
+                    ) {
+                      seen.add(mp4Match[1]);
+                      window.postMessage(
+                        {
+                          type: MAGIC,
+                          url: mp4Match[1],
+                          direct: true,
+                          wsSource: true,
+                        },
+                        "*",
+                      );
+                    }
+                  }
+                } catch (e) {}
+              }
+              return listener.call(this, event);
+            };
+            return origAddEventListener(type, wrappedListener, options);
+          }
+          return origAddEventListener(type, listener, options);
+        };
+
+        // Also intercept onmessage setter
+        var origOnMessage = null;
+        Object.defineProperty(ws, "onmessage", {
+          get: function () {
+            return origOnMessage;
+          },
+          set: function (handler) {
+            origOnMessage = function (event) {
+              wsMessageCount++;
+              if (wsMessageCount % 5 === 1) {
+                try {
+                  var data = typeof event.data === "string" ? event.data : null;
+                  if (
+                    data &&
+                    data.length < 50000 &&
+                    /\.(?:m3u8|mpd|mp4)/i.test(data)
+                  ) {
+                    var urlMatch = data.match(
+                      /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mpd|mp4)(?:\?[^\s"'<>\\]*)?)/i,
+                    );
+                    if (urlMatch && !seen.has(urlMatch[1])) {
+                      seen.add(urlMatch[1]);
+                      window.postMessage(
+                        { type: MAGIC, url: urlMatch[1], wsSource: true },
+                        "*",
+                      );
+                    }
+                  }
+                } catch (e) {}
+              }
+              return handler.call(this, event);
+            };
+          },
+          configurable: true,
+          enumerable: true,
+        });
+
+        return ws;
+      };
+
+      // Copy static properties
+      window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+      window.WebSocket.OPEN = OrigWebSocket.OPEN;
+      window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
+      window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
+      window.WebSocket.prototype = OrigWebSocket.prototype;
+    } catch (e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // EventSource (SSE) interception — detect video URLs via Server-Sent Events
+  // ═══════════════════════════════════════════════════════════════════════
+  if (typeof EventSource !== "undefined") {
+    try {
+      var OrigEventSource = EventSource;
+
+      window.EventSource = function (url, config) {
+        var es = config
+          ? new OrigEventSource(url, config)
+          : new OrigEventSource(url);
+
+        // Check if SSE URL is media-related
+        if (
+          url &&
+          typeof url === "string" &&
+          /stream|video|media|player/i.test(url)
+        ) {
+          window.postMessage(
+            {
+              type: MAGIC,
+              eventSourceDetected: true,
+              sseUrl: String(url),
+            },
+            "*",
+          );
+        }
+
+        // Intercept messages for video URLs
+        var origESAddListener = es.addEventListener.bind(es);
+        es.addEventListener = function (type, listener, options) {
+          if (type === "message" || type === "video" || type === "stream") {
+            var wrappedListener = function (event) {
+              try {
+                var data = event.data;
+                if (data && typeof data === "string" && data.length < 50000) {
+                  if (/\.(?:m3u8|mpd|mp4)/i.test(data)) {
+                    var urlMatch = data.match(
+                      /(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mpd|mp4)(?:\?[^\s"'<>\\]*)?)/i,
+                    );
+                    if (urlMatch && !seen.has(urlMatch[1])) {
+                      seen.add(urlMatch[1]);
+                      window.postMessage(
+                        { type: MAGIC, url: urlMatch[1], sseSource: true },
+                        "*",
+                      );
+                    }
+                  }
+                }
+              } catch (e) {}
+              return listener.call(this, event);
+            };
+            return origESAddListener(type, wrappedListener, options);
+          }
+          return origESAddListener(type, listener, options);
+        };
+
+        return es;
+      };
+
+      window.EventSource.prototype = OrigEventSource.prototype;
+    } catch (e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // pushState/replaceState interception — notify generic extractor of SPA nav
+  // ═══════════════════════════════════════════════════════════════════════
+  try {
+    var origPushState = history.pushState;
+    var origReplaceState = history.replaceState;
+
+    history.pushState = function () {
+      var result = origPushState.apply(this, arguments);
+      window.postMessage({ type: "__generic_spa_navigation__" }, "*");
+      return result;
+    };
+
+    history.replaceState = function () {
+      var result = origReplaceState.apply(this, arguments);
+      window.postMessage({ type: "__generic_spa_navigation__" }, "*");
+      return result;
+    };
+  } catch (e) {}
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // RTCPeerConnection detection — flag WebRTC-based video delivery
+  // ═══════════════════════════════════════════════════════════════════════
+  if (typeof RTCPeerConnection !== "undefined") {
+    try {
+      var OrigRTC = RTCPeerConnection;
+      var rtcCount = 0;
+
+      window.RTCPeerConnection = function (config, constraints) {
+        var pc = constraints
+          ? new OrigRTC(config, constraints)
+          : new OrigRTC(config);
+
+        rtcCount++;
+        if (rtcCount <= 3) {
+          // Only report first few connections
+          window.postMessage(
+            {
+              type: MAGIC,
+              webrtcDetected: true,
+              connectionCount: rtcCount,
+              iceServers:
+                config && config.iceServers ? config.iceServers.length : 0,
+            },
+            "*",
+          );
+        }
+
+        return pc;
+      };
+
+      window.RTCPeerConnection.prototype = OrigRTC.prototype;
+      // Copy static methods
+      if (OrigRTC.generateCertificate) {
+        window.RTCPeerConnection.generateCertificate =
+          OrigRTC.generateCertificate;
+      }
+    } catch (e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Worker / SharedWorker interception — detect workers loading video
+  // ═══════════════════════════════════════════════════════════════════════
+  if (typeof Worker !== "undefined") {
+    try {
+      var OrigWorker = Worker;
+      window.Worker = function (scriptURL, options) {
+        var url =
+          typeof scriptURL === "string"
+            ? scriptURL
+            : scriptURL instanceof URL
+              ? scriptURL.href
+              : String(scriptURL);
+        // Check if worker script URL suggests video processing
+        if (/player|video|stream|hls|dash|media|segment|mse/i.test(url)) {
+          window.postMessage(
+            {
+              type: MAGIC,
+              workerDetected: true,
+              workerUrl: url,
+            },
+            "*",
+          );
+        }
+        return options
+          ? new OrigWorker(scriptURL, options)
+          : new OrigWorker(scriptURL);
+      };
+      window.Worker.prototype = OrigWorker.prototype;
+    } catch (e) {}
+  }
+
+  if (typeof SharedWorker !== "undefined") {
+    try {
+      var OrigSharedWorker = SharedWorker;
+      window.SharedWorker = function (scriptURL, options) {
+        var url =
+          typeof scriptURL === "string"
+            ? scriptURL
+            : scriptURL instanceof URL
+              ? scriptURL.href
+              : String(scriptURL);
+        if (/player|video|stream|hls|dash|media|segment/i.test(url)) {
+          window.postMessage(
+            {
+              type: MAGIC,
+              sharedWorkerDetected: true,
+              workerUrl: url,
+            },
+            "*",
+          );
+        }
+        return options
+          ? new OrigSharedWorker(scriptURL, options)
+          : new OrigSharedWorker(scriptURL);
+      };
+      window.SharedWorker.prototype = OrigSharedWorker.prototype;
+    } catch (e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Blob URL content scanning — read video-type Blob URLs to check content
+  // ═══════════════════════════════════════════════════════════════════════
+  // When a Blob URL is assigned to a video element but the Blob isn't typed
+  // as video, we may miss it. Periodically check video elements using Blob URLs.
+  var blobScanInterval = setInterval(function () {
+    try {
+      var videos = document.querySelectorAll("video");
+      for (var i = 0; i < videos.length; i++) {
+        var video = videos[i];
+        var src = video.src || video.currentSrc;
+        if (!src || !src.startsWith("blob:") || seen.has(src)) continue;
+
+        // If video has duration > 5s and we haven't reported this blob, flag it
+        if (video.duration && isFinite(video.duration) && video.duration > 5) {
+          if (!blobMap.has(src) || !blobMap.get(src).reported) {
+            seen.add(src);
+            blobMap.set(src, {
+              type: "video/auto",
+              size: 0,
+              timestamp: Date.now(),
+              reported: true,
+            });
+            window.postMessage(
+              {
+                type: MAGIC,
+                blobUrl: src,
+                blobType: "video/mp4",
+                blobSize: 0,
+                isBlobVideo: true,
+                autoBlobDetected: true,
+                duration: video.duration,
+              },
+              "*",
+            );
+          }
+        }
+      }
+    } catch (e) {}
+  }, 5000);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // XHR/Fetch content-type enhanced detection
+  // ═══════════════════════════════════════════════════════════════════════
+  // The existing fetch hook checks for mpegurl/text/json/octet — also add
+  // explicit check for dash+xml content-type in the XHR hook
+  var origXHRSend2 = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function () {
+    var xhr = this;
+    var hookUrl = xhr.__hookUrl;
+    if (hookUrl && !seen.has(hookUrl)) {
+      try {
+        xhr.addEventListener("load", function () {
+          try {
+            if (xhr.readyState === 4 && xhr.status >= 200 && xhr.status < 400) {
+              var ct = (
+                xhr.getResponseHeader("content-type") || ""
+              ).toLowerCase();
+
+              // Direct content-type match for DASH
+              if (ct.includes("dash+xml") || ct.includes("application/dash")) {
+                if (!seen.has(hookUrl)) {
+                  seen.add(hookUrl);
+                  window.postMessage(
+                    { type: MAGIC, url: hookUrl, dashContent: true },
+                    "*",
+                  );
+                  return;
+                }
+              }
+
+              // Direct content-type match for HLS
+              if (
+                ct.includes("mpegurl") ||
+                ct.includes("x-mpegurl") ||
+                ct.includes("vnd.apple.mpegurl")
+              ) {
+                if (!seen.has(hookUrl)) {
+                  seen.add(hookUrl);
+                  window.postMessage(
+                    { type: MAGIC, url: hookUrl, hlsContent: true },
+                    "*",
+                  );
+                  return;
+                }
+              }
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+    return origXHRSend2.apply(this, arguments);
+  };
+
   console.log(
-    "[M3U8 Detector] Enhanced generic network hook initialized (MSE + Blob + WebAudio + Ad-filter + Pirate-site + SW detection)",
+    "[M3U8 Detector] GOD-mode network hook initialized (MSE + Blob + WebAudio + WebSocket + SSE + WebRTC + Worker + JSON-deep-scan + Ad-filter + Pirate-site + SW + SPA detection)",
   );
 })();

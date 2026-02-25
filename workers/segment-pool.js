@@ -23,7 +23,10 @@ class SegmentPool {
     this.concurrency = concurrency;
     this._originalConcurrency = concurrency;
     // Allow ramp-up above original when consistently succeeding (auto-scaling)
-    this._maxConcurrency = opts.maxConcurrency ?? Math.min(concurrency + 4, 10);
+    // Ensure _maxConcurrency is never below the initial concurrency (pirate CDNs start at 15)
+    this._maxConcurrency =
+      opts.maxConcurrency ??
+      Math.max(concurrency, Math.min(concurrency + 4, 10));
     this.maxRetries = maxRetries;
 
     this._requestSpacingMs = opts.requestSpacingMs ?? 50;
@@ -38,6 +41,31 @@ class SegmentPool {
     this._validateContent = opts.validateContent !== false; // on by default
     this._minSegmentBytes = opts.minSegmentBytes ?? 512; // reject tiny ad pixels
     this._maxAdRetries = opts.maxAdRetries ?? 3; // retries for ad-like responses
+    this._adRetryDelayMs = opts.adRetryDelayMs ?? 1000; // base delay for ad retries
+    this._isPirateCDN = opts.isPirateCDN ?? false; // pirate CDN mode: zero-delay ad retries
+
+    // Direct origin bypass: rewrite CDN URLs to origin server URLs to skip
+    // ad injection entirely.  The function receives a CDN URL and returns the
+    // direct origin URL, or null if rewriting is not possible.
+    this._originUrlRewriter = opts.originUrlRewriter ?? null;
+    // Track whether direct origin works so we don't keep retrying it after
+    // the first failure (e.g. origin blocks direct access).
+    this._directOriginFailed = false;
+    this._directOriginInFlight = false; // lock to prevent race condition on first attempt
+
+    // Host rotation: swap CDN origin mirrors on ad retries so each mirror
+    // gets fewer requests and stays below its individual ad threshold.
+    // hostRotator(url, excludeHost?) => rotated url
+    this._hostRotator = opts.hostRotator ?? null;
+    this._hostRotationInterval = Math.max(1, opts.hostRotationInterval ?? 5); // rotate every N ad retries
+
+    // Host pool reference for recording ad-rate stats per mirror.
+    // If provided, success/ad events are fed back so the rotator can make
+    // weighted decisions.  Also enables multi-host direct-origin probing.
+    this._hostPool = opts.hostPool ?? null;
+    // Track which direct-origin hosts have been tried and failed (per pool
+    // lifetime, not per segment) so we don't re-probe hosts we know block.
+    this._directOriginFailedHosts = new Set();
 
     // Known ad-server signatures in response headers
     this._adServerSignatures = [
@@ -106,10 +134,18 @@ class SegmentPool {
     this._404BurstThreshold = 5; // 5+ 404s in short window = video removed mid-download
     this._404BurstWindow = 5000; // 5 seconds
     this._segmentCount = 0; // track total segments to detect early vs late 404s
+
+    // Junk server detection: if multiple segments confirm the server is
+    // serving only non-media content, abort the entire pool immediately
+    // instead of wasting retries on every remaining segment.
+    this._junkServerFailures = 0;
+    this._junkServerThreshold = 3; // 3 segments confirming junk = abort pool
+    this._junkServerDetected = false;
   }
 
   // S40 fix: Monitor network changes using Network Information API
   _setupNetworkMonitoring() {
+    this._lastNetworkLogTime = 0;
     if (
       typeof navigator !== "undefined" &&
       navigator.connection &&
@@ -117,9 +153,15 @@ class SegmentPool {
     ) {
       navigator.connection.addEventListener("change", () => {
         const conn = navigator.connection;
-        console.warn(
-          `[SegmentPool] Network change detected: type=${conn.effectiveType}, downlink=${conn.downlink}Mbps`,
-        );
+        // Throttle logs: only log once every 10s to avoid spam from
+        // flapping effective-type estimates during heavy download activity
+        const now = Date.now();
+        if (now - this._lastNetworkLogTime > 10000) {
+          this._lastNetworkLogTime = now;
+          console.log(
+            `[SegmentPool] Network change detected: type=${conn.effectiveType}, downlink=${conn.downlink}Mbps`,
+          );
+        }
         if (this._onNetworkChange) {
           this._onNetworkChange({
             effectiveType: conn.effectiveType,
@@ -168,7 +210,7 @@ class SegmentPool {
     };
   }
 
-  // ───────────────── Queue management ─────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Queue management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _processQueue() {
     while (
@@ -197,9 +239,9 @@ class SegmentPool {
     this._processQueue();
   }
 
-  // ───────────────── Rate-limit management ─────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Rate-limit management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  /** Called on every successful fetch — gradually restore concurrency */
+  /** Called on every successful fetch â€” gradually restore concurrency */
   _onSuccess() {
     this._consecutive429 = 0;
     this._successesSinceThrottle++;
@@ -219,7 +261,7 @@ class SegmentPool {
       timeDrift > this._sleepDetectionThreshold &&
       this._lastSuccessTime > 0
     ) {
-      console.warn(
+      console.log(
         `[SegmentPool] Sleep/wake detected: ${Math.round(timeDrift / 1000)}s time gap`,
       );
       if (this._onSleepWakeDetected) {
@@ -237,20 +279,22 @@ class SegmentPool {
           this.concurrency + 1,
           this._originalConcurrency,
         );
-        console.log(`[SegmentPool] Restored concurrency → ${this.concurrency}`);
+        console.log(
+          `[SegmentPool] Restored concurrency â†’ ${this.concurrency}`,
+        );
       }
     } else if (this.concurrency < this._maxConcurrency) {
       // Auto-scale above initial: ramp up +1 every 15 consecutive successes
       if (this._successesSinceThrottle % 15 === 0) {
         this.concurrency = Math.min(this.concurrency + 1, this._maxConcurrency);
         console.log(
-          `[SegmentPool] Auto-scaled concurrency → ${this.concurrency} (max ${this._maxConcurrency})`,
+          `[SegmentPool] Auto-scaled concurrency â†’ ${this.concurrency} (max ${this._maxConcurrency})`,
         );
       }
     }
   }
 
-  /** Called on 429 — reduce concurrency and set global pause */
+  /** Called on 429 â€” reduce concurrency and set global pause */
   _throttleOnRateLimit(retryAfterMs) {
     this._consecutive429++;
     this._successesSinceThrottle = 0; // Reset restoration counter
@@ -259,8 +303,8 @@ class SegmentPool {
       const prev = this.concurrency;
       this.concurrency = Math.max(1, Math.floor(this.concurrency / 2));
       if (this.concurrency !== prev) {
-        console.warn(
-          `[SegmentPool] Rate limited — concurrency ${prev} → ${this.concurrency}`,
+        console.log(
+          `[SegmentPool] Rate limited â€” concurrency ${prev} â†’ ${this.concurrency}`,
         );
       }
     }
@@ -335,7 +379,7 @@ class SegmentPool {
     }
   }
 
-  // ───────────────── Content validation (anti-ad) ─────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Content validation (anti-ad) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   /**
    * Check if a response's headers indicate it's from an ad server.
@@ -377,6 +421,81 @@ class SegmentPool {
     return false;
   }
 
+  // trueparadise CDN URLs often embed a base64-encoded filename as the last
+  // path segment (e.g. /file2/.../<seg_b64>). When that decoded filename ends
+  // in obvious non-media extensions, the URL is junk/ad and will never be a
+  // valid segment regardless of retries.
+  _decodeTrueparadiseFilename(urlStr) {
+    try {
+      const u = new URL(urlStr);
+      if (!u.hostname || !u.hostname.includes("trueparadise.workers.dev")) {
+        return null;
+      }
+      if (!u.pathname || !u.pathname.includes("/file2/")) return null;
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (parts.length === 0) return null;
+      const token = parts[parts.length - 1];
+      if (!token || token.length < 8) return null;
+
+      // Support URL-safe base64 tokens and missing padding.
+      let b64 = token.replace(/-/g, "+").replace(/_/g, "/");
+      b64 += "=".repeat((4 - (b64.length % 4)) % 4);
+
+      const decoded = atob(b64);
+      if (!decoded || decoded.length > 200) return null;
+      // Keep only printable-ish filenames.
+      for (let i = 0; i < decoded.length; i++) {
+        const c = decoded.charCodeAt(i);
+        if (c < 9) return null;
+      }
+      return decoded;
+    } catch {
+      return null;
+    }
+  }
+
+  _isTrueparadiseJunkSegmentUrl(urlStr) {
+    const decoded = this._decodeTrueparadiseFilename(urlStr);
+    if (!decoded) return null;
+
+    const lower = decoded.toLowerCase().trim();
+    const m = lower.match(/(\.[a-z0-9]{1,5})$/);
+    const ext = m ? m[1] : null;
+    if (!ext) return null;
+
+    // If it looks like a normal media segment extension, allow it.
+    if (
+      ext === ".ts" ||
+      ext === ".m4s" ||
+      ext === ".mp4" ||
+      ext === ".m4a" ||
+      ext === ".aac" ||
+      ext === ".webm"
+    ) {
+      return null;
+    }
+
+    // Obvious junk/ad asset extensions.
+    const junk = new Set([
+      ".html",
+      ".htm",
+      ".js",
+      ".css",
+      ".json",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gif",
+      ".webp",
+      ".ico",
+      ".txt",
+    ]);
+    if (junk.has(ext)) {
+      return { decoded, ext };
+    }
+    return null;
+  }
+
   /**
    * Validate downloaded segment data using magic bytes.
    * MPEG-TS segments start with sync byte 0x47.
@@ -388,7 +507,7 @@ class SegmentPool {
       return { valid: true };
     }
 
-    // Too small — likely an ad tracker pixel or empty response
+    // Too small â€” likely an ad tracker pixel or empty response
     if (data.byteLength < this._minSegmentBytes) {
       return {
         valid: false,
@@ -500,19 +619,156 @@ class SegmentPool {
     return { valid: true, type: "unknown" };
   }
 
-  // ───────────────── Core fetch logic ─────────────────
+  // ————————————————— Direct origin bypass (pirate CDN) —————————————————
+
+  /**
+   * Try fetching a segment directly from the origin server, bypassing the
+   * CDN's ad-injection Worker.  Returns Uint8Array on success, null on any
+   * failure (caller falls through to normal CDN retry path).
+   */
+  async _tryDirectOrigin(task, headers) {
+    if (!this._originUrlRewriter) return null;
+    // If we've tried all known hosts and they all failed, stop probing
+    if (this._directOriginFailed && !this._hostPool) return null;
+    if (
+      this._hostPool &&
+      this._directOriginFailedHosts.size >= this._hostPool.size
+    )
+      return null;
+
+    // Prevent race: only ONE concurrent worker tries direct origin at a time.
+    if (this._directOriginInFlight) return null;
+    this._directOriginInFlight = true;
+
+    // If we have a host pool, try multiple hosts (each once) before giving up.
+    // This handles the case where some origins block direct access but others don't.
+    const hostsToTry = this._hostPool
+      ? this._hostPool.hosts.filter(
+          (h) => !this._directOriginFailedHosts.has(h),
+        )
+      : [null]; // null = use default rewriter (single-host mode)
+
+    for (const targetHost of hostsToTry) {
+      let originUrl;
+      if (targetHost) {
+        // Build a URL with this specific host, then rewrite to direct origin
+        try {
+          const url = new URL(task.url);
+          if (url.hostname.includes("trueparadise.workers.dev")) {
+            const parts = url.pathname.split("/").filter((p) => p);
+            if (parts.length >= 3) {
+              parts[0] = targetHost;
+              url.pathname = "/" + parts.join("/");
+              originUrl = this._originUrlRewriter(url.href);
+            }
+          }
+        } catch {
+          /* fall through */
+        }
+        if (!originUrl) continue;
+      } else {
+        originUrl = this._originUrlRewriter(task.url);
+        if (!originUrl) {
+          this._directOriginInFlight = false;
+          return null;
+        }
+      }
+
+      let controller, timer;
+      try {
+        controller = new AbortController();
+        this._inflightControllers.add(controller);
+        timer = setTimeout(() => controller.abort(), 8000);
+
+        const cbOriginUrl = new URL(originUrl);
+        cbOriginUrl.searchParams.set(
+          "_cb",
+          Math.random().toString(36).slice(2, 8),
+        );
+        const resp = await fetch(cbOriginUrl.href, {
+          headers,
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        clearTimeout(timer);
+        this._inflightControllers.delete(controller);
+
+        if (!resp.ok) {
+          console.log(
+            `[SegmentPool] Direct origin ${targetHost || "default"} returned HTTP ${resp.status}`,
+          );
+          if (targetHost) this._directOriginFailedHosts.add(targetHost);
+          continue; // try next host
+        }
+
+        if (
+          this._validateContent &&
+          !this._isPirateCDN &&
+          this._isInvalidContentType(resp)
+        ) {
+          if (targetHost) this._directOriginFailedHosts.add(targetHost);
+          continue;
+        }
+
+        const buffer = await resp.arrayBuffer();
+        const data = new Uint8Array(buffer);
+
+        if (this._validateContent) {
+          const validation = this._validateSegmentData(data);
+          if (!validation.valid) {
+            if (targetHost) this._directOriginFailedHosts.add(targetHost);
+            continue;
+          }
+        }
+
+        // Success!
+        this._directOriginInFlight = false;
+        if (task.index <= 1) {
+          console.log(
+            `[SegmentPool] Direct origin bypass working – downloading ads-free from ${targetHost || new URL(originUrl).hostname}`,
+          );
+        }
+        return data;
+      } catch (err) {
+        if (controller) this._inflightControllers.delete(controller);
+        if (timer) clearTimeout(timer);
+        console.log(
+          `[SegmentPool] Direct origin ${targetHost || "default"} failed: ${err.message}`,
+        );
+        if (targetHost) this._directOriginFailedHosts.add(targetHost);
+        // continue to next host
+      }
+    }
+
+    // All hosts tried and failed — set global flag if no host pool
+    if (!this._hostPool) this._directOriginFailed = true;
+    this._directOriginInFlight = false;
+    console.log(
+      `[SegmentPool] Direct origin bypass failed on all ${hostsToTry.length} host(s) – using CDN with ad retries`,
+    );
+    return null;
+  }
+
+  // ————————————————— Core fetch logic —————————————————
 
   async _fetchWithRetry(task) {
     const timeout = task.options.timeout || this._timeoutMs;
     const headers = { ...(task.options.headers || {}) };
     const maxRateRetries = this.maxRetries + this._rateRetryExtra;
     let adRetries = 0; // Track ad-response retries separately
+    const isPirate = this._isPirateCDN;
+
+    // ———— Direct origin bypass: try once before hitting the CDN ————
+    if (isPirate) {
+      const directData = await this._tryDirectOrigin(task, headers);
+      if (directData) return directData;
+    }
 
     // S41 fix: Track redirect chain to detect loops
     const redirectChain = [];
     const MAX_REDIRECTS = 10; // More conservative than browser's default 20
 
-    // ── EXT-X-BYTERANGE support (RFC 8216 §4.3.2.2) ──
+    // â”€â”€ EXT-X-BYTERANGE support (RFC 8216 Â§4.3.2.2) â”€â”€
     // When the HLS playlist uses byte-range addressing, add a Range header
     // so we fetch only the required slice instead of the entire resource.
     if (task.options.byteRange) {
@@ -538,72 +794,119 @@ class SegmentPool {
         // S35 fix: Use refreshed URL if available (YouTube URL expiry)
         let fetchUrl = this._urlMap.get(task.url) || task.url;
 
-        // S41 fix: Manual redirect handling to detect loops
+        // Host rotation for pirate CDNs: rotate the origin mirror every N ad
+        // retries so each mirror gets fewer requests.  This distributes load
+        // across the CDN's backend servers.
+        if (
+          isPirate &&
+          this._hostRotator &&
+          adRetries > 0 &&
+          adRetries % this._hostRotationInterval === 0
+        ) {
+          fetchUrl = this._hostRotator(fetchUrl);
+        }
+
+        // Extract current origin host for ad-rate tracking
+        let currentHost = null;
+        if (isPirate && this._hostPool) {
+          currentHost = this._hostPool.constructor.extractHost
+            ? this._hostPool.constructor.extractHost(fetchUrl)
+            : null;
+        }
+
+        // Advisory: trueparadise URLs whose base64-decoded filename ends in an
+        // obvious non-media extension. Some providers may obfuscate filenames,
+        // so we *don't* block purely on this heuristic; we use it to fail fast
+        // only when the response also fails content validation.
+        if (isPirate && this._validateContent) {
+          const junkInfo = this._isTrueparadiseJunkSegmentUrl(fetchUrl);
+          if (junkInfo) {
+            task._tpJunkHint = junkInfo;
+          }
+        }
+
         let resp;
-        let redirectCount = 0;
 
-        while (redirectCount <= MAX_REDIRECTS) {
-          try {
-            resp = await fetch(fetchUrl, {
-              headers,
-              signal: controller.signal,
-              cache: "no-cache",
-              redirect: "manual", // S41: Handle redirects manually
-            });
-          } finally {
-            // Cleanup handled below
+        // Pirate CDN fast path: skip manual redirect handling, use no-store
+        // to prevent caching of ad responses, and let browser follow redirects
+        // natively (no redirect loop risk from simple Workers).
+        if (isPirate) {
+          // Cache-bust: append a random query param on each attempt so the
+          // CDN Worker makes a fresh routing decision instead of replaying
+          // the same ad-injection choice for the same URL.
+          const cbUrl = new URL(fetchUrl);
+          cbUrl.searchParams.set("_cb", Math.random().toString(36).slice(2, 8));
+          resp = await fetch(cbUrl.href, {
+            headers,
+            signal: controller.signal,
+            cache: "no-store",
+            redirect: "follow",
+          });
+        } else {
+          // S41 fix: Manual redirect handling to detect loops
+          let redirectCount = 0;
+
+          while (redirectCount <= MAX_REDIRECTS) {
+            try {
+              resp = await fetch(fetchUrl, {
+                headers,
+                signal: controller.signal,
+                cache: "no-cache",
+                redirect: "manual",
+              });
+            } finally {
+              // Cleanup handled below
+            }
+
+            // S41: Check for redirect responses (3xx status codes)
+            if (resp.status >= 300 && resp.status < 400) {
+              const location = resp.headers.get("Location");
+              if (!location) {
+                throw new Error(
+                  `Segment ${task.index}: HTTP ${resp.status} redirect with no Location header`,
+                );
+              }
+
+              const redirectUrl = new URL(location, fetchUrl).toString();
+
+              if (redirectChain.includes(redirectUrl)) {
+                const loopStart = redirectChain.indexOf(redirectUrl);
+                const loop = redirectChain.slice(loopStart).concat(redirectUrl);
+                console.log(
+                  `[SegmentPool] Redirect loop detected for segment ${task.index}: ${loop.join(" -> ")}`,
+                );
+                throw new Error(
+                  `Segment ${task.index}: Redirect loop detected (${redirectChain.length} redirects). CDN configuration error.`,
+                );
+              }
+
+              redirectChain.push(fetchUrl);
+              redirectCount++;
+
+              if (redirectCount > MAX_REDIRECTS) {
+                throw new Error(
+                  `Segment ${task.index}: Too many redirects (${redirectCount}). Chain: ${redirectChain.slice(0, 3).join(" -> ")} ...`,
+                );
+              }
+
+              console.log(
+                `[SegmentPool] Seg ${task.index}: Redirect ${redirectCount}/${MAX_REDIRECTS} to ${redirectUrl}`,
+              );
+
+              fetchUrl = redirectUrl;
+              continue;
+            }
+
+            // Not a redirect
+            break;
           }
-
-          // S41: Check for redirect responses (3xx status codes)
-          if (resp.status >= 300 && resp.status < 400) {
-            const location = resp.headers.get("Location");
-            if (!location) {
-              throw new Error(
-                `Segment ${task.index}: HTTP ${resp.status} redirect with no Location header`,
-              );
-            }
-
-            // Resolve relative URLs
-            const redirectUrl = new URL(location, fetchUrl).toString();
-
-            // S41: Detect redirect loops by checking if we've seen this URL before
-            if (redirectChain.includes(redirectUrl)) {
-              const loopStart = redirectChain.indexOf(redirectUrl);
-              const loop = redirectChain.slice(loopStart).concat(redirectUrl);
-              console.error(
-                `[SegmentPool] Redirect loop detected for segment ${task.index}: ${loop.join(" → ")}`,
-              );
-              throw new Error(
-                `Segment ${task.index}: Redirect loop detected (${redirectChain.length} redirects). CDN configuration error.`,
-              );
-            }
-
-            redirectChain.push(fetchUrl);
-            redirectCount++;
-
-            if (redirectCount > MAX_REDIRECTS) {
-              throw new Error(
-                `Segment ${task.index}: Too many redirects (${redirectCount}). Chain: ${redirectChain.slice(0, 3).join(" → ")} ...`,
-              );
-            }
-
-            console.log(
-              `[SegmentPool] Seg ${task.index}: Redirect ${redirectCount}/${MAX_REDIRECTS} to ${redirectUrl}`,
-            );
-
-            fetchUrl = redirectUrl;
-            continue; // Follow the redirect
-          }
-
-          // Not a redirect — break out of redirect loop
-          break;
         }
 
         this._inflightControllers.delete(controller);
         clearTimeout(timer);
 
         if (!resp.ok) {
-          // ──── HTTP 429 Too Many Requests ────
+          // â”€â”€â”€â”€ HTTP 429 Too Many Requests â”€â”€â”€â”€
           if (resp.status === 429) {
             task.rateRetries++;
             if (task.rateRetries > maxRateRetries) {
@@ -625,15 +928,11 @@ class SegmentPool {
                     this._rateBackoffCapMs,
                   );
 
-            console.warn(
-              `[SegmentPool] Seg ${task.index}: 429, retry ${task.rateRetries}/${maxRateRetries}, wait ${delay}ms` +
-                (retryAfterMs > 0 ? ` (Retry-After: ${retryAfterMs}ms)` : ""),
-            );
             await new Promise((r) => setTimeout(r, delay));
             continue;
           }
 
-          // ──── 5xx Server Errors ────
+          // â”€â”€â”€â”€ 5xx Server Errors â”€â”€â”€â”€
           if (resp.status >= 500) {
             task.retries++;
             if (task.retries > this.maxRetries) {
@@ -646,14 +945,14 @@ class SegmentPool {
               this._errorBackoffBaseMs,
               this._errorBackoffCapMs,
             );
-            console.warn(
+            console.log(
               `[SegmentPool] Seg ${task.index}: ${resp.status}, retry ${task.retries}/${this.maxRetries}, wait ${delay}ms`,
             );
             await new Promise((r) => setTimeout(r, delay));
             continue;
           }
 
-          // ──── 403 Forbidden — retry once (may be expired token) ────
+          // â”€â”€â”€â”€ 403 Forbidden â€” retry once (may be expired token) â”€â”€â”€â”€
           if (resp.status === 403 && task.retries < 1) {
             task.retries++;
 
@@ -669,8 +968,8 @@ class SegmentPool {
             if (
               this._recent403Timestamps.length >= this._vpnDisconnectThreshold
             ) {
-              console.error(
-                `[SegmentPool] Detected ${this._recent403Timestamps.length} 403s in ${this._vpnDisconnectWindow / 1000}s — possible VPN disconnect or IP change`,
+              console.log(
+                `[SegmentPool] Detected ${this._recent403Timestamps.length} 403s in ${this._vpnDisconnectWindow / 1000}s â€” possible VPN disconnect or IP change`,
               );
               throw new Error(
                 `Multiple 403 Forbidden errors detected. This usually means your IP address changed (VPN disconnect or network switch). Please reconnect your VPN and restart the download.`,
@@ -678,7 +977,7 @@ class SegmentPool {
             }
 
             const delay = 1000 + Math.floor(Math.random() * 1000);
-            console.warn(
+            console.log(
               `[SegmentPool] Seg ${task.index}: 403, retry once after ${delay}ms`,
             );
             await new Promise((r) => setTimeout(r, delay));
@@ -693,8 +992,8 @@ class SegmentPool {
               this._onUrlRefreshNeeded &&
               !this._urlRefreshInProgress
             ) {
-              console.warn(
-                `[SegmentPool] Multiple 403s on YouTube URLs — requesting URL refresh`,
+              console.log(
+                `[SegmentPool] Multiple 403s on YouTube URLs â€” requesting URL refresh`,
               );
               this._urlRefreshInProgress = true;
               try {
@@ -709,14 +1008,14 @@ class SegmentPool {
                   continue;
                 }
               } catch (e) {
-                console.error(`[SegmentPool] URL refresh failed: ${e.message}`);
+                console.log(`[SegmentPool] URL refresh failed: ${e.message}`);
               } finally {
                 this._urlRefreshInProgress = false;
               }
             }
           }
 
-          // S40 fix: Handle 451 (Unavailable For Legal Reasons) — no retries
+          // S40 fix: Handle 451 (Unavailable For Legal Reasons) â€” no retries
           // This typically means geo-blocking or region change (WiFi/VPN switch)
           if (resp.status === 451) {
             throw new Error(
@@ -724,7 +1023,7 @@ class SegmentPool {
             );
           }
 
-          // S52 fix: Handle 404 (Not Found) — Content removal detection
+          // S52 fix: Handle 404 (Not Found) â€” Content removal detection
           if (resp.status === 404) {
             const now = Date.now();
             this._recent404Timestamps.push(now);
@@ -738,8 +1037,8 @@ class SegmentPool {
 
             // Early 404s (first 3 segments) = video was removed/never existed
             if (completed < 3) {
-              console.error(
-                `[SegmentPool] HTTP 404 on segment ${task.index} (early download) — video likely removed or unavailable`,
+              console.log(
+                `[SegmentPool] HTTP 404 on segment ${task.index} (early download) â€” video likely removed or unavailable`,
               );
               throw new Error(
                 `Video not found (HTTP 404). The video may have been removed due to copyright claim, privacy settings, or account deletion. Segment ${task.index} returned 404 Not Found.`,
@@ -751,20 +1050,20 @@ class SegmentPool {
               this._recent404Timestamps.length >= this._404BurstThreshold &&
               completed >= 3
             ) {
-              console.error(
-                `[SegmentPool] Detected ${this._recent404Timestamps.length} 404s in ${this._404BurstWindow / 1000}s after downloading ${completed} segments — video likely removed mid-download`,
+              console.log(
+                `[SegmentPool] Detected ${this._recent404Timestamps.length} 404s in ${this._404BurstWindow / 1000}s after downloading ${completed} segments â€” video likely removed mid-download`,
               );
               throw new Error(
                 `Video removed during download (DMCA/copyright claim). Successfully downloaded ${completed}/${total} segments before removal. The video was taken down by the content owner or platform.`,
               );
             }
 
-            // Late-download occasional 404 on a single segment — may be CDN cache miss
+            // Late-download occasional 404 on a single segment â€” may be CDN cache miss
             // Retry once with exponential backoff (some CDNs return 404 for segments still encoding)
             if (task.retries < 1) {
               task.retries++;
               const delay = 2000 + Math.floor(Math.random() * 1000);
-              console.warn(
+              console.log(
                 `[SegmentPool] Seg ${task.index}: 404 (${completed}/${total} completed), retry once after ${delay}ms (CDN cache miss?)`,
               );
               await new Promise((r) => setTimeout(r, delay));
@@ -772,7 +1071,7 @@ class SegmentPool {
             }
 
             // Multiple retries on same 404 = permanent failure
-            console.error(
+            console.log(
               `[SegmentPool] Seg ${task.index}: Permanent 404 after retry`,
             );
             throw new Error(
@@ -783,68 +1082,122 @@ class SegmentPool {
           throw new Error(`Segment ${task.index}: HTTP ${resp.status}`);
         }
 
-        // ──── Ad-server header detection (IDM technique) ────
+        // â”€â”€â”€â”€ Ad-server header detection (IDM technique) â”€â”€â”€â”€
         if (this._validateContent) {
           const adSig = this._isAdServerResponse(resp);
           if (adSig) {
             this._adBlockedCount++;
             adRetries++;
+            if (currentHost && this._hostPool)
+              this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
               throw new Error(
                 `Segment ${task.index}: Ad server detected (${adSig}) after ${adRetries} retries`,
               );
             }
-            console.warn(
-              `[SegmentPool] Seg ${task.index}: Ad server "${adSig}" detected, retry ${adRetries}/${this._maxAdRetries}`,
-            );
-            const delay = 1500 + Math.floor(Math.random() * 1500);
-            await new Promise((r) => setTimeout(r, delay));
+            if (adRetries <= 2 || adRetries % 10 === 0) {
+              console.log(
+                `[SegmentPool] Seg ${task.index}: Ad server "${adSig}" detected, retry ${adRetries}/${this._maxAdRetries}`,
+              );
+            }
+            if (isPirate) {
+              await new Promise((r) =>
+                setTimeout(r, 200 + Math.floor(Math.random() * 400)),
+              );
+            } else {
+              const delay =
+                this._adRetryDelayMs +
+                Math.floor(Math.random() * this._adRetryDelayMs);
+              await new Promise((r) => setTimeout(r, delay));
+            }
             continue;
           }
 
           // ──── Content-Type validation ────
-          const badCT = this._isInvalidContentType(resp);
-          if (badCT) {
-            this._adBlockedCount++;
-            adRetries++;
-            if (adRetries > this._maxAdRetries) {
-              throw new Error(
-                `Segment ${task.index}: Invalid content-type "${badCT}" after ${adRetries} retries`,
-              );
+          // CRITICAL: Pirate CDNs (trueparadise) deliberately use FAKE
+          // content-type headers (image/jpg, text/html, text/css, etc.)
+          // as anti-scraping. The actual response body contains real video.
+          // The browser's hls.js ignores content-type and reads raw bytes.
+          // For pirate CDNs: SKIP content-type check entirely — download
+          // the body and validate with magic bytes instead.
+          if (!isPirate) {
+            const badCT = this._isInvalidContentType(resp);
+            if (badCT) {
+              this._adBlockedCount++;
+              adRetries++;
+              if (currentHost && this._hostPool)
+                this._hostPool.recordAd(currentHost);
+              if (adRetries > this._maxAdRetries) {
+                throw new Error(
+                  `Segment ${task.index}: Invalid content-type "${badCT}" after ${adRetries} retries`,
+                );
+              }
+              if (adRetries <= 2 || adRetries % 10 === 0) {
+                console.log(
+                  `[SegmentPool] Seg ${task.index}: Invalid content-type "${badCT}", retry ${adRetries}/${this._maxAdRetries}`,
+                );
+              }
+              const delay =
+                this._adRetryDelayMs +
+                Math.floor(Math.random() * this._adRetryDelayMs);
+              await new Promise((r) => setTimeout(r, delay));
+              continue;
             }
-            console.warn(
-              `[SegmentPool] Seg ${task.index}: Invalid content-type "${badCT}", retry ${adRetries}/${this._maxAdRetries}`,
-            );
-            const delay = 1000 + Math.floor(Math.random() * 1000);
-            await new Promise((r) => setTimeout(r, delay));
-            continue;
           }
         }
 
-        // ──── Success — download body ────
+        // ──── Download body ────
         const buffer = await resp.arrayBuffer();
         const data = new Uint8Array(buffer);
 
-        // ──── Segment data validation (magic bytes) ────
+        // Diagnostic: log first few segments' magic bytes for pirate CDN
+        // so we can confirm whether fake content-type hides real video.
+        if (isPirate && task.index <= 2) {
+          const ct = (resp.headers.get("Content-Type") || "unknown").trim();
+          const hex = Array.from(data.slice(0, 16))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(" ");
+          console.log(
+            `[SegmentPool] Seg ${task.index}: CT="${ct}", size=${data.byteLength}, magic=[${hex}]`,
+          );
+        }
+
+        // â”€â”€â”€â”€ Segment data validation (magic bytes) â”€â”€â”€â”€
         if (this._validateContent) {
           const validation = this._validateSegmentData(data);
           if (!validation.valid) {
+            // Note: _tpJunkHint is advisory only (CDN uses fake extensions).
+            // We rely solely on magic byte validation for pirate CDNs.
             this._adBlockedCount++;
             adRetries++;
+            if (currentHost && this._hostPool)
+              this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
               throw new Error(
                 `Segment ${task.index}: ${validation.detail} after ${adRetries} retries`,
               );
             }
-            console.warn(
-              `[SegmentPool] Seg ${task.index}: ${validation.reason} — ${validation.detail}, retry ${adRetries}/${this._maxAdRetries}`,
-            );
-            const delay = 1500 + Math.floor(Math.random() * 1500);
-            await new Promise((r) => setTimeout(r, delay));
+            if (adRetries <= 2 || adRetries % 10 === 0) {
+              console.log(
+                `[SegmentPool] Seg ${task.index}: ${validation.reason} \u2014 ${validation.detail}, retry ${adRetries}/${this._maxAdRetries}`,
+              );
+            }
+            if (isPirate) {
+              await new Promise((r) =>
+                setTimeout(r, 200 + Math.floor(Math.random() * 400)),
+              );
+            } else {
+              const delay =
+                this._adRetryDelayMs +
+                Math.floor(Math.random() * this._adRetryDelayMs);
+              await new Promise((r) => setTimeout(r, delay));
+            }
             continue;
           }
         }
 
+        if (currentHost && this._hostPool)
+          this._hostPool.recordSuccess(currentHost);
         return data;
       } catch (err) {
         // Always clean up controller and timer on error before retry
@@ -852,6 +1205,30 @@ class SegmentPool {
         if (timer) clearTimeout(timer);
 
         if (this._aborted) throw new Error("Pool aborted");
+
+        // ── Junk server: non-retryable ──
+        // When we've confirmed the URL decodes to non-media AND the
+        // response content-type/magic-bytes validated as non-media, this
+        // is a permanent server problem, not a transient glitch.
+        // Re-throw immediately — do NOT burn through 15 general retries.
+        if (err.message && err.message.includes("serving ads/junk")) {
+          this._junkServerFailures++;
+          if (
+            this._junkServerFailures >= this._junkServerThreshold &&
+            !this._junkServerDetected
+          ) {
+            this._junkServerDetected = true;
+            console.log(
+              `[SegmentPool] JUNK SERVER DETECTED: ${this._junkServerFailures} segments confirmed non-media. Aborting pool.`,
+            );
+            this.cancel();
+          }
+          throw err; // permanent — no retry
+        }
+
+        // For pirate CDNs, reset ad retry budget on general retry so each
+        // general attempt gets a full set of fast ad retries
+        if (isPirate) adRetries = 0;
 
         // Timeout (AbortError)
         if (err.name === "AbortError" || err.message.includes("aborted")) {
@@ -861,12 +1238,16 @@ class SegmentPool {
               `Segment ${task.index}: Timeout after ${task.retries} retries`,
             );
           }
-          const delay = this._backoff(
-            task.retries - 1,
-            this._errorBackoffBaseMs,
-            this._errorBackoffCapMs,
-          );
-          console.warn(
+          // Pirate CDNs: flat short delay (CDN is rate-limiting, exponential
+          // backoff just wastes time).  Normal CDNs: exponential backoff.
+          const delay = isPirate
+            ? 500 + Math.floor(Math.random() * 1000)
+            : this._backoff(
+                task.retries - 1,
+                this._errorBackoffBaseMs,
+                this._errorBackoffCapMs,
+              );
+          console.log(
             `[SegmentPool] Seg ${task.index}: Timeout, retry ${task.retries}/${this.maxRetries}, wait ${delay}ms`,
           );
           await new Promise((r) => setTimeout(r, delay));
@@ -878,12 +1259,17 @@ class SegmentPool {
         if (task.retries > this.maxRetries) {
           throw err;
         }
-        const delay = this._backoff(
-          task.retries - 1,
-          this._errorBackoffBaseMs,
-          this._errorBackoffCapMs,
-        );
-        console.warn(
+        // Pirate CDNs: flat short delay ("Failed to fetch" is usually CDN
+        // throttling, not a real network outage — exponential backoff makes
+        // each segment take minutes).  Normal CDNs: exponential backoff.
+        const delay = isPirate
+          ? 500 + Math.floor(Math.random() * 1000)
+          : this._backoff(
+              task.retries - 1,
+              this._errorBackoffBaseMs,
+              this._errorBackoffCapMs,
+            );
+        console.log(
           `[SegmentPool] Seg ${task.index}: ${err.message}, retry ${task.retries}/${this.maxRetries}, wait ${delay}ms`,
         );
         await new Promise((r) => setTimeout(r, delay));
@@ -891,7 +1277,7 @@ class SegmentPool {
     }
   }
 
-  // ───────────────── Lifecycle ─────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   /**
    * S35 fix: Update URLs after refresh (e.g., YouTube format URL expiry).
@@ -950,6 +1336,9 @@ class SegmentPool {
     this._inflightControllers.clear();
     this._recent403Timestamps = [];
     this._recent404Timestamps = [];
+    this._directOriginFailed = false;
+    this._directOriginInFlight = false;
+    if (this._directOriginFailedHosts) this._directOriginFailedHosts.clear();
     this.concurrency = this._originalConcurrency;
   }
 }

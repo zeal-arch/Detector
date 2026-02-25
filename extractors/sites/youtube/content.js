@@ -196,6 +196,9 @@
       directCipher: payload.directCipher || false,
       directNSig: payload.directNSig || false,
       extractionErrors: payload.extractionErrors || null,
+      // IIFE-local deps flag — tells background.js to skip regex-based
+      // cipher/N-sig eval and use full player.js AST solver instead
+      depsAreIIFELocal: payload.depsAreIIFELocal || false,
     };
 
     console.log("[YT-DL] Sending VIDEO_DETECTED:", videoId, {
@@ -209,14 +212,21 @@
     });
 
     try {
-      chrome.runtime.sendMessage({
-        action: "VIDEO_DETECTED",
-        videoId: videoId,
-        url: window.location.href,
-        pageData: merged,
-      });
-    } catch {
-      // Extension context invalidated (reload/update) — silently ignore
+      chrome.runtime
+        .sendMessage({
+          action: "VIDEO_DETECTED",
+          videoId: videoId,
+          url: window.location.href,
+          pageData: merged,
+        })
+        .catch((err) => {
+          console.warn(
+            "[YT-DL] sendMessage VIDEO_DETECTED failed:",
+            err.message,
+          );
+        });
+    } catch (e) {
+      console.warn("[YT-DL] sendMessage sync error:", e.message);
     }
   });
 
@@ -236,14 +246,24 @@
         const scriptData = scanScriptTags();
         if (scriptData.playerResponse || scriptData.playerUrl) {
           try {
-            chrome.runtime.sendMessage({
-              action: "VIDEO_DETECTED",
-              videoId: videoId,
-              url: window.location.href,
-              pageData: scriptData,
-            });
-          } catch {
-            // Extension context invalidated (reload/update) — silently ignore
+            chrome.runtime
+              .sendMessage({
+                action: "VIDEO_DETECTED",
+                videoId: videoId,
+                url: window.location.href,
+                pageData: scriptData,
+              })
+              .catch((err) => {
+                console.warn(
+                  "[YT-DL] sendMessage (navigate) failed:",
+                  err.message,
+                );
+              });
+          } catch (e) {
+            console.warn(
+              "[YT-DL] sendMessage (navigate) sync error:",
+              e.message,
+            );
           }
         }
       }, 2500);
