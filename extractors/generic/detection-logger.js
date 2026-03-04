@@ -160,8 +160,9 @@
     const dupLabel = isDuplicate ? " [DUP]" : "";
 
     console.log(
-      `%c[Detection] ${priority} ${source}%c [${confBar} ${(confidence * 100).toFixed(0)}%%]${dupLabel}%c on %c${entry.hostname}`,
+      `%c[Detection] ${priority} %s%c [${confBar} ${(confidence * 100).toFixed(0)}%%]${dupLabel}%c on %c${entry.hostname}`,
       `color: ${color}; font-weight: bold`,
+      source,
       `color: ${confidence >= 0.7 ? "#4CAF50" : confidence >= 0.4 ? "#FF9800" : "#F44336"}`,
       "color: inherit",
       "color: #2196F3; font-weight: bold",
