@@ -1,4 +1,4 @@
-class YouTubeExtractor extends BaseExtractor {
+﻿class YouTubeExtractor extends BaseExtractor {
   constructor() {
     super("YouTube");
     this._injected = false;
@@ -28,9 +28,11 @@ class YouTubeExtractor extends BaseExtractor {
 
     this._injectMainWorldScript();
 
-    this._messageHandler = (e) => this._onInjectMessage(e);
+    // Handle messages from inject.js (MAIN world -> ISOLATED world)
+    this._messageHandler = (e) => this._onMessage(e);
     this.listen(window, "message", this._messageHandler);
 
+    // SPA navigation listeners
     this.listen(window, "yt-navigate-finish", () =>
       this.timer(() => this._onNavigate(), 100),
     );
@@ -71,6 +73,8 @@ class YouTubeExtractor extends BaseExtractor {
     return null;
   }
 
+  // ========== Main world injection ==========
+
   _injectMainWorldScript() {
     if (this._injected) return;
     this._injected = true;
@@ -79,16 +83,13 @@ class YouTubeExtractor extends BaseExtractor {
       const s = document.createElement("script");
       s.src = chrome.runtime.getURL("extractors/sites/youtube/inject.js");
       s.onload = () => s.remove();
-
-      // S49 fix: Detect CSP violations when injecting into sandboxed iframes
       s.onerror = () => {
         console.error(
           this.TAG,
-          "[S49] inject.js injection failed — likely CSP violation in sandboxed iframe. " +
-            "Extension will fall back to Tier 2 (InnerTube API), but premium formats may be unavailable.",
+          "[S49] inject.js injection failed - likely CSP violation in sandboxed iframe. " +
+            "Extension will fall back to Tier 2 (InnerTube API).",
         );
       };
-
       (document.head || document.documentElement).appendChild(s);
       console.log(this.TAG, "inject.js injected into MAIN world");
     } catch (error) {
@@ -96,15 +97,56 @@ class YouTubeExtractor extends BaseExtractor {
         this.TAG,
         "[S49] Script injection blocked:",
         error.message,
-        "- iframe CSP or sandbox attribute prevents injection",
       );
     }
   }
 
-  _onInjectMessage(e) {
-    const MAGIC = "__ytdl_ext__";
-    if (!e.data || e.data.type !== MAGIC) return;
+  // ========== Message handling ==========
 
+  _onMessage(e) {
+    if (!e.data) return;
+    const MAGIC = "__ytdl_ext__";
+
+    // Handle player.js fetch relay request from inject.js (MAIN world).
+    // inject.js cannot fetch player.js due to YouTube's Service Worker
+    // intercepting requests. Relay: inject.js -> content script -> background.js -> content script -> inject.js
+    if (e.data.type === MAGIC + "_fetch_request" && e.data.url) {
+      chrome.runtime
+        .sendMessage({
+          action: "FETCH_PLAYER_JS",
+          url: e.data.url,
+          requestId: e.data.requestId,
+        })
+        .then((resp) => {
+          window.postMessage(
+            {
+              type: MAGIC + "_fetch_response",
+              requestId: e.data.requestId,
+              text: resp && resp.text ? resp.text : null,
+              error: resp && resp.error ? resp.error : null,
+            },
+            "*",
+          );
+        })
+        .catch((err) => {
+          window.postMessage(
+            {
+              type: MAGIC + "_fetch_response",
+              requestId: e.data.requestId,
+              error: err.message || "relay failed",
+            },
+            "*",
+          );
+        });
+      return;
+    }
+
+    // Handle resolved format data from inject.js
+    if (e.data.type !== MAGIC) return;
+    this._onInjectMessage(e);
+  }
+
+  _onInjectMessage(e) {
     const videoId = this._getVideoId();
     if (!videoId) return;
 
@@ -132,24 +174,40 @@ class YouTubeExtractor extends BaseExtractor {
       directCipher: payload.directCipher || false,
       directNSig: payload.directNSig || false,
       extractionErrors: payload.extractionErrors || null,
+      // IIFE-local deps flag - tells background.js to skip regex-based
+      // cipher/N-sig eval and use full player.js AST solver instead
+      depsAreIIFELocal: payload.depsAreIIFELocal || false,
     };
 
-    console.log(this.TAG, "Received from inject.js:", {
-      videoId: merged.videoId,
+    console.log(this.TAG, "Sending VIDEO_DETECTED:", videoId, {
+      hasPlayerResponse: !!merged.playerResponse,
       resolvedFormats: merged.resolvedFormats
         ? merged.resolvedFormats.length
         : 0,
       formatSource: merged.formatSource,
-      hasPlayerResponse: !!merged.playerResponse,
+      playerUrl: merged.playerUrl ? "yes" : "no",
+      visitorData: merged.visitorData ? "yes" : "no",
     });
 
-    chrome.runtime.sendMessage({
-      action: "VIDEO_DETECTED",
-      videoId: merged.videoId,
-      url: window.location.href,
-      pageData: merged,
-    });
+    try {
+      chrome.runtime
+        .sendMessage({
+          action: "VIDEO_DETECTED",
+          videoId: merged.videoId,
+          url: window.location.href,
+          pageData: merged,
+        })
+        .catch((err) => {
+          if (!err.message?.includes("Extension context invalidated"))
+            console.warn(this.TAG, "sendMessage failed:", err.message);
+        });
+    } catch (ex) {
+      if (!ex.message?.includes("Extension context invalidated"))
+        console.warn(this.TAG, "sendMessage sync error:", ex.message);
+    }
   }
+
+  // ========== Navigation ==========
 
   _onNavigate() {
     const videoId = this._getVideoId();
@@ -159,17 +217,38 @@ class YouTubeExtractor extends BaseExtractor {
 
     clearTimeout(this._debounceTimer);
     this._debounceTimer = setTimeout(() => {
-      window.postMessage({ type: "__ytdl_ext__" + "_request" }, "*");
+      // Ask inject.js (MAIN world) to re-resolve formats
+      window.postMessage({ type: "__ytdl_ext___request" }, "*");
 
+      // Fallback: if inject.js doesn't respond within 2.5s, send
+      // whatever we can scrape from <script> tags directly
       this.timer(() => {
         const scriptData = this._scanScriptTags();
         if (scriptData.playerResponse || scriptData.playerUrl) {
-          chrome.runtime.sendMessage({
-            action: "VIDEO_DETECTED",
-            videoId: videoId,
-            url: window.location.href,
-            pageData: scriptData,
-          });
+          try {
+            chrome.runtime
+              .sendMessage({
+                action: "VIDEO_DETECTED",
+                videoId: videoId,
+                url: window.location.href,
+                pageData: scriptData,
+              })
+              .catch((err) => {
+                if (!err.message?.includes("Extension context invalidated"))
+                  console.warn(
+                    this.TAG,
+                    "sendMessage (navigate) failed:",
+                    err.message,
+                  );
+              });
+          } catch (ex) {
+            if (!ex.message?.includes("Extension context invalidated"))
+              console.warn(
+                this.TAG,
+                "sendMessage (navigate) sync error:",
+                ex.message,
+              );
+          }
         }
       }, 2500);
     }, 500);
@@ -188,6 +267,8 @@ class YouTubeExtractor extends BaseExtractor {
       setTimeout(() => self._onNavigate(), 200);
     };
   }
+
+  // ========== Utilities ==========
 
   _getVideoId() {
     const url = window.location.href;
