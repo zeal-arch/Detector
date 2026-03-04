@@ -34,31 +34,40 @@
   var reported = new Set();
   var hookActive = false;
 
-  // Allowlist of trusted origins that are permitted to embed this player
-  // and receive decrypted source data via postMessage.
-  var TRUSTED_ORIGINS = new Set([
-    "https://tmovie.tv",
-    "https://www.tmovie.tv",
-    "https://vidsrc.to",
-    "https://vidsrc.me",
-    "https://vidsrc.cc",
-    "https://vidsrc.in",
-    "https://vidsrc.net",
-    "https://vidsrc.xyz",
-  ]);
+  // Allowlist of trusted parent origins that may embed the player
+  var ALLOWED_PARENT_ORIGINS = [
+    "tmovie.tv",
+    "www.tmovie.tv",
+    "vidsrc.to",
+    "vidsrc.me",
+    "vidsrc.cc",
+    "vidsrc.in",
+    "vidsrc.net",
+    "vidsrc.xyz",
+  ];
 
   /**
-   * Derive the trusted parent origin from document.referrer.
-   * Returns the referrer origin string if it is in the allowlist,
-   * or null if the referrer is absent, malformed, or untrusted.
+   * Derive a safe postMessage targetOrigin from document.referrer.
+   * Returns the referrer origin string if it is in the allowlist (exact
+   * hostname match, HTTPS only), or null if the referrer is absent,
+   * malformed, not HTTPS, or untrusted.
    */
   function getTrustedParentOrigin() {
     try {
       var referrer = document.referrer;
-      if (!referrer) return null;
-      var origin = new URL(referrer).origin;
-      if (TRUSTED_ORIGINS.has(origin)) return origin;
-      return null;
+      if (!referrer) {
+        return null;
+      }
+      var parsed = new URL(referrer);
+      // Only trust HTTPS origins to prevent MITM via plain HTTP
+      if (parsed.protocol !== "https:") {
+        return null;
+      }
+      var referrerHost = parsed.hostname;
+      var trusted = ALLOWED_PARENT_ORIGINS.some(function (allowed) {
+        return referrerHost === allowed;
+      });
+      return trusted ? parsed.origin : null;
     } catch (_) {
       return null;
     }
@@ -240,18 +249,19 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame only when the embedding origin is trusted.
-    // Using a specific targetOrigin prevents data leakage to malicious
-    // sites that might embed this player in their own pages.
-    var parentOrigin = getTrustedParentOrigin();
-    if (parentOrigin) {
+    // Send to parent frame — only when the referrer is a trusted origin
+    var trustedOrigin = getTrustedParentOrigin();
+    if (trustedOrigin) {
       try {
         window.parent.postMessage(payload, trustedOrigin);
       } catch (e) {
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
     } else {
-      // No trusted referrer — skip to avoid leaking data to unknown origins.
+      console.log(
+        TAG,
+        "Skipping postMessage to parent: referrer absent or untrusted",
+      );
     }
 
     // Also dispatch on current window for any local listeners (same-origin, safe).
