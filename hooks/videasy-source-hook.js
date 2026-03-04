@@ -34,45 +34,6 @@
   var reported = new Set();
   var hookActive = false;
 
-  // Allowlist of trusted parent origins that may embed the player
-  var ALLOWED_PARENT_ORIGINS = [
-    "tmovie.tv",
-    "www.tmovie.tv",
-    "vidsrc.to",
-    "vidsrc.me",
-    "vidsrc.cc",
-    "vidsrc.in",
-    "vidsrc.net",
-    "vidsrc.xyz",
-  ];
-
-  /**
-   * Derive a safe postMessage targetOrigin from document.referrer.
-   * Returns the referrer origin string if it is in the allowlist (exact
-   * hostname match, HTTPS only), or null if the referrer is absent,
-   * malformed, not HTTPS, or untrusted.
-   */
-  function getTrustedParentOrigin() {
-    try {
-      var referrer = document.referrer;
-      if (!referrer) {
-        return null;
-      }
-      var parsed = new URL(referrer);
-      // Only trust HTTPS origins to prevent MITM via plain HTTP
-      if (parsed.protocol !== "https:") {
-        return null;
-      }
-      var referrerHost = parsed.hostname;
-      var trusted = ALLOWED_PARENT_ORIGINS.some(function (allowed) {
-        return referrerHost === allowed;
-      });
-      return trusted ? parsed.origin : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
