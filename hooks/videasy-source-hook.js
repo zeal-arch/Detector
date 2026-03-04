@@ -37,6 +37,21 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
+  // ── Trusted parent origin ─────────────────────────────────────────
+  // Derive a safe targetOrigin for window.parent.postMessage from the
+  // page referrer so messages are only delivered to the embedding origin
+  // (e.g. tmovie.tv) and not to arbitrary third-party frames.
+  // Returns null when the referrer is unavailable; callers must skip
+  // the postMessage in that case to avoid broadcasting to "*".
+  function getSafeParentOrigin() {
+    try {
+      if (document.referrer) {
+        return new URL(document.referrer).origin;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ── Extract media info from the URL path ─────────────────────────
   // URL pattern: /tv/{tmdbId}/{season}/{episode}
   //              /movie/{tmdbId}
@@ -169,10 +184,13 @@
     );
 
     // Send to parent frame (tmovie.tv or whoever embedded us)
-    try {
-      window.parent.postMessage(payload, "*");
-    } catch (e) {
-      console.log(TAG, "postMessage to parent failed:", e.message);
+    var parentOrigin = getSafeParentOrigin();
+    if (parentOrigin) {
+      try {
+        window.parent.postMessage(payload, parentOrigin);
+      } catch (e) {
+        console.log(TAG, "postMessage to parent failed:", e.message);
+      }
     }
 
     // Also dispatch on current window for any local listeners
@@ -246,26 +264,29 @@
     );
 
     var mediaInfo = getMediaInfo();
-    try {
-      window.parent.postMessage(
-        {
-          type: "VIDEASY_STREAM_URL",
-          source: "VIDEASY_HOOK",
-          data: {
-            url: url,
-            streamType:
-              streamType === "MP4"
-                ? "DIRECT"
-                : streamType === "DASH"
-                  ? "DASH"
-                  : "HLS",
-            mediaInfo: mediaInfo,
-            playerUrl: window.location.href,
+    var parentOrigin = getSafeParentOrigin();
+    if (parentOrigin) {
+      try {
+        window.parent.postMessage(
+          {
+            type: "VIDEASY_STREAM_URL",
+            source: "VIDEASY_HOOK",
+            data: {
+              url: url,
+              streamType:
+                streamType === "MP4"
+                  ? "DIRECT"
+                  : streamType === "DASH"
+                    ? "DASH"
+                    : "HLS",
+              mediaInfo: mediaInfo,
+              playerUrl: window.location.href,
+            },
           },
-        },
-        "*",
-      );
-    } catch (_) {}
+          parentOrigin,
+        );
+      } catch (_) {}
+    }
   }
 
   // Hook fetch

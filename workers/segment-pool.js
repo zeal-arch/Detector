@@ -1173,6 +1173,15 @@ class SegmentPool {
             if (currentHost && this._hostPool)
               this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
+              // When the URL was also flagged as a likely junk segment (e.g.
+              // base64-decoded filename ends in .html/.js/.png), emit the
+              // "serving ads/junk" signal so the catch-block junk-detector
+              // can increment _junkServerFailures and abort the pool early.
+              if (task._tpJunkHint) {
+                throw new Error(
+                  `serving ads/junk — Segment ${task.index}: ${validation.detail} after ${adRetries} retries (url hint: ${task._tpJunkHint.ext})`,
+                );
+              }
               throw new Error(
                 `Segment ${task.index}: ${validation.detail} after ${adRetries} retries`,
               );
