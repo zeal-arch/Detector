@@ -16,15 +16,26 @@
 
   // ── Helpers ──────────────────────────────────────────────────────
 
+  function escapeHtml(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   function cleanTitle() {
-    return (
+    const cleaned =
       document.title
         .replace(/\s*[-–|]?\s*(net22|net52|net20|net50).*$/i, "")
         .replace(/Watch\s+(Online\s+)?Free\s*(HD)?\s*[-–|]?\s*/i, "")
         .replace(/\s*Free\s*Online\s*/i, "")
         .replace(/\s*Online\s*Free\s*/i, "")
-        .trim() || document.title
-    );
+        .trim() || document.title;
+
+    return escapeHtml(cleaned);
   }
 
   function getThumbnail() {
