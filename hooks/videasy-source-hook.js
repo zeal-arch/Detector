@@ -34,31 +34,29 @@
   var reported = new Set();
   var hookActive = false;
 
-  // Determine the trusted target origin for postMessage calls to window.parent.
-  // When running inside an iframe, restrict to the embedding parent's origin
-  // derived from document.referrer so stream URLs are not broadcast to
-  // arbitrary embedding origins.  Falls back to window.location.origin for
-  // the direct-access case (window.parent === window).
-  // Note: document.referrer is set by the browser based on the actual
-  // navigation, not by page content, so it reliably reflects the embedding
-  // origin.  If the referrer is absent or unparseable the postMessage will
-  // silently fail to reach a cross-origin parent, which is the secure
-  // default.
-  var _trustedParentOrigin = (function () {
+  // Allowlist of trusted parent origins that may embed the player
+  var TRUSTED_ORIGIN_PATTERNS = [
+    /^https?:\/\/(?:[\w-]+\.)*tmovie\.tv$/,
+    /^https?:\/\/(?:[\w-]+\.)*vidsrc\.(?:cc|to|me|in|net|xyz)$/,
+    /^https?:\/\/(?:[\w-]+\.)*videasy\.net$/,
+  ];
+
+  /**
+   * Derive the trusted postMessage target origin from document.referrer.
+   * Returns the referrer origin if it matches the allowlist, otherwise null.
+   */
+  function getTrustedParentOrigin() {
     try {
-      if (window.parent === window) {
-        return window.location.origin;
+      if (!document.referrer) return null;
+      var referrerOrigin = new URL(document.referrer).origin;
+      for (var i = 0; i < TRUSTED_ORIGIN_PATTERNS.length; i++) {
+        if (TRUSTED_ORIGIN_PATTERNS[i].test(referrerOrigin)) {
+          return referrerOrigin;
+        }
       }
-      var ref = document.referrer;
-      if (ref) {
-        return new URL(ref).origin;
-      }
-    } catch (_) {
-      // URL parsing failed or window.parent access was denied;
-      // fall through to the safe same-origin default below.
-    }
-    return window.location.origin;
-  })();
+    } catch (_) {}
+    return null;
+  }
 
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
@@ -213,13 +211,15 @@
     var parentOrigin = getSafeParentOrigin();
     if (parentOrigin) {
       try {
-        window.parent.postMessage(payload, parentOrigin);
+        window.parent.postMessage(payload, trustedOrigin);
       } catch (e) {
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
+    } else {
+      console.log(TAG, "Skipping parent postMessage — no trusted referrer origin");
     }
 
-    // Also dispatch on current window for any local listeners
+    // Also dispatch on current window for any local listeners (scoped to self)
     try {
       window.postMessage(payload, window.location.origin);
     } catch (_) {}
