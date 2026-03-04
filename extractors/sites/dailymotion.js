@@ -395,20 +395,20 @@
     };
   }
 
-  function processInterceptedMetadata(meta) {
-    if (!meta || meta.error || !meta.qualities) return;
+async function processInterceptedMetadata(meta) {
+  if (!meta || meta.error || !meta.qualities) return;
 
-    const videoId =
-      meta.id ||
-      extractVideoId(meta.url || window.location.href) ||
-      `dm_${Date.now()}`;
+  const videoId =
+    meta.id ||
+    extractVideoId(meta.url || window.location.href) ||
+    `dm_${Date.now()}`;
 
-    if (processedVideos.has(videoId)) return;
-    processedVideos.add(videoId);
+  if (processedVideos.has(videoId)) return;
+  processedVideos.add(videoId);
 
-    const formats = await buildFormats(meta.qualities);
-    sendFormats(videoId, meta, formats);
-  }
+  const formats = await buildFormats(meta.qualities);
+  sendFormats(videoId, meta, formats);
+}
 
   function parseDuration(iso) {
     if (!iso) return null;
