@@ -1,4 +1,18 @@
 /**
+ * Thrown when a segment URL is confirmed non-media by both URL heuristics
+ * (_tpJunkHint) and magic-byte validation after exhausting ad retries.
+ * Using a dedicated class allows the catch block to distinguish this
+ * permanent failure from transient network/timeout errors and skip the
+ * general retry budget entirely.
+ */
+class JunkSegmentError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "JunkSegmentError";
+  }
+}
+
+/**
  * Robust segment download pool with adaptive rate-limiting and content validation.
  *
  * Features:
@@ -1173,6 +1187,16 @@ class SegmentPool {
             if (currentHost && this._hostPool)
               this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
+              // When the URL heuristic (_tpJunkHint) and magic-byte validation
+              // both confirm non-media content, this is a permanent junk segment
+              // (not a transient glitch). Use JunkSegmentError so the catch
+              // block can count it toward the junk-server threshold without
+              // consuming the general retry budget.
+              if (task._tpJunkHint) {
+                throw new JunkSegmentError(
+                  `Segment ${task.index}: ${validation.detail} after ${adRetries} retries (URL hint: ${task._tpJunkHint.decoded})`,
+                );
+              }
               throw new Error(
                 `Segment ${task.index}: ${validation.detail} after ${adRetries} retries`,
               );
@@ -1207,11 +1231,11 @@ class SegmentPool {
         if (this._aborted) throw new Error("Pool aborted");
 
         // ── Junk server: non-retryable ──
-        // When we've confirmed the URL decodes to non-media AND the
-        // response content-type/magic-bytes validated as non-media, this
-        // is a permanent server problem, not a transient glitch.
+        // JunkSegmentError is thrown when both the URL heuristic (_tpJunkHint)
+        // and magic-byte validation confirm the segment is non-media.  This is
+        // a permanent server problem, not a transient glitch.
         // Re-throw immediately — do NOT burn through 15 general retries.
-        if (err.message && err.message.includes("serving ads/junk")) {
+        if (err instanceof JunkSegmentError) {
           this._junkServerFailures++;
           if (
             this._junkServerFailures >= this._junkServerThreshold &&
