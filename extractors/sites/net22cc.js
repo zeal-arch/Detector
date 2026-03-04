@@ -235,7 +235,7 @@
 
         // Intercept play.php POST response (returns embed iframe URL)
         if (/play\.php/i.test(reqUrl) && this._net22Method === "POST") {
-          log("play.php POST response:", response?.substring(0, 200));
+          log("play.php POST response:", this.responseText?.substring(0, 200));
         }
 
         // Skip large responses (video segments)
