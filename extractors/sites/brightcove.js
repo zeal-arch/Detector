@@ -21,7 +21,7 @@
                     platform: 'brightcove'
                 }
             }
-        }, '*');
+        }, window.location.origin);
         window.__SPECIALIST_DETECTED = true;
     }
 
