@@ -1,4 +1,4 @@
-﻿class YouTubeExtractor extends BaseExtractor {
+class YouTubeExtractor extends BaseExtractor {
   constructor() {
     super("YouTube");
     this._injected = false;
