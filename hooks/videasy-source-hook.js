@@ -45,27 +45,45 @@
   ];
 
   /**
-   * Derive the parent frame's origin from document.referrer and validate it
-   * against the allowlist. Returns the trusted origin string (e.g.
-   * "https://tmovie.tv") or null if the referrer is absent or untrusted.
+   * Derive the trusted postMessage target origin from document.referrer.
+   * Returns the referrer origin if it matches the allowlist, otherwise null.
    */
+  function getTrustedParentOrigin() {
+    try {
+      if (!document.referrer) return null;
+      var referrerOrigin = new URL(document.referrer).origin;
+      for (var i = 0; i < TRUSTED_ORIGIN_PATTERNS.length; i++) {
+        if (TRUSTED_ORIGIN_PATTERNS[i].test(referrerOrigin)) {
+          return referrerOrigin;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Tell the generic-network-hook to stand down — we handle detection
+  window.__SPECIALIST_DETECTED = true;
+
+  // ── Trusted parent origins allowed to receive postMessage data ────
+  // Only send decrypted source data to these known-safe origins.
+  // This prevents a malicious embedder from receiving sensitive data.
+  var ALLOWED_ORIGIN_PATTERNS = [
+    /^https:\/\/(?:[\w-]+\.)?tmovie\.tv$/i,
+    /^https:\/\/(?:[\w-]+\.)?vidsrc\.(cc|to|me|in|net|xyz)$/i,
+    /^https:\/\/(?:[\w-]+\.)?videasy\.net$/i,
+  ];
+
   function getTrustedParentOrigin() {
     try {
       var ref = document.referrer;
       if (!ref) return null;
-      var parsed = new URL(ref);
-      var hostname = parsed.hostname;
-      for (var i = 0; i < TRUSTED_ORIGINS.length; i++) {
-        if (
-          hostname === TRUSTED_ORIGINS[i] ||
-          hostname.endsWith("." + TRUSTED_ORIGINS[i])
-        ) {
-          return parsed.origin;
+      var origin = new URL(ref).origin;
+      for (var i = 0; i < ALLOWED_ORIGIN_PATTERNS.length; i++) {
+        if (ALLOWED_ORIGIN_PATTERNS[i].test(origin)) {
+          return origin;
         }
       }
-    } catch (e) {
-      console.log(TAG, "getTrustedParentOrigin: failed to parse referrer:", e.message);
-    }
+    } catch (_) {}
     return null;
   }
 
@@ -200,7 +218,8 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame — only to the trusted embedding origin
+    // Send to parent frame — restricted to trusted origins only to prevent
+    // decrypted source data leaking to malicious embedders.
     var parentOrigin = getTrustedParentOrigin();
     if (parentOrigin) {
       try {
@@ -208,9 +227,11 @@
       } catch (e) {
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
+    } else {
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
     }
 
-    // Also dispatch on current window for any local listeners
+    // Also dispatch on current window for any local listeners (same-origin, safe).
     try {
       window.postMessage(payload, window.location.origin);
     } catch (_) {}
@@ -283,7 +304,7 @@
     var mediaInfo = getMediaInfo();
     var parentOrigin = getTrustedParentOrigin();
     if (!parentOrigin) {
-      console.log(TAG, "Skipping VIDEASY_STREAM_URL — parent origin is not trusted");
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
       return;
     }
     try {
