@@ -61,35 +61,18 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
-  // ── Trusted parent origins (sites known to embed videasy/vidsrc iframes) ──
-  // Listed as bare hostnames; subdomains are also accepted (e.g. sub.tmovie.tv).
-  var TRUSTED_ORIGINS = [
-    "tmovie.tv",
-    // Add additional trusted embedding domains here as needed
-  ];
-
-  /**
-   * Derive the parent frame's origin from document.referrer and validate it
-   * against the allowlist. Returns the trusted origin string (e.g.
-   * "https://tmovie.tv") or null if the referrer is absent or untrusted.
-   */
-  function getTrustedParentOrigin() {
+  // ── Trusted parent origin ─────────────────────────────────────────
+  // Derive a safe targetOrigin for window.parent.postMessage from the
+  // page referrer so messages are only delivered to the embedding origin
+  // (e.g. tmovie.tv) and not to arbitrary third-party frames.
+  // Returns null when the referrer is unavailable; callers must skip
+  // the postMessage in that case to avoid broadcasting to "*".
+  function getSafeParentOrigin() {
     try {
-      var ref = document.referrer;
-      if (!ref) return null;
-      var parsed = new URL(ref);
-      var hostname = parsed.hostname;
-      for (var i = 0; i < TRUSTED_ORIGINS.length; i++) {
-        if (
-          hostname === TRUSTED_ORIGINS[i] ||
-          hostname.endsWith("." + TRUSTED_ORIGINS[i])
-        ) {
-          return parsed.origin;
-        }
+      if (document.referrer) {
+        return new URL(document.referrer).origin;
       }
-    } catch (e) {
-      console.log(TAG, "getTrustedParentOrigin: failed to parse referrer:", e.message);
-    }
+    } catch (_) {}
     return null;
   }
 
@@ -224,9 +207,9 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame — only when the referrer is a trusted origin
-    var trustedOrigin = getTrustedParentOrigin();
-    if (trustedOrigin) {
+    // Send to parent frame (tmovie.tv or whoever embedded us)
+    var parentOrigin = getSafeParentOrigin();
+    if (parentOrigin) {
       try {
         window.parent.postMessage(payload, trustedOrigin);
       } catch (e) {
@@ -307,28 +290,29 @@
     );
 
     var mediaInfo = getMediaInfo();
-    var trustedOrigin = getTrustedParentOrigin();
-    if (!trustedOrigin) return;
-    try {
-      window.parent.postMessage(
-        {
-          type: "VIDEASY_STREAM_URL",
-          source: "VIDEASY_HOOK",
-          data: {
-            url: url,
-            streamType:
-              streamType === "MP4"
-                ? "DIRECT"
-                : streamType === "DASH"
-                  ? "DASH"
-                  : "HLS",
-            mediaInfo: mediaInfo,
-            playerUrl: window.location.href,
+    var parentOrigin = getSafeParentOrigin();
+    if (parentOrigin) {
+      try {
+        window.parent.postMessage(
+          {
+            type: "VIDEASY_STREAM_URL",
+            source: "VIDEASY_HOOK",
+            data: {
+              url: url,
+              streamType:
+                streamType === "MP4"
+                  ? "DIRECT"
+                  : streamType === "DASH"
+                    ? "DASH"
+                    : "HLS",
+              mediaInfo: mediaInfo,
+              playerUrl: window.location.href,
+            },
           },
-        },
-        trustedOrigin,
-      );
-    } catch (_) {}
+          parentOrigin,
+        );
+      } catch (_) {}
+    }
   }
 
   // Hook fetch
