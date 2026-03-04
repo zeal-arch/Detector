@@ -233,11 +233,6 @@
           }
         }
 
-        // Intercept play.php POST response (returns embed iframe URL)
-        if (/play\.php/i.test(reqUrl) && this._net22Method === "POST") {
-          log("play.php POST response:", this.responseText?.substring(0, 200));
-        }
-
         // Skip large responses (video segments)
         const contentLength = parseInt(
           this.getResponseHeader("content-length") || "0",
@@ -246,6 +241,11 @@
         if (contentLength > MAX_RESPONSE_BYTES) return;
 
         const response = this.responseText;
+
+        // Intercept play.php POST response (returns embed iframe URL)
+        if (/play\.php/i.test(reqUrl) && this._net22Method === "POST") {
+          log("play.php POST response:", response?.substring(0, 200));
+        }
         if (!response || typeof response !== "string") return;
         if (response.length > MAX_RESPONSE_BYTES) return;
 
