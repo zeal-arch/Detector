@@ -67,6 +67,38 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
+  // ── Trusted parent origins (sites known to embed videasy/vidsrc iframes) ──
+  // Listed as bare hostnames; subdomains are also accepted (e.g. sub.tmovie.tv).
+  var TRUSTED_ORIGINS = [
+    "tmovie.tv",
+    // Add additional trusted embedding domains here as needed
+  ];
+
+  /**
+   * Derive the parent frame's origin from document.referrer and validate it
+   * against the allowlist. Returns the trusted origin string (e.g.
+   * "https://tmovie.tv") or null if the referrer is absent or untrusted.
+   */
+  function getTrustedParentOrigin() {
+    try {
+      var ref = document.referrer;
+      if (!ref) return null;
+      var parsed = new URL(ref);
+      var hostname = parsed.hostname;
+      for (var i = 0; i < TRUSTED_ORIGINS.length; i++) {
+        if (
+          hostname === TRUSTED_ORIGINS[i] ||
+          hostname.endsWith("." + TRUSTED_ORIGINS[i])
+        ) {
+          return parsed.origin;
+        }
+      }
+    } catch (e) {
+      console.log(TAG, "getTrustedParentOrigin: failed to parse referrer:", e.message);
+    }
+    return null;
+  }
+
   // ── Extract media info from the URL path ─────────────────────────
   // URL pattern: /tv/{tmdbId}/{season}/{episode}
   //              /movie/{tmdbId}
@@ -283,6 +315,11 @@
     );
 
     var mediaInfo = getMediaInfo();
+    var parentOrigin = getTrustedParentOrigin();
+    if (!parentOrigin) {
+      console.log(TAG, "Skipping VIDEASY_STREAM_URL — parent origin is not trusted");
+      return;
+    }
     try {
       window.parent.postMessage(
         {
@@ -300,7 +337,7 @@
             playerUrl: window.location.href,
           },
         },
-        "*",
+        parentOrigin,
       );
     } catch (_) {}
   }
