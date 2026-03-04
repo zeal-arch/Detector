@@ -34,32 +34,6 @@
   var reported = new Set();
   var hookActive = false;
 
-  // Determine the trusted target origin for postMessage calls to window.parent.
-  // When running inside an iframe, restrict to the embedding parent's origin
-  // derived from document.referrer so stream URLs are not broadcast to
-  // arbitrary embedding origins.  Falls back to window.location.origin for
-  // the direct-access case (window.parent === window).
-  // Note: document.referrer is set by the browser based on the actual
-  // navigation, not by page content, so it reliably reflects the embedding
-  // origin.  If the referrer is absent or unparseable the postMessage will
-  // silently fail to reach a cross-origin parent, which is the secure
-  // default.
-  var _trustedParentOrigin = (function () {
-    try {
-      if (window.parent === window) {
-        return window.location.origin;
-      }
-      var ref = document.referrer;
-      if (ref) {
-        return new URL(ref).origin;
-      }
-    } catch (_) {
-      // URL parsing failed or window.parent access was denied;
-      // fall through to the safe same-origin default below.
-    }
-    return window.location.origin;
-  })();
-
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
