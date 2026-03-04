@@ -34,11 +34,44 @@
   var reported = new Set();
   var hookActive = false;
 
-  // Allowlist of trusted parent origins that may embed the player
-  var TRUSTED_ORIGIN_PATTERNS = [
-    /^https?:\/\/(?:[\w-]+\.)*tmovie\.tv$/,
-    /^https?:\/\/(?:[\w-]+\.)*vidsrc\.(?:cc|to|me|in|net|xyz)$/,
-    /^https?:\/\/(?:[\w-]+\.)*videasy\.net$/,
+  // Allowlist of trusted origins that are permitted to embed this player
+  // and receive decrypted source data via postMessage.
+  var TRUSTED_ORIGINS = new Set([
+    "https://tmovie.tv",
+    "https://www.tmovie.tv",
+    "https://vidsrc.to",
+    "https://vidsrc.me",
+    "https://vidsrc.cc",
+    "https://vidsrc.in",
+    "https://vidsrc.net",
+    "https://vidsrc.xyz",
+  ]);
+
+  /**
+   * Derive the trusted parent origin from document.referrer.
+   * Returns the referrer origin string if it is in the allowlist,
+   * or null if the referrer is absent, malformed, or untrusted.
+   */
+  function getTrustedParentOrigin() {
+    try {
+      var referrer = document.referrer;
+      if (!referrer) return null;
+      var origin = new URL(referrer).origin;
+      if (TRUSTED_ORIGINS.has(origin)) return origin;
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Tell the generic-network-hook to stand down — we handle detection
+  window.__SPECIALIST_DETECTED = true;
+
+  // ── Trusted parent origins (sites known to embed videasy/vidsrc iframes) ──
+  // Listed as bare hostnames; subdomains are also accepted (e.g. sub.tmovie.tv).
+  var TRUSTED_ORIGINS = [
+    "tmovie.tv",
+    // Add additional trusted embedding domains here as needed
   ];
 
   /**
@@ -207,8 +240,10 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame (tmovie.tv or whoever embedded us)
-    var parentOrigin = getSafeParentOrigin();
+    // Send to parent frame only when the embedding origin is trusted.
+    // Using a specific targetOrigin prevents data leakage to malicious
+    // sites that might embed this player in their own pages.
+    var parentOrigin = getTrustedParentOrigin();
     if (parentOrigin) {
       try {
         window.parent.postMessage(payload, trustedOrigin);
@@ -216,10 +251,10 @@
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
     } else {
-      console.log(TAG, "Skipping parent postMessage — no trusted referrer origin");
+      // No trusted referrer — skip to avoid leaking data to unknown origins.
     }
 
-    // Also dispatch on current window for any local listeners (scoped to self)
+    // Also dispatch on current window for any local listeners (same-origin, safe).
     try {
       window.postMessage(payload, window.location.origin);
     } catch (_) {}
