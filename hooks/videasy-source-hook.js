@@ -103,16 +103,24 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
-  // ── Trusted parent origin ─────────────────────────────────────────
-  // Derive a safe targetOrigin for window.parent.postMessage from the
-  // page referrer so messages are only delivered to the embedding origin
-  // (e.g. tmovie.tv) and not to arbitrary third-party frames.
-  // Returns null when the referrer is unavailable; callers must skip
-  // the postMessage in that case to avoid broadcasting to "*".
-  function getSafeParentOrigin() {
+  // ── Trusted parent origins allowed to receive postMessage data ────
+  // Only send decrypted source data to these known-safe origins.
+  // This prevents a malicious embedder from receiving sensitive data.
+  var ALLOWED_ORIGIN_PATTERNS = [
+    /^https:\/\/(?:[\w-]+\.)?tmovie\.tv$/i,
+    /^https:\/\/(?:[\w-]+\.)?vidsrc\.(cc|to|me|in|net|xyz)$/i,
+    /^https:\/\/(?:[\w-]+\.)?videasy\.net$/i,
+  ];
+
+  function getTrustedParentOrigin() {
     try {
-      if (document.referrer) {
-        return new URL(document.referrer).origin;
+      var ref = document.referrer;
+      if (!ref) return null;
+      var origin = new URL(ref).origin;
+      for (var i = 0; i < ALLOWED_ORIGIN_PATTERNS.length; i++) {
+        if (ALLOWED_ORIGIN_PATTERNS[i].test(origin)) {
+          return origin;
+        }
       }
     } catch (_) {}
     return null;
@@ -249,19 +257,17 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame — only when the referrer is a trusted origin
-    var trustedOrigin = getTrustedParentOrigin();
-    if (trustedOrigin) {
+    // Send to parent frame — restricted to trusted origins only to prevent
+    // decrypted source data leaking to malicious embedders.
+    var parentOrigin = getTrustedParentOrigin();
+    if (parentOrigin) {
       try {
-        window.parent.postMessage(payload, trustedOrigin);
+        window.parent.postMessage(payload, parentOrigin);
       } catch (e) {
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
     } else {
-      console.log(
-        TAG,
-        "Skipping postMessage to parent: referrer absent or untrusted",
-      );
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
     }
 
     // Also dispatch on current window for any local listeners (same-origin, safe).
@@ -335,29 +341,31 @@
     );
 
     var mediaInfo = getMediaInfo();
-    var parentOrigin = getSafeParentOrigin();
-    if (parentOrigin) {
-      try {
-        window.parent.postMessage(
-          {
-            type: "VIDEASY_STREAM_URL",
-            source: "VIDEASY_HOOK",
-            data: {
-              url: url,
-              streamType:
-                streamType === "MP4"
-                  ? "DIRECT"
-                  : streamType === "DASH"
-                    ? "DASH"
-                    : "HLS",
-              mediaInfo: mediaInfo,
-              playerUrl: window.location.href,
-            },
-          },
-          parentOrigin,
-        );
-      } catch (_) {}
+    var parentOrigin = getTrustedParentOrigin();
+    if (!parentOrigin) {
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
+      return;
     }
+    try {
+      window.parent.postMessage(
+        {
+          type: "VIDEASY_STREAM_URL",
+          source: "VIDEASY_HOOK",
+          data: {
+            url: url,
+            streamType:
+              streamType === "MP4"
+                ? "DIRECT"
+                : streamType === "DASH"
+                  ? "DASH"
+                  : "HLS",
+            mediaInfo: mediaInfo,
+            playerUrl: window.location.href,
+          },
+        },
+        parentOrigin,
+      );
+    } catch (_) {}
   }
 
   // Hook fetch
