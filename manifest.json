@@ -76,7 +76,10 @@
                 "*://accounts.youtube.com/*"
             ],
             "js": [
-                "extractors/sites/youtube/content.js"
+                "extractors/base.js",
+                "extractors/sites/youtube/youtube.js",
+                "extractors/registry.js",
+                "content/content-multi.js"
             ],
             "run_at": "document_end",
             "all_frames": false

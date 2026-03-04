@@ -1,10 +1,6 @@
 (() => {
   "use strict";
 
-  if (/youtube\.com|youtu\.be/.test(window.location.hostname)) {
-    return;
-  }
-
   console.log(
     "[Multi-DL] Content script loaded for:",
     window.location.hostname,

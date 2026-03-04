@@ -593,6 +593,45 @@
         }
 
         /* ═══════════════════════════════════════
+       Generic Detection Notice
+       ═══════════════════════════════════════ */
+        .generic-notice {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 10px 12px;
+            background: rgba(154, 171, 221, 0.08);
+            border: 1px solid rgba(154, 171, 221, 0.15);
+            border-radius: 10px;
+            margin-bottom: 12px;
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--secondary);
+        }
+
+        .generic-notice-icon {
+            flex-shrink: 0;
+            width: 16px;
+            height: 16px;
+            margin-top: 1px;
+            opacity: 0.7;
+        }
+
+        .generic-notice-text {
+            flex: 1;
+        }
+
+        .generic-notice a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .generic-notice a:hover {
+            text-decoration: underline;
+        }
+
+        /* ═══════════════════════════════════════
        Stream Cards
        ═══════════════════════════════════════ */
         .stream-card {

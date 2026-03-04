@@ -37,6 +37,56 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
+  // ── Trusted parent origins (sites known to embed videasy/vidsrc iframes) ──
+  // Listed as bare hostnames; subdomains are also accepted (e.g. sub.tmovie.tv).
+  var TRUSTED_ORIGINS = [
+    "tmovie.tv",
+    // Add additional trusted embedding domains here as needed
+  ];
+
+  /**
+   * Derive the trusted postMessage target origin from document.referrer.
+   * Returns the referrer origin if it matches the allowlist, otherwise null.
+   */
+  function getTrustedParentOrigin() {
+    try {
+      if (!document.referrer) return null;
+      var referrerOrigin = new URL(document.referrer).origin;
+      for (var i = 0; i < TRUSTED_ORIGIN_PATTERNS.length; i++) {
+        if (TRUSTED_ORIGIN_PATTERNS[i].test(referrerOrigin)) {
+          return referrerOrigin;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Tell the generic-network-hook to stand down — we handle detection
+  window.__SPECIALIST_DETECTED = true;
+
+  // ── Trusted parent origins allowed to receive postMessage data ────
+  // Only send decrypted source data to these known-safe origins.
+  // This prevents a malicious embedder from receiving sensitive data.
+  var ALLOWED_ORIGIN_PATTERNS = [
+    /^https:\/\/(?:[\w-]+\.)?tmovie\.tv$/i,
+    /^https:\/\/(?:[\w-]+\.)?vidsrc\.(cc|to|me|in|net|xyz)$/i,
+    /^https:\/\/(?:[\w-]+\.)?videasy\.net$/i,
+  ];
+
+  function getTrustedParentOrigin() {
+    try {
+      var ref = document.referrer;
+      if (!ref) return null;
+      var origin = new URL(ref).origin;
+      for (var i = 0; i < ALLOWED_ORIGIN_PATTERNS.length; i++) {
+        if (ALLOWED_ORIGIN_PATTERNS[i].test(origin)) {
+          return origin;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
   // ── Extract media info from the URL path ─────────────────────────
   // URL pattern: /tv/{tmdbId}/{season}/{episode}
   //              /movie/{tmdbId}
@@ -168,16 +218,22 @@
       "subtitles to parent",
     );
 
-    // Send to parent frame (tmovie.tv or whoever embedded us)
-    try {
-      window.parent.postMessage(payload, "*");
-    } catch (e) {
-      console.log(TAG, "postMessage to parent failed:", e.message);
+    // Send to parent frame — restricted to trusted origins only to prevent
+    // decrypted source data leaking to malicious embedders.
+    var parentOrigin = getTrustedParentOrigin();
+    if (parentOrigin) {
+      try {
+        window.parent.postMessage(payload, parentOrigin);
+      } catch (e) {
+        console.log(TAG, "postMessage to parent failed:", e.message);
+      }
+    } else {
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
     }
 
-    // Also dispatch on current window for any local listeners
+    // Also dispatch on current window for any local listeners (same-origin, safe).
     try {
-      window.postMessage(payload, "*");
+      window.postMessage(payload, window.location.origin);
     } catch (_) {}
   }
 
@@ -246,6 +302,11 @@
     );
 
     var mediaInfo = getMediaInfo();
+    var parentOrigin = getTrustedParentOrigin();
+    if (!parentOrigin) {
+      console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
+      return;
+    }
     try {
       window.parent.postMessage(
         {
@@ -263,7 +324,7 @@
             playerUrl: window.location.href,
           },
         },
-        "*",
+        parentOrigin,
       );
     } catch (_) {}
   }
