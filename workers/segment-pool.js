@@ -1187,14 +1187,13 @@ class SegmentPool {
             if (currentHost && this._hostPool)
               this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
-              // When the URL heuristic (_tpJunkHint) and magic-byte validation
-              // both confirm non-media content, this is a permanent junk segment
-              // (not a transient glitch). Use JunkSegmentError so the catch
-              // block can count it toward the junk-server threshold without
-              // consuming the general retry budget.
+              // When the URL was also flagged as a likely junk segment (e.g.
+              // base64-decoded filename ends in .html/.js/.png), emit the
+              // "serving ads/junk" signal so the catch-block junk-detector
+              // can increment _junkServerFailures and abort the pool early.
               if (task._tpJunkHint) {
-                throw new JunkSegmentError(
-                  `Segment ${task.index}: ${validation.detail} after ${adRetries} retries (URL hint: ${task._tpJunkHint.decoded})`,
+                throw new Error(
+                  `serving ads/junk — Segment ${task.index}: ${validation.detail} after ${adRetries} retries (url hint: ${task._tpJunkHint.ext})`,
                 );
               }
               throw new Error(
