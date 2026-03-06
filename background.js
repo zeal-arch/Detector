@@ -3705,21 +3705,30 @@ async function loadSignatureData(playerUrl) {
   const KNOWN_GOOD_SOLVER_HASH = "9f4cc5e4";
   const playerHashMatch = playerUrl.match(/\/s\/player\/([a-fA-F0-9]{8,})\//);
   const currentHash = playerHashMatch ? playerHashMatch[1] : null;
-  // Prefer known-good hash for solver; fall back to current hash's tv variant
-  const tvPlayerUrl = `https://www.youtube.com/s/player/${KNOWN_GOOD_SOLVER_HASH}/${TV_VARIANT_PATH}`;
-  const tvPlayerUrlFallback =
-    currentHash && currentHash !== KNOWN_GOOD_SOLVER_HASH
+
+  // Prefer the current page's player hash TV variant for the solver.
+  // If we can't extract a hash (or that variant fails later), fall back to
+  // the pinned known-good hash.
+  const tvPlayerUrlCurrent =
+    currentHash
       ? `https://www.youtube.com/s/player/${currentHash}/${TV_VARIANT_PATH}`
       : null;
+  const tvPlayerUrlPinned = `https://www.youtube.com/s/player/${KNOWN_GOOD_SOLVER_HASH}/${TV_VARIANT_PATH}`;
+
+  // Primary solver URL: current hash TV variant when available, otherwise pinned.
+  const tvPlayerUrl = tvPlayerUrlCurrent || tvPlayerUrlPinned;
+  // Fallback solver URL: whichever variant is not primary (when it exists).
+  const tvPlayerUrlFallback =
+    tvPlayerUrl === tvPlayerUrlCurrent && tvPlayerUrlPinned
+      ? tvPlayerUrlPinned
+      : tvPlayerUrl === tvPlayerUrlPinned && tvPlayerUrlCurrent
+        ? tvPlayerUrlCurrent
+        : null;
 
   console.log("[BG] Loading player JS:", playerUrl);
-  console.log(
-    "[BG] Solver player (known-good hash",
-    KNOWN_GOOD_SOLVER_HASH + "):",
-    tvPlayerUrl,
-  );
+  console.log("[BG] Solver primary TV player:", tvPlayerUrl);
   if (tvPlayerUrlFallback) {
-    console.log("[BG] Solver fallback (current hash tv):", tvPlayerUrlFallback);
+    console.log("[BG] Solver fallback TV player:", tvPlayerUrlFallback);
   }
 
   let js = null;
