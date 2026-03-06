@@ -1187,11 +1187,6 @@ class SegmentPool {
             if (currentHost && this._hostPool)
               this._hostPool.recordAd(currentHost);
             if (adRetries > this._maxAdRetries) {
-<<<<<<< HEAD
-              if (task._tpJunkHint) {
-                throw new JunkSegmentError(
-                  `Segment ${task.index}: ${validation.detail} after ${adRetries} retries (url hint: ${task._tpJunkHint.ext})`,
-=======
               // When the URL was also flagged as a likely junk segment (e.g.
               // base64-decoded filename ends in .html/.js/.png), emit the
               // "serving ads/junk" signal so the catch-block junk-detector
@@ -1199,7 +1194,6 @@ class SegmentPool {
               if (task._tpJunkHint) {
                 throw new Error(
                   `serving ads/junk — Segment ${task.index}: ${validation.detail} after ${adRetries} retries (url hint: ${task._tpJunkHint.ext})`,
->>>>>>> 846ebbe90a9559757eee0f71ce615a1bdec20d3e
                 );
               }
               throw new Error(
@@ -1237,11 +1231,7 @@ class SegmentPool {
 
         // ── Junk server: non-retryable ──
         // JunkSegmentError is thrown when both the URL heuristic (_tpJunkHint)
-<<<<<<< HEAD
-        // and magic-byte validation confirm the segment is non-media. This is
-=======
         // and magic-byte validation confirm the segment is non-media.  This is
->>>>>>> 846ebbe90a9559757eee0f71ce615a1bdec20d3e
         // a permanent server problem, not a transient glitch.
         // Re-throw immediately — do NOT burn through 15 general retries.
         if (err instanceof JunkSegmentError) {

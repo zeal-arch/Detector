@@ -37,8 +37,6 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
-<<<<<<< HEAD
-=======
   // ── Trusted parent origins (sites known to embed videasy/vidsrc iframes) ──
   // Listed as bare hostnames; subdomains are also accepted (e.g. sub.tmovie.tv).
   var TRUSTED_ORIGINS = [
@@ -66,7 +64,6 @@
   // Tell the generic-network-hook to stand down — we handle detection
   window.__SPECIALIST_DETECTED = true;
 
->>>>>>> 846ebbe90a9559757eee0f71ce615a1bdec20d3e
   // ── Trusted parent origins allowed to receive postMessage data ────
   // Only send decrypted source data to these known-safe origins.
   // This prevents a malicious embedder from receiving sensitive data.
@@ -231,14 +228,7 @@
         console.log(TAG, "postMessage to parent failed:", e.message);
       }
     } else {
-<<<<<<< HEAD
-      console.log(
-        TAG,
-        "Skipping parent postMessage: referrer absent or untrusted",
-      );
-=======
       console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
->>>>>>> 846ebbe90a9559757eee0f71ce615a1bdec20d3e
     }
 
     // Also dispatch on current window for any local listeners (same-origin, safe).
@@ -314,14 +304,7 @@
     var mediaInfo = getMediaInfo();
     var parentOrigin = getTrustedParentOrigin();
     if (!parentOrigin) {
-<<<<<<< HEAD
-      console.log(
-        TAG,
-        "Skipping parent postMessage: referrer absent or untrusted",
-      );
-=======
       console.log(TAG, "Skipping parent postMessage: referrer absent or untrusted");
->>>>>>> 846ebbe90a9559757eee0f71ce615a1bdec20d3e
       return;
     }
     try {
