@@ -125,7 +125,7 @@ class YouTubeExtractor extends BaseExtractor {
               text: resp && resp.text ? resp.text : null,
               error: resp && resp.error ? resp.error : null,
             },
-            "*",
+            window.location.origin,
           );
         })
         .catch((err) => {
@@ -135,7 +135,7 @@ class YouTubeExtractor extends BaseExtractor {
               requestId: e.data.requestId,
               error: err.message || "relay failed",
             },
-            "*",
+            window.location.origin,
           );
         });
       return;
