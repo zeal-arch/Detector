@@ -14,6 +14,20 @@ const CLIENTS = {
     clientId: 28,
     requireCipher: false,
   },
+  // TVHTML5 (Smart TV) client: no PO token needed, returns all formats with cipher.
+  // Signatures are deciphered using the tv-player-ias.js player variant.
+  tv: {
+    client: {
+      clientName: "TVHTML5",
+      clientVersion: "7.20260114.12.00",
+      userAgent:
+        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+    },
+    userAgent:
+      "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+    clientId: 7,
+    requireCipher: true,
+  },
   web: {
     client: {
       clientName: "WEB",
@@ -2132,7 +2146,6 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   let visitorData = pageData.visitorData || null;
   let playerUrl = pageData.playerUrl || null;
   let pagePlayerResp = pageData.playerResponse || null;
-  let nSigCode = pageData.nSigCode || null;
   let cipherCode = pageData.cipherCode || null;
   let cipherArgName = pageData.cipherArgName || null;
   let cipherActionsFromPage = pageData.cipherActions || null;
@@ -2157,15 +2170,11 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         "cipher:",
         sig.actionList ? "actions" : sig.cipherCode ? "code" : "none",
         "| nSig:",
-        sig.nSigCode ? "yes" : "none",
+        sig.playerSource ? "solver" : "none",
       );
     } catch (e) {
       console.warn("[BG] Sig data load error:", e.message);
     }
-  }
-
-  if (nSigCode && sig && !sig.nSigCode) {
-    sig.nSigCode = nSigCode;
   }
 
   if (cipherCode && sig && !sig.cipherCode) {
@@ -2186,23 +2195,15 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
   // ============ Tier 1: InnerTube API clients ============
   // android_vr returns plain URLs (no cipher needed), web needs cipher.
   // This is the most reliable tier — independent of page injection and regex.
-  const order = ["android_vr", "web"];
+  const order = ["android_vr", "tv", "web"];
   let lastErr = null;
   let allFormats = [];
   let successfulClients = [];
   let bestVideoDetails = null;
   let triedWebEmbedded = false;
 
-  // Build a merged sig object that fills in nSigBundled / nSigCode from
-  // pageData when the player-derived sig is missing those fields.
-  const mergedSig =
-    sig || nSigCode
-      ? {
-          ...sig,
-          nSigCode: sig?.nSigCode ?? nSigCode ?? null,
-          nSigBundled: sig?.nSigBundled ?? pageData.nSigBundled ?? null,
-        }
-      : null;
+  // Build a merged sig object — the solver only needs playerSource/playerUrl.
+  const mergedSig = sig ?? null;
 
   for (const key of order) {
     try {
@@ -2212,7 +2213,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         key,
         videoId,
         visitorData,
-        cfg.requireCipher ? pageData.sts || sig?.sts || null : null,
+        cfg.requireCipher ? sig?.sts || pageData.sts || null : null,
       );
 
       const status = resp.playabilityStatus?.status;
@@ -2264,6 +2265,30 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
 
       const info = buildInfo(resp, key);
 
+      // Diagnostic: show total format breakdown from InnerTube response
+      const sd_diag = resp.streamingData || {};
+      const allFmts = [
+        ...(sd_diag.formats || []),
+        ...(sd_diag.adaptiveFormats || []),
+      ];
+      const cipheredCount = allFmts.filter(
+        (f) => f.cipher || f.signatureCipher,
+      ).length;
+      const directCount = allFmts.filter((f) => f.url).length;
+      console.log(
+        "[BG]",
+        key,
+        "InnerTube response:",
+        allFmts.length,
+        "total formats |",
+        directCount,
+        "direct |",
+        cipheredCount,
+        "ciphered |",
+        "adaptiveFormats:",
+        (sd_diag.adaptiveFormats || []).length,
+      );
+
       if (info.formats.length > 0) {
         console.log("[BG]", key, "returned", info.formats.length, "formats");
 
@@ -2271,7 +2296,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         allFormats.push(...info.formats);
         successfulClients.push(key);
 
-        if (mergedSig?.nSigCode) {
+        if (mergedSig?.playerSource) {
           await applyNSig(info.formats, mergedSig);
         }
 
@@ -2295,7 +2320,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (mergedSig?.nSigCode) {
+          if (mergedSig?.playerSource) {
             await applyNSig(ciphered.formats, mergedSig);
           }
 
@@ -2326,12 +2351,151 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
           allFormats.push(...ciphered.formats);
           successfulClients.push(key);
 
-          if (mergedSig?.nSigCode) {
+          if (mergedSig?.playerSource) {
             await applyNSig(ciphered.formats, mergedSig);
           }
 
           if (successfulClients.length >= 2 && allFormats.length > 15) {
             break;
+          }
+        }
+      }
+
+      // Full AST solver fallback — when regex-based cipher extraction fails
+      // but player.js source is available, use the sandbox solver directly.
+      // This handles ES6 players where extractCipherActions/extractRawCipherCode
+      // return null but the AST solver (meriyah/astring) can still parse them.
+      if (
+        cfg.requireCipher &&
+        !sig?.actionList &&
+        !(cipherCode || sig?.cipherCode) &&
+        sig?.playerSource
+      ) {
+        const sd = resp.streamingData || {};
+        const rawFmts = [...(sd.formats || []), ...(sd.adaptiveFormats || [])];
+        const cipherQueue = [];
+        const nChallengeSet = new Set();
+
+        for (const fmt of rawFmts) {
+          if (fmt.url) {
+            const nm = /[?&]n=([^&]+)/i.exec(fmt.url);
+            if (nm) nChallengeSet.add(decodeURIComponent(nm[1]));
+          } else if (fmt.cipher || fmt.signatureCipher) {
+            const params = new URLSearchParams(
+              fmt.cipher || fmt.signatureCipher,
+            );
+            const url = params.get("url");
+            const s = params.get("s");
+            const sp = params.get("sp") || "sig";
+            if (url && s) {
+              cipherQueue.push({ fmt, url, s, sp });
+              const nm = /[?&]n=([^&]+)/i.exec(url);
+              if (nm) nChallengeSet.add(decodeURIComponent(nm[1]));
+            }
+          }
+        }
+
+        if (cipherQueue.length > 0) {
+          console.log(
+            "[BG]",
+            key,
+            "— regex cipher extraction failed, using full AST solver for",
+            cipherQueue.length,
+            "ciphered formats",
+          );
+          try {
+            const solverResult = await sandboxSolvePlayer(
+              sig.playerSource,
+              sig.solverPlayerUrl || sig.playerUrl || playerUrl,
+              [...nChallengeSet],
+              cipherQueue.map((e) => e.s),
+            );
+            const { nResults, sigResults, elapsed } = solverResult;
+            console.log(
+              "[BG]",
+              key,
+              "AST solver returned in",
+              elapsed + "ms",
+              "| cipher:",
+              Object.keys(sigResults).length,
+              "| n-sig:",
+              Object.keys(nResults).length,
+            );
+
+            const solvedFormats = [];
+            for (const { fmt, url, sp, s } of cipherQueue) {
+              const deciphered = sigResults[s];
+              if (!deciphered || typeof deciphered !== "string") continue;
+
+              let fullUrl =
+                url +
+                (url.includes("?") ? "&" : "?") +
+                sp +
+                "=" +
+                encodeURIComponent(deciphered);
+              if (!/ratebypass/.test(fullUrl)) fullUrl += "&ratebypass=yes";
+
+              // Apply N-sig from the same solver result
+              const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
+              if (nm) {
+                const decoded = decodeURIComponent(nm[1]);
+                const nSolved = nResults[decoded];
+                if (
+                  nSolved &&
+                  typeof nSolved === "string" &&
+                  nSolved !== decoded
+                ) {
+                  fullUrl = fullUrl.replace(
+                    "n=" + nm[1],
+                    "n=" + encodeURIComponent(nSolved),
+                  );
+                }
+              }
+
+              const mime = fmt.mimeType || "";
+              const cm = mime.match(/codecs="([^"]+)"/);
+              const codecs = cm ? cm[1] : "";
+              const isV = mime.startsWith("video/");
+              const isA = mime.startsWith("audio/");
+
+              solvedFormats.push({
+                itag: fmt.itag,
+                url: fullUrl,
+                mimeType: mime,
+                quality: fmt.qualityLabel || fmt.quality || "",
+                qualityLabel: fmt.qualityLabel || "",
+                width: fmt.width || 0,
+                height: fmt.height || 0,
+                fps: fmt.fps || 0,
+                bitrate: fmt.bitrate || 0,
+                audioBitrate: fmt.averageBitrate || fmt.bitrate || 0,
+                audioQuality: fmt.audioQuality || "",
+                contentLength: parseInt(fmt.contentLength) || null,
+                codecs,
+                isVideo: isV,
+                isAudio: isA,
+                isMuxed: isV && codecs.includes("mp4a"),
+              });
+            }
+
+            if (solvedFormats.length > 0) {
+              console.log(
+                "[BG]",
+                key,
+                "returned",
+                solvedFormats.length,
+                "formats (AST solver)",
+              );
+              for (const f of solvedFormats) f.clientUsed = key;
+              allFormats.push(...solvedFormats);
+              successfulClients.push(key);
+
+              if (successfulClients.length >= 2 && allFormats.length > 15) {
+                break;
+              }
+            }
+          } catch (solverErr) {
+            console.warn("[BG]", key, "AST solver failed:", solverErr.message);
           }
         }
       }
@@ -2497,27 +2661,17 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
         (f) => f.url && /[?&]n=([^&]{15,})/.test(f.url),
       );
 
-      if (hasUntransformedN) {
-        const t3Sig = sig || (playerUrl ? null : null);
-        const t3nSigCode = nSigCode || t3Sig?.nSigCode || null;
-        const t3nSigBundled =
-          pageData.nSigBundled || t3Sig?.nSigBundled || null;
-
-        if (t3nSigCode) {
-          console.log(
-            "[BG] Tier 3: Applying N-sig transform to",
-            pageData.resolvedFormats.length,
-            "formats",
-          );
-          await applyNSig(
-            pageData.resolvedFormats,
-            t3Sig || { nSigCode: t3nSigCode, nSigBundled: t3nSigBundled },
-          );
-        } else {
-          console.warn(
-            "[BG] Tier 3: No N-sig code available — downloads may be throttled",
-          );
-        }
+      if (hasUntransformedN && sig?.playerSource) {
+        console.log(
+          "[BG] Tier 3: Applying N-sig transform to",
+          pageData.resolvedFormats.length,
+          "formats",
+        );
+        await applyNSig(pageData.resolvedFormats, sig);
+      } else if (hasUntransformedN) {
+        console.warn(
+          "[BG] Tier 3: No player source available — downloads may be throttled",
+        );
       }
     } else {
       console.log("[BG] Tier 3: N-sig already applied by inject.js (direct)");
@@ -2969,7 +3123,7 @@ async function buildInfoWithSandboxCipher(
 }
 
 async function applyNSig(formats, sig) {
-  if (!sig?.nSigCode) return;
+  if (!sig?.playerSource || !sig?.playerUrl) return;
 
   const entries = [];
   for (const f of formats) {
@@ -2984,71 +3138,54 @@ async function applyNSig(formats, sig) {
   }
   if (!entries.length) return;
 
-  console.log("[BG] Transforming", entries.length, "N-params via sandbox...");
-
   const decodedParams = entries.map((e) => e.decoded);
-  let results = null;
-  let succeeded = false;
+  console.log(
+    "[BG] Transforming",
+    entries.length,
+    "N-params via full player.js solver...",
+  );
 
-  // Try 1: Plain N-sig code (original extraction)
   try {
-    results = await sandboxEval(sig.nSigCode, decodedParams);
-    // Validate: check if at least one value actually changed
-    const anyChanged = results.some(
-      (r, i) => r && typeof r === "string" && r !== decodedParams[i],
+    const solverResult = await sandboxSolvePlayer(
+      sig.playerSource,
+      sig.solverPlayerUrl || sig.playerUrl,
+      decodedParams,
+      [],
     );
-    if (anyChanged) {
-      succeeded = true;
-      console.log("[BG] N-sig transform succeeded (plain code)");
-    } else {
-      console.warn(
-        "[BG] N-sig plain code returned unchanged values — trying bundled...",
-      );
+    if (solverResult?.nResults) {
+      const nRes = solverResult.nResults;
+      let applied = 0;
+      for (const e of entries) {
+        const r = nRes[e.decoded];
+        if (r && typeof r === "string" && r !== e.decoded) {
+          const fmt = formats.find((f) => f.itag === e.itag);
+          if (fmt) {
+            fmt.url = fmt.url.replace(
+              "n=" + e.raw,
+              "n=" + encodeURIComponent(r),
+            );
+            applied++;
+          }
+        }
+      }
+      if (applied > 0) {
+        console.log(
+          "[BG] ★ N-sig transform succeeded (player.js solver)",
+          applied + "/" + entries.length,
+          solverResult.cached ? "[cached]" : "[" + solverResult.elapsed + "ms]",
+        );
+        return;
+      }
+      console.warn("[BG] Player.js solver returned unchanged N-sig values");
     }
   } catch (err) {
-    console.warn(
-      "[BG] N-sig plain code failed:",
-      err.message,
-      "— trying bundled...",
-    );
+    console.warn("[BG] Player.js solver N-sig failed:", err.message);
   }
 
-  // Try 2: yt-dlp bundled N-sig (includes all dependencies)
-  if (!succeeded && sig.nSigBundled) {
-    try {
-      results = await sandboxEval(sig.nSigBundled, decodedParams);
-      const anyChanged = results.some(
-        (r, i) => r && typeof r === "string" && r !== decodedParams[i],
-      );
-      if (anyChanged) {
-        succeeded = true;
-        console.log("[BG] ★ N-sig transform succeeded (yt-dlp bundled code)");
-      } else {
-        console.warn("[BG] N-sig bundled code also returned unchanged values");
-      }
-    } catch (err2) {
-      console.warn("[BG] N-sig bundled code also failed:", err2.message);
-    }
-  }
-
-  if (!succeeded) {
-    console.warn(
-      "[BG] All N-sig transforms failed — downloads may be throttled. " +
-        "Sniffed URLs (IDM-style) will be used if available.",
-    );
-    return;
-  }
-
-  // Apply successful results
-  for (let i = 0; i < entries.length; i++) {
-    const e = entries[i];
-    const r = results[i];
-    if (r && typeof r === "string" && r !== e.decoded) {
-      const fmt = formats.find((f) => f.itag === e.itag);
-      if (fmt)
-        fmt.url = fmt.url.replace("n=" + e.raw, "n=" + encodeURIComponent(r));
-    }
-  }
+  console.warn(
+    "[BG] N-sig transform failed — downloads may be throttled. " +
+      "Sniffed URLs (IDM-style) will be used if available.",
+  );
 }
 
 async function ensureOffscreen() {
@@ -3306,7 +3443,7 @@ async function pageScrapeWithCipher(
     };
 
     const nm = /[?&]n=([^&]+)/i.exec(url);
-    if (nm && sig?.nSigCode) {
+    if (nm) {
       nEntries.push({
         idx: formats.length,
         raw: nm[1],
@@ -3339,7 +3476,7 @@ async function pageScrapeWithCipher(
       try {
         const solverResult = await sandboxSolvePlayer(
           sig.playerSource,
-          sig.playerUrl || playerUrl,
+          sig.solverPlayerUrl || sig.playerUrl || playerUrl,
           nChallenges,
           sigChallenges,
         );
@@ -3503,7 +3640,7 @@ async function pageScrapeWithCipher(
         };
 
         const nm = /[?&]n=([^&]+)/i.exec(fullUrl);
-        if (nm && sig?.nSigCode) {
+        if (nm) {
           nEntries.push({
             idx: formats.length,
             raw: nm[1],
@@ -3514,20 +3651,28 @@ async function pageScrapeWithCipher(
       }
     }
 
-    if (nEntries.length && sig?.nSigCode) {
-      const results = await sandboxEval(
-        sig.nSigCode,
-        nEntries.map((e) => e.decoded),
-      );
-      for (let i = 0; i < nEntries.length; i++) {
-        const e = nEntries[i];
-        const r = results[i];
-        if (r && typeof r === "string" && r !== e.decoded) {
-          formats[e.idx].url = formats[e.idx].url.replace(
-            "n=" + e.raw,
-            "n=" + encodeURIComponent(r),
-          );
+    // Regex-cipher fallback N-sig: use solver if available
+    if (nEntries.length && sig?.playerSource) {
+      try {
+        const nSolverResult = await sandboxSolvePlayer(
+          sig.playerSource,
+          sig.solverPlayerUrl || sig.playerUrl || playerUrl,
+          nEntries.map((e) => e.decoded),
+          [],
+        );
+        if (nSolverResult?.nResults) {
+          for (const e of nEntries) {
+            const r = nSolverResult.nResults[e.decoded];
+            if (r && typeof r === "string" && r !== e.decoded) {
+              formats[e.idx].url = formats[e.idx].url.replace(
+                "n=" + e.raw,
+                "n=" + encodeURIComponent(r),
+              );
+            }
+          }
         }
+      } catch (nErr) {
+        console.warn("[BG] Tier 2 fallback N-sig solver failed:", nErr.message);
       }
     }
   }
@@ -3550,8 +3695,36 @@ async function loadSignatureData(playerUrl) {
     if (Date.now() < c.expiresAt) return c;
   }
 
+  // defaults to the 'tv' player variant (ES5) because the AST solver
+  // can't reliably handle ES6 players (arrow functions, const/let, etc.).
+  // We do the same: extract the player hash from the URL and construct the
+  // tv-player-ias variant URL. This variant has identical cipher/nsig logic
+  // but in ES5 format that the solver can parse.
+  const TV_VARIANT_PATH = "tv-player-ias.vflset/tv-player-ias.js";
+  // yt-dlp pins to this player hash — solver v0.5.0 is confirmed working with it
+  const KNOWN_GOOD_SOLVER_HASH = "9f4cc5e4";
+  const playerHashMatch = playerUrl.match(/\/s\/player\/([a-fA-F0-9]{8,})\//);
+  const currentHash = playerHashMatch ? playerHashMatch[1] : null;
+  // Prefer known-good hash for solver; fall back to current hash's tv variant
+  const tvPlayerUrl = `https://www.youtube.com/s/player/${KNOWN_GOOD_SOLVER_HASH}/${TV_VARIANT_PATH}`;
+  const tvPlayerUrlFallback =
+    currentHash && currentHash !== KNOWN_GOOD_SOLVER_HASH
+      ? `https://www.youtube.com/s/player/${currentHash}/${TV_VARIANT_PATH}`
+      : null;
+
   console.log("[BG] Loading player JS:", playerUrl);
+  console.log(
+    "[BG] Solver player (known-good hash",
+    KNOWN_GOOD_SOLVER_HASH + "):",
+    tvPlayerUrl,
+  );
+  if (tvPlayerUrlFallback) {
+    console.log("[BG] Solver fallback (current hash tv):", tvPlayerUrlFallback);
+  }
+
   let js = null;
+  let solverJs = null; // The player source used for the AST solver (may be tv variant)
+  let solverPlayerUrl = playerUrl;
   let lastFetchErr = null;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -3582,6 +3755,52 @@ async function loadSignatureData(playerUrl) {
       lastFetchErr?.message,
     );
     throw lastFetchErr || new Error("Player.js load failed");
+  }
+
+  // Fetch known-good solver player (tv variant of pinned hash)
+  solverJs = js;
+  if (tvPlayerUrl !== playerUrl) {
+    let tvFetched = false;
+    try {
+      const tvResp = await fetch(tvPlayerUrl, { cache: "default" });
+      if (tvResp.ok) {
+        const tvJs = await tvResp.text();
+        if (tvJs && tvJs.length > 1000) {
+          solverJs = tvJs;
+          solverPlayerUrl = tvPlayerUrl;
+          tvFetched = true;
+          console.log(
+            "[BG] Using known-good solver player (",
+            tvJs.length,
+            "bytes, hash:",
+            KNOWN_GOOD_SOLVER_HASH,
+            ")",
+          );
+        }
+      }
+    } catch (e) {
+      console.warn("[BG] Known-good solver player fetch failed:", e.message);
+    }
+    // Fallback: try current player's tv variant
+    if (!tvFetched && tvPlayerUrlFallback) {
+      try {
+        const fbResp = await fetch(tvPlayerUrlFallback, { cache: "default" });
+        if (fbResp.ok) {
+          const fbJs = await fbResp.text();
+          if (fbJs && fbJs.length > 1000) {
+            solverJs = fbJs;
+            solverPlayerUrl = tvPlayerUrlFallback;
+            console.log(
+              "[BG] Using current-hash tv variant as fallback (",
+              fbJs.length,
+              "bytes)",
+            );
+          }
+        }
+      } catch (e) {
+        console.warn("[BG] Fallback tv variant fetch also failed:", e.message);
+      }
+    }
   }
 
   // Also try to fetch the YouTube page HTML to find cipher helper
@@ -3618,67 +3837,85 @@ async function loadSignatureData(playerUrl) {
     );
   }
 
-  const actionList = extractCipherActions(js, pageHtml);
-  const nSigCode = extractNSigCode(js);
-
-  // yt-dlp style: bundle N-sig with all its dependencies for robust sandbox eval
-  let nSigBundled = null;
-  if (nSigCode) {
-    try {
-      nSigBundled = bundleNSigWithDeps(js);
-      if (nSigBundled && nSigBundled !== nSigCode) {
-        console.log(
-          "[BG] yt-dlp bundled N-sig available (" +
-            nSigBundled.length +
-            "ch vs " +
-            nSigCode.length +
-            "ch plain)",
-        );
-      } else {
-        nSigBundled = null; // No benefit, skip
-      }
-    } catch (e) {
-      console.warn("[BG] yt-dlp N-sig bundling failed:", e.message);
+  // Try cipher extraction on solver player first (for STS consistency), then original
+  let actionList = null;
+  if (solverJs !== js) {
+    actionList = extractCipherActions(solverJs, pageHtml);
+    if (actionList) {
+      console.log("[BG] Cipher actions extracted from solver player");
     }
+  }
+  if (!actionList) {
+    actionList = extractCipherActions(js, pageHtml);
   }
 
   let cipherCode = null;
   let cipherArgName = null;
   if (!actionList) {
-    const extracted = extractRawCipherCode(js, pageHtml);
-    if (extracted) {
-      cipherCode = extracted.code;
-      cipherArgName = extracted.argName;
-      console.log(
-        "[BG] Extracted raw cipher code (" +
-          cipherCode.length +
-          "ch) for sandbox eval",
-      );
+    if (solverJs !== js) {
+      const extractedSolver = extractRawCipherCode(solverJs, pageHtml);
+      if (extractedSolver) {
+        cipherCode = extractedSolver.code;
+        cipherArgName = extractedSolver.argName;
+        console.log(
+          "[BG] Extracted raw cipher code from solver player (" +
+            cipherCode.length +
+            "ch)",
+        );
+      }
+    }
+    if (!cipherCode) {
+      const extracted = extractRawCipherCode(js, pageHtml);
+      if (extracted) {
+        cipherCode = extracted.code;
+        cipherArgName = extracted.argName;
+        console.log(
+          "[BG] Extracted raw cipher code from original player (" +
+            cipherCode.length +
+            "ch)",
+        );
+      }
     }
   }
 
+  // Extract STS from solver player first (for consistency with its cipher)
   let sts = null;
-  for (const re of [
-    /,sts:(\d+)/,
-    /signatureTimestamp[=:](\d+)/,
-    /"signatureTimestamp":(\d+)/,
-  ]) {
-    const m = js.match(re);
-    if (m) {
-      sts = parseInt(m[1]);
-      break;
+  if (solverJs !== js) {
+    for (const re of [
+      /,sts:(\d+)/,
+      /signatureTimestamp[=:](\d+)/,
+      /"signatureTimestamp":(\d+)/,
+    ]) {
+      const m = solverJs.match(re);
+      if (m) {
+        sts = parseInt(m[1]);
+        console.log("[BG] STS from solver player:", sts);
+        break;
+      }
+    }
+  }
+  if (!sts) {
+    for (const re of [
+      /,sts:(\d+)/,
+      /signatureTimestamp[=:](\d+)/,
+      /"signatureTimestamp":(\d+)/,
+    ]) {
+      const m = js.match(re);
+      if (m) {
+        sts = parseInt(m[1]);
+        break;
+      }
     }
   }
 
   const data = {
     actionList,
-    nSigCode,
-    nSigBundled,
     cipherCode,
     cipherArgName,
     sts,
     playerUrl,
-    playerSource: js,
+    playerSource: solverJs,
+    solverPlayerUrl,
     expiresAt: Date.now() + 43200000,
   };
   sigCache.set(playerUrl, data);
@@ -3689,13 +3926,11 @@ async function loadSignatureData(playerUrl) {
       : cipherCode
         ? "raw code"
         : "none",
-    "| N-sig:",
-    nSigCode ? nSigCode.length + "ch" : "none",
-    nSigBundled ? "(bundled: " + nSigBundled.length + "ch)" : "",
+    "| Solver source:",
+    solverJs === js ? "original" : "pinned solver",
+    "(" + solverJs.length + "ch)",
     "| STS:",
     sts,
-    "| PlayerSource:",
-    js ? js.length + "ch" : "none",
   );
   return data;
 }
@@ -3797,13 +4032,16 @@ function extractDispatchCipherActions(
   pageHtml,
 ) {
   // Step 1: Find lookup array: var NAME = "...".split("DELIM") with 50+ elements
+  // Support both single and double-quoted strings
   const lookupArrayRe =
-    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/g;
+    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/g;
   let lookupArray = null,
     lookupName = null,
     lm;
   while ((lm = lookupArrayRe.exec(js)) !== null) {
-    const parts = lm[2].split(lm[3]);
+    const lookupStr = lm[2] || lm[3];
+    const lookupDelim = lm[4] || lm[5];
+    const parts = lookupStr.split(lookupDelim);
     if (parts.length > 50) {
       lookupArray = parts;
       lookupName = lm[1];
@@ -3939,13 +4177,16 @@ function extractDispatchCipherActions(
 }
 
 function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
-  // Find lookup array raw definition
+  // Find lookup array raw definition (support both quote types)
   const lookupMatch = js.match(
-    /var\s+([a-zA-Z0-9$_]+)\s*=\s*("([^"]{200,})")\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/,
+    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*((?:"([^"]{200,})"|'([^']{200,})'))\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/,
   );
   if (!lookupMatch) return null;
   const lookupName = lookupMatch[1];
-  const parts = lookupMatch[3].split(lookupMatch[4]);
+  const lookupRawExpr = lookupMatch[2]; // the full quoted string expression
+  const lookupStr = lookupMatch[3] || lookupMatch[4];
+  const lookupDelim = lookupMatch[5] || lookupMatch[6];
+  const parts = lookupStr.split(lookupDelim);
   if (parts.length < 50) return null;
 
   // Find cipher function definition (disambiguate short names)
@@ -4002,14 +4243,18 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
 
   // Build self-contained code with a unique arg name
   const argName = "_sig_";
+  // Use the correct quote style for the split delimiter
+  const delimQuote = lookupRawExpr.startsWith("'") ? "'" : '"';
   const code =
     "var " +
     lookupName +
     "=" +
-    lookupMatch[2] +
-    '.split("' +
-    lookupMatch[4] +
-    '");\n' +
+    lookupRawExpr +
+    ".split(" +
+    delimQuote +
+    lookupDelim +
+    delimQuote +
+    ");\n" +
     "var " +
     helperName +
     "=" +
@@ -4036,9 +4281,39 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
 
 function extractCipherActions(js, pageHtml) {
   // === Try new-style dispatch cipher first (2025+) ===
-  const dispatchCallMatch = js.match(
+  // Pattern 1: literal property access — FUNC(N, decodeURIComponent(x.s))
+  let dispatchCallMatch = js.match(
     /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
   );
+
+  // Pattern 2: lookup-array property access — FUNC(N, decodeURIComponent(x[LOOKUP[S_IDX]]))
+  // YouTube 2025+ may use x[J[49]] instead of x.s where J[49]="s"
+  if (!dispatchCallMatch) {
+    const lookupRe =
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/;
+    const lookupM = js.match(lookupRe);
+    if (lookupM) {
+      const lookupStr = lookupM[2] || lookupM[3];
+      const lookupDelim = lookupM[4] || lookupM[5];
+      const arr = lookupStr.split(lookupDelim);
+      const sIdx = arr.indexOf("s");
+      if (sIdx !== -1) {
+        // Search for: FUNC(N, decodeURIComponent(x[LOOKUP[sIdx]]))
+        const le = escRe(lookupM[1]);
+        const re = new RegExp(
+          `=\\s*([a-zA-Z0-9$_]+)\\s*\\(\\s*(\\d+)\\s*,\\s*decodeURIComponent\\s*\\(\\s*\\w+\\s*\\[\\s*${le}\\s*\\[\\s*${sIdx}\\s*\\]\\s*\\]\\s*\\)\\s*\\)`,
+        );
+        dispatchCallMatch = js.match(re);
+        if (dispatchCallMatch) {
+          console.log(
+            "[BG] Cipher dispatch found via lookup-array s-index:",
+            sIdx,
+          );
+        }
+      }
+    }
+  }
+
   if (dispatchCallMatch) {
     const actions = extractDispatchCipherActions(
       js,
@@ -4167,9 +4442,31 @@ function extractCipherActions(js, pageHtml) {
 
 function extractRawCipherCode(js, pageHtml) {
   // === Try new-style dispatch cipher first (2025+) ===
-  const dispatchCallMatch = js.match(
+  // Pattern 1: literal property access — FUNC(N, decodeURIComponent(x.s))
+  let dispatchCallMatch = js.match(
     /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
   );
+
+  // Pattern 2: lookup-array property access — FUNC(N, decodeURIComponent(x[LOOKUP[S_IDX]]))
+  if (!dispatchCallMatch) {
+    const lookupRe =
+      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/;
+    const lookupM = js.match(lookupRe);
+    if (lookupM) {
+      const lookupStr = lookupM[2] || lookupM[3];
+      const lookupDelim = lookupM[4] || lookupM[5];
+      const arr = lookupStr.split(lookupDelim);
+      const sIdx = arr.indexOf("s");
+      if (sIdx !== -1) {
+        const le = escRe(lookupM[1]);
+        const re = new RegExp(
+          `=\\s*([a-zA-Z0-9$_]+)\\s*\\(\\s*(\\d+)\\s*,\\s*decodeURIComponent\\s*\\(\\s*\\w+\\s*\\[\\s*${le}\\s*\\[\\s*${sIdx}\\s*\\]\\s*\\]\\s*\\)\\s*\\)`,
+        );
+        dispatchCallMatch = js.match(re);
+      }
+    }
+  }
+
   if (dispatchCallMatch) {
     const raw = extractDispatchCipherRaw(
       js,
@@ -4297,759 +4594,6 @@ function applyCipher(actions, sig) {
     }
   }
   return a.join("");
-}
-
-function extractNSigCode(js) {
-  let fn = null,
-    arrIdx = null;
-
-  // === 2025+ patterns: lookup-array-based references ===
-  // YouTube now uses l[33]="n", l[42]="get", l[20]="set" instead of literal strings
-  // Pattern: WRAPPER[0](x), VAR[l[SET_IDX]](l[N_IDX], x) or VAR.set("n", x)
-  const lookupArrayRe =
-    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/;
-  const lookupMatch = js.match(lookupArrayRe);
-  if (lookupMatch) {
-    const lookupArray = lookupMatch[2].split(lookupMatch[3]);
-    const nIdx = lookupArray.indexOf("n");
-    const setIdx = lookupArray.indexOf("set");
-
-    if (nIdx !== -1 && setIdx !== -1) {
-      // Search for: WRAPPER[0](x) near l[nIdx] context
-      const lookupName = lookupMatch[1];
-      const wrapperRe = new RegExp(
-        "([a-zA-Z0-9$_]+)\\[0\\]\\s*\\(\\s*(\\w+)\\s*\\)",
-        "g",
-      );
-      let wm;
-      while ((wm = wrapperRe.exec(js)) !== null) {
-        const ctx = js.substring(
-          Math.max(0, wm.index - 100),
-          Math.min(js.length, wm.index + 200),
-        );
-        if (
-          ctx.indexOf(lookupName + "[" + nIdx + "]") !== -1 ||
-          ctx.indexOf('"n"') !== -1
-        ) {
-          fn = wm[1];
-          arrIdx = 0;
-          console.log(
-            "[BG] N-sig wrapper found via lookup pattern:",
-            fn,
-            "[0]",
-          );
-          break;
-        }
-      }
-    }
-  }
-
-  // === Legacy patterns (pre-2025) ===
-  if (!fn) {
-    const nPatterns = [
-      /\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\([a-zA-Z0-9]\)/,
-
-      /[=(,&|]([a-zA-Z0-9$]+)\(\w+\),\w+\.set\("n",/,
-
-      /[=(,&|]([a-zA-Z0-9$]+)\[(\d+)\]\(\w+\),\w+\.set\("n",/,
-
-      /\.set\("n",\s*([a-zA-Z0-9$]+)\(\s*\w+\s*\)/,
-
-      // Only match decodeURIComponent patterns when near .get("n") context
-      /\.get\("n"\).*?&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/s,
-
-      /\w+=\w+\.get\("n"\)[^}]*\w+&&\(\w+=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(\w+\)/,
-
-      // Newer patterns (2025+)
-      /\.get\("n"\)\s*\)\s*[;,].*?\.set\("n"\s*,\s*([a-zA-Z0-9$]+)\s*\(/s,
-
-      /\.get\("n"\)\)&&.*?[=(,]([a-zA-Z0-9$]+)(?:\[(\d+)\])?\(/,
-
-      /([a-zA-Z0-9$]+)\(\w+\.get\("n"\)\)[,;].*?\.set\("n"/,
-
-      // URL path /n/ replacement pattern (anchored to .set("n") context)
-      /\.set\("n"[^)]*\).*?\/n\/[^/]+.*?([a-zA-Z0-9$]+)\s*\(\s*\w+\s*\)/s,
-    ];
-
-    for (let idx = 0; idx < nPatterns.length; idx++) {
-      const m = js.match(nPatterns[idx]);
-      if (m) {
-        fn = m[1];
-        arrIdx = m[2] != null ? parseInt(m[2]) : null;
-        console.log(
-          "[BG] N-sig name found with pattern",
-          idx,
-          ":",
-          fn,
-          "arrIdx:",
-          arrIdx,
-        );
-        break;
-      }
-    }
-  }
-
-  if (!fn) {
-    const arrWrapRe = /;\s*([a-zA-Z0-9$]+)\s*=\s*\[([a-zA-Z0-9$]+)\]\s*[;,]/g;
-    let awm;
-    while ((awm = arrWrapRe.exec(js)) !== null) {
-      const candidateArr = awm[1];
-      const candidateFunc = awm[2];
-      if (
-        js.includes(candidateArr + "[0]") ||
-        js.includes(candidateArr + "(")
-      ) {
-        // Verify the candidate is actually a function
-        const funcDefRe = new RegExp(
-          "(?:function\\s+" +
-            escRe(candidateFunc) +
-            "|" +
-            escRe(candidateFunc) +
-            "\\s*=\\s*function|" +
-            escRe(candidateFunc) +
-            "\\s*=\\s*\\(?\\w+\\)?\\s*=>)\\s*[\\({]",
-        );
-        const funcDefMatch = funcDefRe.exec(js);
-        if (funcDefMatch) {
-          // Verify the function body is large enough and has N-sig structure
-          const braceIdx = js.indexOf(
-            "{",
-            funcDefMatch.index + funcDefMatch[0].length - 1,
-          );
-          if (braceIdx !== -1) {
-            const body = extractBraceBlock(js, braceIdx);
-            if (
-              body &&
-              body.length > 500 &&
-              /try\s*\{/.test(body) &&
-              /catch\s*\(/.test(body)
-            ) {
-              fn = candidateFunc;
-              arrIdx = null;
-              console.log(
-                "[BG] N-sig found via array-wrap pattern:",
-                fn,
-                "(",
-                body.length,
-                "chars)",
-              );
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (!fn) {
-    const structPatterns = [
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{/gm,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*\((\w+)\)\s*=>\s*\{/gm,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*(\w+)\s*=>\s*\{/gm,
-    ];
-    outer: for (const structRe of structPatterns) {
-      let sm;
-      while ((sm = structRe.exec(js)) !== null) {
-        const braceIdx = sm.index + sm[0].lastIndexOf("{");
-        const body = extractBraceBlock(js, braceIdx);
-        if (!body || body.length < 50 || body.length > 30000) continue;
-        if (
-          /try\s*\{/.test(body) &&
-          /catch\s*\(/.test(body) &&
-          /\[\s*\d+\s*\]/.test(body)
-        ) {
-          fn = sm[1];
-          arrIdx = null;
-          console.log("[BG] N-sig found by structure:", fn);
-          break outer;
-        }
-      }
-    }
-  }
-
-  if (!fn) return null;
-
-  if (arrIdx !== null) {
-    const am = js.match(
-      new RegExp(`[,;\\n]\\s*${escRe(fn)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`),
-    );
-    if (am) {
-      const items = am[1].split(",");
-      if (items[arrIdx]) fn = items[arrIdx].trim();
-    }
-  }
-
-  const esc = escRe(fn);
-  const defPatterns = [
-    // Traditional function expression: H = function(a) {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
-      "gm",
-    ),
-    // Function declaration: function H(a) {
-    new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
-    // var/let/const function expression: var H = function(a) {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
-      "g",
-    ),
-    // Arrow function with parens: H = (a) => {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
-      "gm",
-    ),
-    // Arrow function single param: H = a => {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=>\\s*\\{`,
-      "gm",
-    ),
-    // var/let/const with arrow: var H = (a) => {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
-      "g",
-    ),
-    // var/let/const with arrow single param: var H = a => {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\\s*=>\\s*\\{`,
-      "g",
-    ),
-  ];
-
-  for (const re of defPatterns) {
-    let sm;
-    while ((sm = re.exec(js)) !== null) {
-      const braceIdx = sm.index + sm[0].lastIndexOf("{");
-      const body = extractBraceBlock(js, braceIdx);
-      if (!body) continue;
-
-      // N-sig functions are large (typically 500+ chars) and contain
-      // try/catch blocks and array indexing — skip tiny matches
-      if (body.length < 200) continue;
-      if (
-        !/try\s*\{/.test(body) &&
-        !/\[\s*\d+\s*\]/.test(body) &&
-        body.length < 2000
-      )
-        continue;
-
-      let code = `function(${sm[1]})${body}`;
-
-      const arg0 = sm[1].split(",")[0].trim();
-      code = code.replace(
-        new RegExp(
-          `if\\s*\\([^)]*typeof\\s+${escRe(arg0)}[^)]*\\)\\s*return\\s+${escRe(arg0)}\\s*;?`,
-        ),
-        ";",
-      );
-
-      console.log(
-        "[BG] N-sig code extracted:",
-        code.length,
-        "chars from function",
-        fn,
-      );
-      return code;
-    }
-  }
-
-  console.warn(
-    "[BG] N-sig function definition not found or too small for:",
-    fn,
-  );
-  return null;
-}
-
-// ============================================================
-// yt-dlp-style N-sig dependency bundler
-// ============================================================
-// When YouTube's N-sig function references helper functions and variables
-// defined elsewhere in player.js (inside the IIFE), sandbox eval fails with
-// "X is not defined" errors. This function extracts the N-sig function AND
-// all its dependencies (helper functions, internal lookup arrays, constants)
-// into a single self-contained code string that the sandbox can execute.
-//
-// This mirrors yt-dlp's _extract_n_function_code() approach, which:
-// 1. Finds the N-sig function
-// 2. Identifies free variables (references to IIFE-scoped identifiers)
-// 3. Recursively extracts their definitions from player.js
-// 4. Bundles everything into a standalone script
-// ============================================================
-
-function bundleNSigWithDeps(js) {
-  // Step 1: Find N-sig function name the same way extractNSigCode does
-  const nSigCode = extractNSigCode(js);
-  if (!nSigCode) return null;
-
-  // Step 2: Find the N-sig function name again (we need it for the dependency scan)
-  let nSigFuncName = null;
-  const lookupArrayRe =
-    /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*"([^"]{200,})"\s*\.\s*split\s*\(\s*"([^"]+)"\s*\)/;
-  const lookupMatch = js.match(lookupArrayRe);
-
-  // Try to find the function name from the lookup-based pattern first
-  if (lookupMatch) {
-    const lookupArray = lookupMatch[2].split(lookupMatch[3]);
-    const nIdx = lookupArray.indexOf("n");
-    const lookupName = lookupMatch[1];
-    if (nIdx !== -1) {
-      const wrapperRe = new RegExp(
-        "([a-zA-Z0-9$_]+)\\[0\\]\\s*\\(\\s*(\\w+)\\s*\\)",
-        "g",
-      );
-      let wm;
-      while ((wm = wrapperRe.exec(js)) !== null) {
-        const ctx = js.substring(
-          Math.max(0, wm.index - 100),
-          Math.min(js.length, wm.index + 200),
-        );
-        if (
-          ctx.indexOf(lookupName + "[" + nIdx + "]") !== -1 ||
-          ctx.indexOf('"n"') !== -1
-        ) {
-          // Found wrapper name, resolve to actual function name
-          const wrapperName = wm[1];
-          const arrMatch = js.match(
-            new RegExp(
-              `[,;\\n]\\s*${escRe(wrapperName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
-            ),
-          );
-          if (arrMatch) {
-            nSigFuncName = arrMatch[1].split(",")[0].trim();
-          } else {
-            nSigFuncName = wrapperName;
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  // Fallback: try to find it from the nSigCode by matching function definitions
-  if (!nSigFuncName) {
-    // The nSigCode string is "function(a){...}" — find which named function matches
-    const nPatterns = [
-      /\.get\("n"\)\)&&\(b=([a-zA-Z0-9$]+)(?:\[(\d+)\])?\([a-zA-Z0-9]\)/,
-      /[=(,&|]([a-zA-Z0-9$]+)\(\w+\),\w+\.set\("n",/,
-      /\.set\("n",\s*([a-zA-Z0-9$]+)\(\s*\w+\s*\)/,
-    ];
-    for (const re of nPatterns) {
-      const m = js.match(re);
-      if (m) {
-        nSigFuncName = m[1];
-        // Resolve array wrapper
-        if (m[2] != null) {
-          const arrMatch = js.match(
-            new RegExp(
-              `[,;\\n]\\s*${escRe(nSigFuncName)}\\s*=\\s*\\[([\\w$,\\s]+)\\]`,
-            ),
-          );
-          if (arrMatch) {
-            const items = arrMatch[1].split(",");
-            nSigFuncName = items[parseInt(m[2])]?.trim() || nSigFuncName;
-          }
-        }
-        break;
-      }
-    }
-  }
-
-  if (!nSigFuncName) {
-    console.warn("[BG] yt-dlp bundler: Could not identify N-sig function name");
-    return nSigCode; // Fall back to unbundled code
-  }
-
-  console.log(
-    "[BG] yt-dlp bundler: N-sig function is",
-    nSigFuncName,
-    "— scanning dependencies...",
-  );
-
-  // Step 3: Find the N-sig function's definition position and body in player.js
-  const funcBodyResult = findFunctionDefinition(js, nSigFuncName);
-  if (!funcBodyResult) {
-    console.warn(
-      "[BG] yt-dlp bundler: Could not locate",
-      nSigFuncName,
-      "definition in player.js",
-    );
-    return nSigCode;
-  }
-
-  // Step 4: Collect all dependencies recursively
-  // Build a set of JS builtins and known names to skip
-  const BUILTINS = new Set([
-    "undefined",
-    "null",
-    "true",
-    "false",
-    "NaN",
-    "Infinity",
-    "Math",
-    "String",
-    "Array",
-    "Object",
-    "Number",
-    "Boolean",
-    "RegExp",
-    "Date",
-    "JSON",
-    "parseInt",
-    "parseFloat",
-    "isNaN",
-    "isFinite",
-    "encodeURIComponent",
-    "decodeURIComponent",
-    "atob",
-    "btoa",
-    "console",
-    "window",
-    "self",
-    "globalThis",
-    "this",
-    "setTimeout",
-    "clearTimeout",
-    "setInterval",
-    "clearInterval",
-    "Promise",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "SyntaxError",
-    "Map",
-    "Set",
-    "WeakMap",
-    "WeakSet",
-    "Symbol",
-    "Proxy",
-    "Reflect",
-    "arguments",
-    "eval",
-    "Function",
-    "Uint8Array",
-    "Int32Array",
-    "Float64Array",
-    "ArrayBuffer",
-    "DataView",
-    "TextEncoder",
-    "TextDecoder",
-    // JS keywords
-    "var",
-    "let",
-    "const",
-    "function",
-    "return",
-    "if",
-    "else",
-    "for",
-    "while",
-    "do",
-    "switch",
-    "case",
-    "break",
-    "continue",
-    "try",
-    "catch",
-    "finally",
-    "throw",
-    "new",
-    "delete",
-    "typeof",
-    "instanceof",
-    "in",
-    "of",
-    "void",
-    "with",
-    "yield",
-    "async",
-    "await",
-    "class",
-    "extends",
-    "super",
-    "import",
-    "export",
-    "default",
-    "from",
-    "as",
-  ]);
-
-  const extracted = new Map(); // name → { code, startIdx, endIdx }
-  const visited = new Set();
-  const extractionOrder = [];
-
-  // Recursive dependency extraction
-  function extractDeps(funcName, depth) {
-    if (depth > 15) return; // Prevent infinite recursion
-    if (visited.has(funcName)) return;
-    visited.add(funcName);
-
-    const def = findFunctionDefinition(js, funcName);
-    if (!def) {
-      // Try to find as a variable/object definition instead
-      const varDef = findVarDefinition(js, funcName);
-      if (varDef) {
-        extracted.set(funcName, varDef);
-        extractionOrder.push(funcName);
-        // Scan variable value for further dependencies
-        scanAndExtractDeps(varDef.code, funcName, depth + 1);
-      }
-      return;
-    }
-
-    extracted.set(funcName, def);
-    extractionOrder.push(funcName);
-
-    // Scan function body for references to other functions/variables
-    scanAndExtractDeps(def.body, funcName, depth + 1);
-  }
-
-  function scanAndExtractDeps(code, parentName, depth) {
-    // Find all identifier references that could be IIFE-scoped dependencies
-    // Pattern: identifiers used as function calls or property accesses
-    const identRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]*)\s*(?:\(|\[|\.\w)/g;
-    let im;
-    const candidates = new Set();
-    while ((im = identRe.exec(code)) !== null) {
-      const name = im[1];
-      if (BUILTINS.has(name)) continue;
-      if (name === parentName) continue; // self-reference
-      if (name.length === 1 && /[a-z]/.test(name)) continue; // single lowercase = likely param
-      candidates.add(name);
-    }
-
-    // Also find plain identifier assignments/references
-    const assignRe = /\b([a-zA-Z$_][a-zA-Z0-9$_]{1,})\b/g;
-    let am;
-    while ((am = assignRe.exec(code)) !== null) {
-      const name = am[1];
-      if (BUILTINS.has(name)) continue;
-      if (name === parentName) continue;
-      // Only consider names that appear as function calls or assignments
-      if (
-        code.includes(name + "(") ||
-        code.includes(name + "[") ||
-        code.includes(name + ".")
-      ) {
-        candidates.add(name);
-      }
-    }
-
-    for (const candidate of candidates) {
-      if (!visited.has(candidate)) {
-        extractDeps(candidate, depth);
-      }
-    }
-  }
-
-  // Start recursive extraction from the N-sig function
-  extractDeps(nSigFuncName, 0);
-
-  if (extracted.size <= 1) {
-    // Only the function itself, no deps found — bundle won't help
-    console.log(
-      "[BG] yt-dlp bundler: No additional dependencies found — using plain extraction",
-    );
-    return nSigCode;
-  }
-
-  // Step 5: Build the bundled self-contained code
-  const depDeclarations = [];
-  for (const name of extractionOrder) {
-    if (name === nSigFuncName) continue; // Main function goes last
-    const dep = extracted.get(name);
-    if (dep) depDeclarations.push(dep.code);
-  }
-
-  // The main N-sig function, wrapped so it can be called standalone
-  const mainDef = extracted.get(nSigFuncName);
-  const mainFuncCode = mainDef
-    ? mainDef.code
-    : `var ${nSigFuncName} = ${nSigCode};`;
-
-  // Build the bundle:
-  // (function(){
-  //   var dep1 = ...;
-  //   var dep2 = function(){...};
-  //   var nSigFunc = function(a){...};
-  //   return nSigFunc;
-  // })()
-  const bundled =
-    "(function(){\n" +
-    depDeclarations.join("\n") +
-    "\n" +
-    mainFuncCode +
-    "\n" +
-    "return " +
-    nSigFuncName +
-    ";\n" +
-    "})()";
-
-  console.log(
-    "[BG] yt-dlp bundler: Bundled N-sig with",
-    extracted.size - 1,
-    "dependencies (",
-    bundled.length,
-    "chars)",
-  );
-
-  return bundled;
-}
-
-// Find a function definition in player.js by name.
-// Returns { code, body, startIdx, endIdx } or null.
-function findFunctionDefinition(js, name) {
-  const esc = escRe(name);
-  const patterns = [
-    // var X = function(a) {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
-      "g",
-    ),
-    // X = function(a) {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*function\\s*\\(([^)]*)\\)\\s*\\{`,
-      "gm",
-    ),
-    // function X(a) {
-    new RegExp(`function\\s+${esc}\\s*\\(([^)]*)\\)\\s*\\{`, "g"),
-    // var X = (a) => {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
-      "g",
-    ),
-    // X = (a) => {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*\\(([^)]*)\\)\\s*=>\\s*\\{`,
-      "gm",
-    ),
-    // var X = a => {
-    new RegExp(
-      `(?:var|let|const)\\s+${esc}\\s*=\\s*([a-zA-Z_$]\\w*)\\s*=>\\s*\\{`,
-      "g",
-    ),
-    // X = a => {
-    new RegExp(
-      `(?:^|[;,\\n])\\s*${esc}\\s*=\\s*([a-zA-Z_$]\\w*)\\s*=>\\s*\\{`,
-      "gm",
-    ),
-  ];
-
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(js)) !== null) {
-      const braceIdx = m.index + m[0].lastIndexOf("{");
-      const body = extractBraceBlock(js, braceIdx);
-      if (!body) continue;
-      // Skip very tiny matches (likely false positives)
-      if (body.length < 10) continue;
-
-      const params = m[1];
-      const fullCode = `var ${name} = function(${params})${body};`;
-      return {
-        code: fullCode,
-        body,
-        params,
-        startIdx: m.index,
-        endIdx: braceIdx + body.length,
-      };
-    }
-  }
-  return null;
-}
-
-// Find a variable/constant/object definition in player.js by name.
-// Returns { code } or null.
-function findVarDefinition(js, name) {
-  const esc = escRe(name);
-
-  // Pattern 1: Object literal — var X = { ... }
-  const objRe = new RegExp(
-    `(?:var|let|const|[;,\\n])\\s*${esc}\\s*=\\s*\\{`,
-    "gm",
-  );
-  let m = objRe.exec(js);
-  if (m) {
-    const braceIdx = m.index + m[0].lastIndexOf("{");
-    const block = extractBraceBlock(js, braceIdx);
-    if (block && block.length > 2) {
-      return { code: `var ${name} = ${block};` };
-    }
-  }
-
-  // Pattern 2: Array literal — var X = [ ... ]
-  const arrRe = new RegExp(
-    `(?:var|let|const|[;,\\n])\\s*${esc}\\s*=\\s*\\[`,
-    "gm",
-  );
-  m = arrRe.exec(js);
-  if (m) {
-    const bracketIdx = m.index + m[0].lastIndexOf("[");
-    // Extract bracket block (similar to brace block but for [])
-    const block = extractBracketBlock(js, bracketIdx);
-    if (block) {
-      return { code: `var ${name} = ${block};` };
-    }
-  }
-
-  // Pattern 3: Simple value — var X = EXPR;
-  const valRe = new RegExp(
-    `(?:var|let|const)\\s+${esc}\\s*=\\s*([^;{\\n]+);`,
-    "gm",
-  );
-  m = valRe.exec(js);
-  if (m) {
-    const value = m[1].trim();
-    // Skip if value is too long (likely a false match)
-    if (value.length < 500) {
-      return { code: `var ${name} = ${value};` };
-    }
-  }
-
-  // Pattern 4: Comma-separated in var statement — var ..., X = EXPR, ...
-  const commaRe = new RegExp(`[,]\\s*${esc}\\s*=\\s*([^,;{\\n]+)[,;]`, "gm");
-  m = commaRe.exec(js);
-  if (m) {
-    const value = m[1].trim();
-    if (value.length < 500) {
-      return { code: `var ${name} = ${value};` };
-    }
-  }
-
-  return null;
-}
-
-// Extract a balanced bracket block [...] from code starting at pos
-function extractBracketBlock(code, pos) {
-  if (code[pos] !== "[") return null;
-  let d = 0,
-    inStr = false,
-    sc = "",
-    esc = false;
-  for (let i = pos; i < code.length && i < pos + 100000; i++) {
-    const c = code[i];
-    if (esc) {
-      esc = false;
-      continue;
-    }
-    if (c === "\\") {
-      esc = true;
-      continue;
-    }
-    if (inStr) {
-      if (c === sc) inStr = false;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      inStr = true;
-      sc = c;
-      continue;
-    }
-    if (c === "[") d++;
-    if (c === "]") {
-      d--;
-      if (d === 0) return code.substring(pos, i + 1);
-    }
-  }
-  return null;
 }
 
 function extractBraceBlock(code, pos) {

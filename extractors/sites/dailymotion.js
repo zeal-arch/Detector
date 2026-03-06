@@ -19,7 +19,6 @@
   }
 
   function extractVideoId(url) {
-
     const m = url.match(
       /(?:dailymotion\.com\/(?:embed\/)?video\/|dai\.ly\/)([a-zA-Z0-9]+)/,
     );
@@ -27,7 +26,6 @@
   }
 
   function parseResolution(url) {
-
     const m = url.match(/\/H264-(\d+)x(\d+)(?:-(\d+))?/);
     if (m) {
       return {
@@ -110,7 +108,6 @@
       }
 
       if (autoHlsUrl) {
-
         try {
           const hlsResp = await fetch(autoHlsUrl);
           if (hlsResp.ok) {
@@ -247,7 +244,6 @@
     processedVideos.add(videoId);
 
     try {
-
       const metaUrl = `https://www.dailymotion.com/player/metadata/video/${videoId}?app=com.dailymotion.neon`;
       const resp = await fetch(metaUrl, {
         credentials: "include",
@@ -291,7 +287,6 @@
     processedVideos.add(videoId + "_page");
 
     try {
-
       if (window.__PLAYER_CONFIG__) {
         const config = window.__PLAYER_CONFIG__;
         const metadata = config.metadata || {};
@@ -338,9 +333,7 @@
             console.log("[Dailymotion] Fallback: extracted from JSON-LD");
             return;
           }
-        } catch {
-
-        }
+        } catch {}
       }
 
       console.warn("[Dailymotion] All extraction methods failed");
@@ -365,9 +358,7 @@
             .then((data) => processInterceptedMetadata(data))
             .catch(() => {});
         }
-      } catch {
-
-      }
+      } catch {}
       return resp;
     };
   }
@@ -386,16 +377,14 @@
           try {
             const data = JSON.parse(this.responseText);
             processInterceptedMetadata(data);
-          } catch {
-
-          }
+          } catch {}
         });
       }
       return origSend.apply(this, args);
     };
   }
 
-  function processInterceptedMetadata(meta) {
+  async function processInterceptedMetadata(meta) {
     if (!meta || meta.error || !meta.qualities) return;
 
     const videoId =

@@ -39,7 +39,7 @@ var jsc = (function (meriyah, astring) {
   function isOneOf(value, ...of) {
     return of.includes(value);
   }
-  function _optionalChain(ops) {
+  function _optionalChain$2(ops) {
     let lastAccessLHS = undefined;
     let value = ops[0];
     let i = 1;
@@ -60,24 +60,28 @@ var jsc = (function (meriyah, astring) {
     }
     return value;
   }
-  const nsigExpression = {
-    type: "VariableDeclaration",
-    declarations: [
+  const nsig = {
+    type: "CallExpression",
+    callee: { or: [{ type: "Identifier" }, { type: "SequenceExpression" }] },
+    arguments: [
+      {},
       {
-        type: "VariableDeclarator",
-        init: {
-          type: "CallExpression",
-          callee: { type: "Identifier" },
-          arguments: [
-            { type: "Literal" },
-            {
-              type: "CallExpression",
-              callee: { type: "Identifier", name: "decodeURIComponent" },
-            },
-          ],
-        },
+        type: "CallExpression",
+        callee: { type: "Identifier", name: "decodeURIComponent" },
+        arguments: [{}],
       },
     ],
+  };
+  const nsigAssignment = {
+    type: "AssignmentExpression",
+    left: { type: "Identifier" },
+    operator: "=",
+    right: nsig,
+  };
+  const nsigDeclarator = {
+    type: "VariableDeclarator",
+    id: { type: "Identifier" },
+    init: nsig,
   };
   const logicalExpression = {
     type: "ExpressionStatement",
@@ -97,6 +101,17 @@ var jsc = (function (meriyah, astring) {
               arguments: {
                 or: [
                   [
+                    {
+                      type: "CallExpression",
+                      callee: {
+                        type: "Identifier",
+                        name: "decodeURIComponent",
+                      },
+                      arguments: [{ type: "Identifier" }],
+                      optional: false,
+                    },
+                  ],
+                  [
                     { type: "Literal" },
                     {
                       type: "CallExpression",
@@ -104,16 +119,20 @@ var jsc = (function (meriyah, astring) {
                         type: "Identifier",
                         name: "decodeURIComponent",
                       },
+                      arguments: [{ type: "Identifier" }],
                       optional: false,
                     },
                   ],
                   [
+                    { type: "Literal" },
+                    { type: "Literal" },
                     {
                       type: "CallExpression",
                       callee: {
                         type: "Identifier",
                         name: "decodeURIComponent",
                       },
+                      arguments: [{ type: "Identifier" }],
                       optional: false,
                     },
                   ],
@@ -135,27 +154,16 @@ var jsc = (function (meriyah, astring) {
         expression: {
           type: "AssignmentExpression",
           operator: "=",
-          left: { type: "Identifier" },
+          left: { or: [{ type: "Identifier" }, { type: "MemberExpression" }] },
           right: {
-            type: "FunctionExpression",
-            params: {
-              or: [
-                [{}, {}, {}],
-                [{}, {}, {}, {}],
-              ],
-            },
+            or: [
+              { type: "FunctionExpression" },
+              { type: "ArrowFunctionExpression" },
+            ],
           },
         },
       },
-      {
-        type: "FunctionDeclaration",
-        params: {
-          or: [
-            [{}, {}, {}],
-            [{}, {}, {}, {}],
-          ],
-        },
-      },
+      { type: "FunctionDeclaration" },
       {
         type: "VariableDeclaration",
         declarations: {
@@ -163,13 +171,10 @@ var jsc = (function (meriyah, astring) {
             {
               type: "VariableDeclarator",
               init: {
-                type: "FunctionExpression",
-                params: {
-                  or: [
-                    [{}, {}, {}],
-                    [{}, {}, {}, {}],
-                  ],
-                },
+                or: [
+                  { type: "FunctionExpression" },
+                  { type: "ArrowFunctionExpression" },
+                ],
               },
             },
           ],
@@ -179,28 +184,56 @@ var jsc = (function (meriyah, astring) {
   };
   function extract$1(node) {
     const blocks = [];
-
     if (matchesStructure(node, identifier$1)) {
       if (
         node.type === "ExpressionStatement" &&
         node.expression.type === "AssignmentExpression" &&
-        node.expression.right.type === "FunctionExpression" &&
+        (node.expression.right.type === "FunctionExpression" ||
+          node.expression.right.type === "ArrowFunctionExpression") &&
         node.expression.right.params.length >= 3
       ) {
-        blocks.push(node.expression.right.body);
+        blocks.push(
+          node.expression.right.body.type === "BlockStatement"
+            ? node.expression.right.body
+            : {
+                type: "BlockStatement",
+                body: [
+                  {
+                    type: "ReturnStatement",
+                    argument: node.expression.right.body,
+                  },
+                ],
+              },
+        );
       } else if (node.type === "VariableDeclaration") {
         for (const decl of node.declarations) {
           if (
-            _optionalChain([
+            (_optionalChain$2([
               decl,
               "access",
               (_) => _.init,
               "optionalAccess",
               (_2) => _2.type,
-            ]) === "FunctionExpression" &&
+            ]) === "FunctionExpression" ||
+              _optionalChain$2([
+                decl,
+                "access",
+                (_) => _.init,
+                "optionalAccess",
+                (_2) => _2.type,
+              ]) === "ArrowFunctionExpression") &&
             decl.init.params.length >= 3
           ) {
-            blocks.push(decl.init.body);
+            blocks.push(
+              decl.init.body.type === "BlockStatement"
+                ? decl.init.body
+                : {
+                    type: "BlockStatement",
+                    body: [
+                      { type: "ReturnStatement", argument: decl.init.body },
+                    ],
+                  },
+            );
           }
         }
       } else if (
@@ -218,19 +251,27 @@ var jsc = (function (meriyah, astring) {
       for (const expr of node.expression.expressions) {
         if (
           expr.type === "AssignmentExpression" &&
-          expr.right.type === "FunctionExpression" &&
-          expr.right.params.length >= 3
+          (expr.right.type === "FunctionExpression" ||
+            expr.right.type === "ArrowFunctionExpression") &&
+          expr.right.params.length === 3
         ) {
-          blocks.push(expr.right.body);
+          blocks.push(
+            expr.right.body.type === "BlockStatement"
+              ? expr.right.body
+              : {
+                  type: "BlockStatement",
+                  body: [
+                    { type: "ReturnStatement", argument: expr.right.body },
+                  ],
+                },
+          );
         }
       }
     } else {
       return null;
     }
-
     for (const block of blocks) {
       let call = null;
-
       for (const stmt of block.body) {
         if (matchesStructure(stmt, logicalExpression)) {
           if (
@@ -242,82 +283,72 @@ var jsc = (function (meriyah, astring) {
             stmt.expression.right.expressions[0].right.type === "CallExpression"
           ) {
             call = stmt.expression.right.expressions[0].right;
-            break;
           }
         } else if (stmt.type === "IfStatement") {
           let consequent = stmt.consequent;
           while (consequent.type === "LabeledStatement") {
             consequent = consequent.body;
           }
-
-          if (consequent.type === "BlockStatement") {
-            for (const n of consequent.body) {
-              if (!matchesStructure(n, nsigExpression)) {
-                continue;
-              }
-
+          if (consequent.type !== "BlockStatement") {
+            continue;
+          }
+          for (const n of consequent.body) {
+            if (n.type !== "VariableDeclaration") {
+              continue;
+            }
+            for (const decl of n.declarations) {
               if (
-                n.type === "VariableDeclaration" &&
-                _optionalChain([
-                  n,
+                matchesStructure(decl, nsigDeclarator) &&
+                _optionalChain$2([
+                  decl,
                   "access",
-                  (_11) => _11.declarations,
-                  "access",
-                  (_12) => _12[0],
+                  (_3) => _3.init,
                   "optionalAccess",
-                  (_13) => _13.init,
-                  "optionalAccess",
-                  (_14) => _14.type,
+                  (_4) => _4.type,
                 ]) === "CallExpression"
               ) {
-                call = n.declarations[0].init;
+                call = decl.init;
+                break;
+              }
+            }
+            if (call) {
+              break;
+            }
+          }
+        } else if (stmt.type === "ExpressionStatement") {
+          if (
+            stmt.expression.type !== "LogicalExpression" ||
+            stmt.expression.operator !== "&&" ||
+            stmt.expression.right.type !== "SequenceExpression"
+          ) {
+            continue;
+          }
+          for (const expr of stmt.expression.right.expressions) {
+            if (matchesStructure(expr, nsigAssignment) && expr.type) {
+              if (
+                expr.type === "AssignmentExpression" &&
+                expr.right.type === "CallExpression"
+              ) {
+                call = expr.right;
                 break;
               }
             }
           }
-          if (call) break;
-        } else if (matchesStructure(stmt, nsigExpression)) {
-          // Top-level nsigExpression: handle ES6 variants where the cipher
-          // call is directly in the function body (not inside an IfStatement)
-          if (
-            stmt.type === "VariableDeclaration" &&
-            _optionalChain([
-              stmt,
-              "access",
-              (_20) => _20.declarations,
-              "access",
-              (_21) => _21[0],
-              "optionalAccess",
-              (_22) => _22.init,
-              "optionalAccess",
-              (_23) => _23.type,
-            ]) === "CallExpression"
-          ) {
-            call = stmt.declarations[0].init;
-            break;
-          }
+        }
+        if (call) {
+          break;
         }
       }
-
-      if (
-        _optionalChain([
-          call,
-          "optionalAccess",
-          (_15) => _15.callee,
-          "access",
-          (_16) => _16.type,
-        ]) !== "Identifier"
-      ) {
+      if (!call) {
         continue;
       }
-
       return {
         type: "ArrowFunctionExpression",
         params: [{ type: "Identifier", name: "sig" }],
         body: {
           type: "CallExpression",
-          callee: { type: "Identifier", name: call.callee.name },
-          arguments: call.arguments.map(function (arg) {
+          callee: call.callee,
+          arguments: call.arguments.map((arg) => {
             if (
               arg.type === "CallExpression" &&
               arg.callee.type === "Identifier" &&
@@ -334,14 +365,33 @@ var jsc = (function (meriyah, astring) {
         generator: false,
       };
     }
-
     return null;
+  }
+  function _optionalChain$1(ops) {
+    let lastAccessLHS = undefined;
+    let value = ops[0];
+    let i = 1;
+    while (i < ops.length) {
+      const op = ops[i];
+      const fn = ops[i + 1];
+      i += 2;
+      if ((op === "optionalAccess" || op === "optionalCall") && value == null) {
+        return undefined;
+      }
+      if (op === "access" || op === "optionalAccess") {
+        lastAccessLHS = value;
+        value = fn(value);
+      } else if (op === "call" || op === "optionalCall") {
+        value = fn((...args) => value.call(lastAccessLHS, ...args));
+        lastAccessLHS = undefined;
+      }
+    }
+    return value;
   }
   const identifier = {
     or: [
       {
         type: "VariableDeclaration",
-        kind: "var",
         declarations: {
           anykey: [
             {
@@ -395,17 +445,39 @@ var jsc = (function (meriyah, astring) {
           if (
             node.expression.type === "AssignmentExpression" &&
             node.expression.left.type === "Identifier" &&
-            node.expression.right.type === "FunctionExpression" &&
+            (node.expression.right.type === "FunctionExpression" ||
+              node.expression.right.type === "ArrowFunctionExpression") &&
             node.expression.right.params.length === 1
           ) {
             name = node.expression.left.name;
-            block = node.expression.right.body;
+            block =
+              node.expression.right.body.type === "BlockStatement"
+                ? node.expression.right.body
+                : null;
+          }
+          break;
+        }
+        case "VariableDeclaration": {
+          for (const decl of node.declarations) {
+            if (
+              decl.type === "VariableDeclarator" &&
+              decl.id.type === "Identifier" &&
+              (decl.init?.type === "FunctionExpression" ||
+                decl.init?.type === "ArrowFunctionExpression") &&
+              decl.init.params.length === 1
+            ) {
+              name = decl.id.name;
+              block =
+                decl.init.body.type === "BlockStatement"
+                  ? decl.init.body
+                  : null;
+            }
           }
           break;
         }
         case "FunctionDeclaration": {
           if (node.params.length === 1) {
-            name = _optionalChain([
+            name = _optionalChain$1([
               node,
               "access",
               (_) => _.id,
@@ -422,9 +494,9 @@ var jsc = (function (meriyah, astring) {
       }
       const tryNode = block.body.at(-2);
       if (
-        _optionalChain([tryNode, "optionalAccess", (_3) => _3.type]) !==
+        _optionalChain$1([tryNode, "optionalAccess", (_3) => _3.type]) !==
           "TryStatement" ||
-        _optionalChain([
+        _optionalChain$1([
           tryNode,
           "access",
           (_4) => _4.handler,
@@ -487,18 +559,61 @@ var jsc = (function (meriyah, astring) {
       generator: false,
     };
   }
-  // Setup code injected before the player to provide browser-like globals.
-  // This is a plain string to avoid re-parsing overhead.
-  const setupCodeStr = `\nif (typeof globalThis.XMLHttpRequest === "undefined") {\n    globalThis.XMLHttpRequest = { prototype: {} };\n}\nconst window = Object.create(null);\nif (typeof URL === "undefined") {\n    window.location = {\n        hash: "",\n        host: "www.youtube.com",\n        hostname: "www.youtube.com",\n        href: "https://www.youtube.com/watch?v=yt-dlp-wins",\n        origin: "https://www.youtube.com",\n        password: "",\n        pathname: "/watch",\n        port: "",\n        protocol: "https:",\n        search: "?v=yt-dlp-wins",\n        username: "",\n    };\n} else {\n    window.location = new URL("https://www.youtube.com/watch?v=yt-dlp-wins");\n}\nif (typeof globalThis.document === "undefined") {\n    globalThis.document = Object.create(null);\n}\nif (typeof globalThis.navigator === "undefined") {\n    globalThis.navigator = Object.create(null);\n}\nif (typeof globalThis.self === "undefined") {\n    globalThis.self = globalThis;\n}\n`;
+  const setupNodes = meriyah.parse(
+    `\nif (typeof globalThis.XMLHttpRequest === "undefined") {\n    globalThis.XMLHttpRequest = { prototype: {} };\n}\nconst window = Object.create(null);\nif (typeof URL === "undefined") {\n    window.location = {\n        hash: "",\n        host: "www.youtube.com",\n        hostname: "www.youtube.com",\n        href: "https://www.youtube.com/watch?v=yt-dlp-wins",\n        origin: "https://www.youtube.com",\n        password: "",\n        pathname: "/watch",\n        port: "",\n        protocol: "https:",\n        search: "?v=yt-dlp-wins",\n        username: "",\n    };\n} else {\n    window.location = new URL("https://www.youtube.com/watch?v=yt-dlp-wins");\n}\nif (typeof globalThis.document === "undefined") {\n    globalThis.document = Object.create(null);\n}\nif (typeof globalThis.navigator === "undefined") {\n    globalThis.navigator = Object.create(null);\n}\nif (typeof globalThis.self === "undefined") {\n    globalThis.self = globalThis;\n}\n`,
+  ).body;
+  function _optionalChain(ops) {
+    let lastAccessLHS = undefined;
+    let value = ops[0];
+    let i = 1;
+    while (i < ops.length) {
+      const op = ops[i];
+      const fn = ops[i + 1];
+      i += 2;
+      if ((op === "optionalAccess" || op === "optionalCall") && value == null) {
+        return undefined;
+      }
+      if (op === "access" || op === "optionalAccess") {
+        lastAccessLHS = value;
+        value = fn(value);
+      } else if (op === "call" || op === "optionalCall") {
+        value = fn((...args) => value.call(lastAccessLHS, ...args));
+        lastAccessLHS = undefined;
+      }
+    }
+    return value;
+  }
   function preprocessPlayer(data) {
-    // === String injection approach ===
-    // Instead of re-generating the entire 2.5MB player.js through astring,
-    // we only generate the small solver assignments (~2KB) and inject them
-    // into the original source string. This saves ~250ms of astring.generate.
-    const ast = meriyah.parse(data);
-    const body = ast.body;
-    // Determine IIFE structure and find the block body
-    let isCase2 = false;
+    const program = meriyah.parse(data);
+    console.log("[Solver] Parsed player — body.length:", program.body.length);
+    const plainStatements = modifyPlayer(program);
+    console.log(
+      "[Solver] modifyPlayer done — statements:",
+      plainStatements.length,
+    );
+    const solutions = getSolutions(plainStatements);
+    for (const [name, options] of Object.entries(solutions)) {
+      plainStatements.push({
+        type: "ExpressionStatement",
+        expression: {
+          type: "AssignmentExpression",
+          operator: "=",
+          left: {
+            type: "MemberExpression",
+            computed: false,
+            object: { type: "Identifier", name: "_result" },
+            property: { type: "Identifier", name: name },
+            optional: false,
+          },
+          right: multiTry(options),
+        },
+      });
+    }
+    program.body.splice(0, 0, ...setupNodes);
+    return astring.generate(program);
+  }
+  function modifyPlayer(program) {
+    const body = program.body;
     const block = (() => {
       switch (body.length) {
         case 1: {
@@ -521,92 +636,91 @@ var jsc = (function (meriyah, astring) {
               "ExpressionStatement" &&
             func.expression.type === "CallExpression"
           ) {
-            // Direct call: (function(){...})(this)
+            // Direct call: (function(g){...})(_yt_player)
             if (func.expression.callee.type === "FunctionExpression") {
-              isCase2 = true;
-              return func.expression.callee.body;
+              const block = func.expression.callee.body;
+              block.body.splice(0, 1);
+              return block;
             }
-            // .call(this): 'use strict'; (function(){...}).call(this)
-            // — the es6 variant uses this pattern
+            // .call() pattern: (function(g){...}).call(this, _yt_player)
             if (
               func.expression.callee.type === "MemberExpression" &&
               func.expression.callee.object.type === "FunctionExpression"
             ) {
-              isCase2 = true;
               return func.expression.callee.object.body;
             }
           }
           break;
         }
       }
-      throw new Error("unexpected structure");
+      throw "unexpected structure";
     })();
-    // Find solver functions by walking the AST
+    block.body = block.body.filter((node) => {
+      if (node.type === "ExpressionStatement") {
+        if (node.expression.type === "AssignmentExpression") {
+          return true;
+        }
+        return node.expression.type === "Literal";
+      }
+      return true;
+    });
+    return block.body;
+  }
+  function getSolutions(statements) {
     const found = { n: [], sig: [] };
-    for (const node of block.body) {
-      const n = extract(node);
-      if (n) found.n.push(n);
-      const sig = extract$1(node);
-      if (sig) found.sig.push(sig);
-    }
-    // Diagnostic: log extraction results for debugging
-    console.log(
-      `[yt.solver] Extraction: n=${found.n.length} candidates, sig=${found.sig.length} candidates` +
-        (isCase2
-          ? " (case 2: dual-statement IIFE)"
-          : " (case 1: single-statement IIFE)"),
-    );
-    // Generate ONLY the solver assignment code (tiny ~2KB)
-    const solverStmts = [];
-    for (const [name, options] of Object.entries(found)) {
-      if (options.length === 0) continue; // No candidates found, _result stays null
-      solverStmts.push({
-        type: "ExpressionStatement",
-        expression: {
-          type: "AssignmentExpression",
-          operator: "=",
-          left: {
-            type: "MemberExpression",
-            computed: false,
-            object: { type: "Identifier", name: "_result" },
-            property: { type: "Identifier", name: name },
-          },
-          // Single candidate: use directly (no multiTry wrapper overhead)
-          // Multiple candidates: wrap in multiTry for consensus validation
-          right: options.length === 1 ? options[0] : multiTry(options),
-        },
-      });
-    }
-    const solverCode = astring.generate(
-      { type: "Program", body: solverStmts },
-      { indent: "" },
-    );
-    // Find injection point: before the IIFE's closing })
-    let source = data;
-    const closingIdx = source.lastIndexOf("})");
-    if (closingIdx === -1) throw new Error("Cannot find IIFE closing");
-    let insertPos = closingIdx;
-    // For case 2: remove 'var window=this;' so setup code's window
-    // definition takes effect inside the IIFE (replaces this=globalThis
-    // with a controlled fake window object)
-    if (isCase2) {
-      const marker = "{var window=this;";
-      const markerIdx = source.indexOf(marker);
-      if (markerIdx !== -1) {
-        source =
-          source.slice(0, markerIdx + 1) +
-          source.slice(markerIdx + marker.length);
-        insertPos -= marker.length - 1;
+    for (const statement of statements) {
+      const n = extract(statement);
+      if (n) {
+        found.n.push(n);
+      }
+      const sig = extract$1(statement);
+      if (sig) {
+        found.sig.push(sig);
       }
     }
-    // Build result: setupCode + original source with solver injected
-    return (
-      setupCodeStr +
-      source.slice(0, insertPos) +
-      "\n" +
-      solverCode +
-      source.slice(insertPos)
+    console.log(
+      "[Solver] getSolutions: n=",
+      found.n.length,
+      "sig=",
+      found.sig.length,
+      "statements=",
+      statements.length,
     );
+    // Fallback: In newer YouTube player versions, the N-sig function uses a
+    // dispatch pattern (e.g. Ol(53, decodeURIComponent(n))) inside a 3-param
+    // wrapper function. This pattern is detected by extract$1 (sig extractor)
+    // rather than extract (n extractor). When n has no matches but sig does,
+    // copy the sig solutions to n as a fallback.
+    if (found.n.length === 0 && found.sig.length > 0) {
+      console.warn(
+        "[Solver] No direct n-sig match — using sig→n fallback (",
+        found.sig.length,
+        "candidates)",
+      );
+      found.n = [...found.sig];
+    }
+    if (found.n.length === 0) {
+      console.error("[Solver] CRITICAL: No n-sig candidates found at all!");
+    }
+    return found;
+  }
+  function getFromPrepared(code) {
+    const resultObj = { n: null, sig: null };
+    try {
+      Function("_result", code)(resultObj);
+    } catch (e) {
+      console.error(
+        "[Solver] getFromPrepared execution error:",
+        e?.message || e,
+      );
+    }
+    console.log(
+      "[Solver] getFromPrepared: n=",
+      typeof resultObj.n,
+      "sig=",
+      typeof resultObj.sig,
+    );
+    return resultObj;
   }
   function multiTry(generators) {
     return {
@@ -643,10 +757,7 @@ var jsc = (function (meriyah, astring) {
                 },
               ],
             },
-            right: {
-              type: "ArrayExpression",
-              elements: generators,
-            },
+            right: { type: "ArrayExpression", elements: generators },
             body: {
               type: "BlockStatement",
               body: [
@@ -686,8 +797,33 @@ var jsc = (function (meriyah, astring) {
                   },
                   handler: {
                     type: "CatchClause",
-                    param: null,
-                    body: { type: "BlockStatement", body: [] },
+                    param: { type: "Identifier", name: "_e" },
+                    body: {
+                      type: "BlockStatement",
+                      body: [
+                        {
+                          type: "ExpressionStatement",
+                          expression: {
+                            type: "CallExpression",
+                            callee: {
+                              type: "MemberExpression",
+                              object: { type: "Identifier", name: "console" },
+                              computed: false,
+                              property: { type: "Identifier", name: "warn" },
+                              optional: false,
+                            },
+                            arguments: [
+                              {
+                                type: "Literal",
+                                value: "[Solver] multiTry candidate error:",
+                              },
+                              { type: "Identifier", name: "_e" },
+                            ],
+                            optional: false,
+                          },
+                        },
+                      ],
+                    },
                   },
                   finalizer: null,
                 },
@@ -756,23 +892,7 @@ var jsc = (function (meriyah, astring) {
                         type: "CallExpression",
                         callee: {
                           type: "MemberExpression",
-                          object: {
-                            type: "CallExpression",
-                            callee: {
-                              type: "Identifier",
-                              name: "Array",
-                            },
-                            arguments: [
-                              {
-                                type: "SpreadElement",
-                                argument: {
-                                  type: "Identifier",
-                                  name: "_results",
-                                },
-                              },
-                            ],
-                            optional: false,
-                          },
+                          object: { type: "Identifier", name: "_results" },
                           computed: false,
                           property: { type: "Identifier", name: "join" },
                           optional: false,
@@ -841,18 +961,6 @@ var jsc = (function (meriyah, astring) {
       generator: false,
     };
   }
-  // Cache the last executed code and its solver functions to avoid
-  // re-compiling the same ~2.5MB code on repeated calls.
-  let _cachedCode = null;
-  let _cachedSolvers = null;
-  function getFromPrepared(code) {
-    if (code === _cachedCode && _cachedSolvers) return _cachedSolvers;
-    const resultObj = { n: null, sig: null };
-    Function("_result", code)(resultObj);
-    _cachedCode = code;
-    _cachedSolvers = resultObj;
-    return resultObj;
-  }
   function main(input) {
     const preprocessedPlayer =
       input.type === "player"
@@ -867,32 +975,14 @@ var jsc = (function (meriyah, astring) {
       if (!solver) {
         return {
           type: "error",
-          error: `Failed to extract ${input.type} function (n=${solvers.n ? "ok" : "null"}, sig=${solvers.sig ? "ok" : "null"})`,
+          error: `Failed to extract ${input.type} function`,
         };
       }
       try {
         return {
           type: "result",
           data: Object.fromEntries(
-            input.challenges.map((challenge) => {
-              const result = solver(challenge);
-              // Validate n-sig results inside the solver itself:
-              // If result ends with the challenge, the function returned an
-              // error-bearing string (e.g., "enhanced_except_...CHALLENGE").
-              // This is the same heuristic background.js uses, but catching
-              // it here gives a clearer error and avoids false positives.
-              if (
-                input.type === "n" &&
-                typeof result === "string" &&
-                result.length > challenge.length &&
-                result.endsWith(challenge)
-              ) {
-                throw new Error(
-                  `n-sig validation failed: result ends with challenge`,
-                );
-              }
-              return [challenge, result];
-            }),
+            input.challenges.map((challenge) => [challenge, solver(challenge)]),
           ),
         };
       } catch (error) {

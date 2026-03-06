@@ -47,9 +47,10 @@
   function computeConfidence(source, metadata = {}) {
     let confidence = SOURCE_CONFIDENCE[source] || SOURCE_CONFIDENCE.UNKNOWN;
 
-    // Boost for known format
-    if (metadata.type && FORMAT_CONFIDENCE[metadata.type]) {
-      confidence *= FORMAT_CONFIDENCE[metadata.type];
+    // Boost for known format (prefer explicit MIME type, fall back to type)
+    const mimeType = metadata.mimeType || metadata.type;
+    if (mimeType && FORMAT_CONFIDENCE[mimeType]) {
+      confidence *= FORMAT_CONFIDENCE[mimeType];
     }
 
     // Boost for presence of title/metadata
