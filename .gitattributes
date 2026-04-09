@@ -1,0 +1,24 @@
+# Auto detect text files and normalize line endings in git
+# On Windows checkout: CRLF.  On Mac/Linux checkout: LF.  In repo: always LF.
+* text=auto
+
+# Explicitly mark as text (line endings handled by core.autocrlf)
+*.js text
+*.mjs text
+*.html text
+*.css text
+*.json text
+*.md text
+*.txt text
+*.svg text
+
+# Binary files - never touch
+*.wasm binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.tar binary
