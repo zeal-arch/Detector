@@ -252,7 +252,9 @@
                 "*://lersia.com/*",
                 "*://*.lersia.com/*",
                 "*://api.lersia.com/*",
-                "*://lersia.lailendemo.com/*"
+                "*://lersia.lailendemo.com/*",
+                "*://*.sketchfab.com/*",
+                "*://sketchfab.com/*"
             ],
             "js": [
                 "extractors/site-map.js",
@@ -272,7 +274,11 @@
                 "content/bridge.js"
             ],
             "run_at": "document_start",
-            "all_frames": false
+            "all_frames": false,
+            "exclude_matches": [
+                "*://*.sketchfab.com/*",
+                "*://sketchfab.com/*"
+            ]
         },
         {
             "matches": [
@@ -366,7 +372,9 @@
                 "*://lersia.com/*",
                 "*://*.lersia.com/*",
                 "*://api.lersia.com/*",
-                "*://lersia.lailendemo.com/*"
+                "*://lersia.lailendemo.com/*",
+                "*://*.sketchfab.com/*",
+                "*://sketchfab.com/*"
             ],
             "js": [
                 "extractors/site-map.js",
@@ -374,6 +382,30 @@
             ],
             "run_at": "document_start",
             "world": "MAIN"
+        },
+        {
+            "matches": [
+                "*://*.sketchfab.com/*",
+                "*://sketchfab.com/*"
+            ],
+            "js": [
+                "extractors/sites/sketchfab-hook.js"
+            ],
+            "run_at": "document_start",
+            "all_frames": true,
+            "world": "MAIN"
+        },
+        {
+            "matches": [
+                "*://*.sketchfab.com/*",
+                "*://sketchfab.com/*"
+            ],
+            "js": [
+                "extractors/sites/sketchfab.js",
+                "content/content-multi.js"
+            ],
+            "run_at": "document_start",
+            "all_frames": true
         }
     ],
     "web_accessible_resources": [

@@ -1623,7 +1623,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       return true;
 
     case "DOWNLOAD_VIDEO":
-      doDownload(msg.url, msg.filename)
+      doDownload(msg.url, msg.filename, msg.saveAs !== false)
         .then(respond)
         .catch((e) => respond({ success: false, error: e.message }));
       return true;
@@ -5024,11 +5024,11 @@ async function doMergedDownload(msg) {
   }
 }
 
-async function doDownload(url, filename) {
+async function doDownload(url, filename, saveAs = true) {
   filename = sanitize(filename);
 
   return new Promise((resolve) => {
-    chrome.downloads.download({ url, filename, saveAs: true }, (id) => {
+    chrome.downloads.download({ url, filename, saveAs }, (id) => {
       if (chrome.runtime.lastError) {
         console.error("[BG] Download error:", chrome.runtime.lastError.message);
 
@@ -5051,7 +5051,7 @@ async function doDownload(url, filename) {
 function sanitize(n) {
   if (!n) return "video.mp4";
   return n
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/[<>:"|?*\x00-\x1F]/g, "_")
     .replace(/\s+/g, " ")
     .trim()
     .substring(0, 200);
@@ -5798,6 +5798,8 @@ async function onSpecialistDetected(msg, tabId) {
             isHLS: f.isHLS === true,
             isDASH: f.isDASH === true,
             ext: f.ext || "mp4",
+            isModel: f.isModel === true,
+            filename: f.filename || null
           });
         }
       }

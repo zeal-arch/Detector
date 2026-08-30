@@ -304,8 +304,8 @@ async function getOPFSRoot() {
  * combining at the end (acceptable because unknown-size downloads are
  * typically small).
  */
-async function downloadToBuffer(url, label, signal, onProgress) {
-  console.log(`[OFFSCREEN] Downloading ${label}...`);
+async function downloadToOPFS(url, label, opfsFilename, signal, onProgress) {
+  console.log(`[OFFSCREEN] Downloading ${label} to OPFS...`);
 
   // Retry up to 3 times on 403 — YouTube can temporarily reject requests
   // (e.g. when fetching audio after a long video download).
@@ -374,56 +374,32 @@ async function downloadToBuffer(url, label, signal, onProgress) {
     if (onProgress) onProgress(downloaded, totalSize, speed);
   }
 
-  let result;
+  const root = await getOPFSRoot();
+  const fileHandle = await root.getFileHandle(opfsFilename, { create: true });
+  const writable = await fileHandle.createWritable();
 
   try {
-    if (totalSize > 0) {
-      // --- Known size: pre-allocate, write chunks in-place ---
-      result = new Uint8Array(totalSize);
-      while (true) {
-        if (signal?.aborted)
-          throw new DOMException("Download cancelled", "AbortError");
-        const { done, value } = await reader.read();
-        if (done) break;
-        // Guard against server sending more bytes than Content-Length
-        const safeLen = Math.min(value.byteLength, totalSize - downloaded);
-        if (safeLen > 0) result.set(value.subarray(0, safeLen), downloaded);
-        trackProgress(value.byteLength);
-      }
-      if (downloaded < totalSize) {
-        result = result.subarray(0, downloaded);
-      }
-    } else {
-      // --- Unknown size: accumulate then combine ---
-      const chunks = [];
-      while (true) {
-        if (signal?.aborted)
-          throw new DOMException("Download cancelled", "AbortError");
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        trackProgress(value.byteLength);
-      }
-      result = new Uint8Array(downloaded);
-      let offset = 0;
-      for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
+    while (true) {
+      if (signal?.aborted)
+        throw new DOMException("Download cancelled", "AbortError");
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writable.write(value);
+      trackProgress(value.byteLength);
     }
+    await writable.close();
   } catch (err) {
-    // On cancel or error, release the pre-allocated buffer immediately
-    result = null;
+    await writable.abort().catch(() => {});
     reader.cancel().catch(() => {});
     throw err;
   }
 
   console.log(
-    `[OFFSCREEN] Downloaded ${label}: ${(downloaded / 1024 / 1024).toFixed(2)} MB` +
+    `[OFFSCREEN] Downloaded ${label} to OPFS: ${(downloaded / 1024 / 1024).toFixed(2)} MB` +
       (speed > 0 ? ` (${(speed / 1024 / 1024).toFixed(1)} MB/s)` : ""),
   );
 
-  return result;
+  return await fileHandle.getFile();
 }
 
 async function cleanupMergeOPFS() {
@@ -474,6 +450,9 @@ function cleanupMEMFS() {
     } catch (e) {}
     try {
       libavInstance.unlinkreadaheadfile(f);
+    } catch (e) {}
+    try {
+      libavInstance.unlinkfsfhfile(f).catch(() => {});
     } catch (e) {}
   }
 }
@@ -722,30 +701,6 @@ async function _doMerge(msg, sendResponse, knownVideoLength = 0, knownAudioLengt
       );
     }
 
-    // Download BOTH tracks in parallel.
-    // Audio is tiny (10-50 MB), video is large (100 MB-2 GB).
-    // Parallel download is safe because:
-    //   - Audio finishes in seconds and gets written to MEMFS immediately
-    //   - Peak memory is ~1× video size (audio already freed to MEMFS)
-    //   - Both URLs are used immediately so neither goes stale
-    const [audioResult, videoResult] = await Promise.all([
-      downloadToBuffer(audioUrl, "audio", signal, (dl, total) => {
-        audioDL = dl;
-        audioTotal = total || audioDL;
-        reportDownloadProgress();
-      }),
-      downloadToBuffer(videoUrl, "video", signal, (dl, total) => {
-        videoDL = dl;
-        videoTotal = total || videoDL;
-        reportDownloadProgress();
-      }),
-    ]);
-
-    audioData = audioResult;
-    videoData = videoResult;
-
-    if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
-
     // --- Auto-detect output container ---
     // This only activates when BOTH inputs are WebM (VP9/Opus), so H.264/AAC
     // never enters the WebM path.  With -c:v copy -c:a copy, no codec
@@ -763,20 +718,46 @@ async function _doMerge(msg, sendResponse, knownVideoLength = 0, knownAudioLengt
     const videoInputFile = isWebMVideo ? "input_video.webm" : "input_video.mp4";
     const audioInputFile = isWebMAudio ? "input_audio.webm" : "input_audio.mp4";
 
-    // Write audio to MEMFS first (small) then free it
-    const audioSize = audioData.byteLength;
-    libav.writeFile(audioInputFile, audioData, { canOwn: true });
-    audioData = null;
+    const audioOPFSFile = isWebMAudio ? "merge_audio.webm" : "merge_audio.mp4";
+    const videoOPFSFile = isWebMVideo ? "merge_video.webm" : "merge_video.mp4";
 
-    // Write video to MEMFS and free it
-    const videoSize = videoData.byteLength;
-    libav.writeFile(videoInputFile, videoData, { canOwn: true });
-    videoData = null;
+    // Download BOTH tracks in parallel.
+    // Audio is tiny (10-50 MB), video is large (100 MB-2 GB).
+    // Parallel download is safe because:
+    //   - Both write directly to OPFS disk via streaming
+    //   - Minimal JS heap is used
+    const [audioFile, videoFile] = await Promise.all([
+      downloadToOPFS(audioUrl, "audio", audioOPFSFile, signal, (dl, total) => {
+        audioDL = dl;
+        audioTotal = total || audioDL;
+        reportDownloadProgress();
+      }),
+      downloadToOPFS(videoUrl, "video", videoOPFSFile, signal, (dl, total) => {
+        videoDL = dl;
+        videoTotal = total || videoDL;
+        reportDownloadProgress();
+      }),
+    ]);
+
+    if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
+
+    const audioSize = audioFile.size;
+    const videoSize = videoFile.size;
+
+    // Mount the downloaded OPFS File objects as readahead files in libav.js
+    libav.mkreadaheadfile(audioInputFile, audioFile);
+    libav.mkreadaheadfile(videoInputFile, videoFile);
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
     const outputExt = useWebM ? "webm" : "mp4";
     const outputFile = `output.${outputExt}`;
+    const opfsOutputName = `merge_output_${Date.now()}.${outputExt}`;
     const mimeType = useWebM ? "video/webm" : "video/mp4";
+
+    // Mount OPFS FileSystemFileHandle for the output file
+    const root = await getOPFSRoot();
+    const outHandle = await root.getFileHandle(opfsOutputName, { create: true });
+    await libav.mkfsfhfile(outputFile, outHandle);
 
     sendProgress(progressKey, "merge", "Merging audio + video...", 72);
 
@@ -817,36 +798,27 @@ async function _doMerge(msg, sendResponse, knownVideoLength = 0, knownAudioLengt
     // Check for cancellation immediately after FFmpeg completes
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
-    // Free input files from MEMFS BEFORE reading output — reduces peak memory
-    try {
-      libav.unlink(videoInputFile);
-    } catch (e) {}
-    try {
-      libav.unlink(audioInputFile);
-    } catch (e) {}
+    // Close the output file handle via libav and unlink input readahead files
+    await libav.unlinkfsfhfile(outputFile);
+    try { libav.unlinkreadaheadfile(videoInputFile); } catch (e) {}
+    try { libav.unlinkreadaheadfile(audioInputFile); } catch (e) {}
 
     if (signal.aborted) throw new DOMException("Cancelled", "AbortError");
 
     sendProgress(progressKey, "finalize", "Preparing download...", 92);
 
-    let mergedData = libav.readFile(outputFile);
-    const outputSize = mergedData.byteLength;
+    const mergedBlob = await outHandle.getFile();
+    const outputSize = mergedBlob.size;
     console.log(
       `[OFFSCREEN] Merged output: ${(outputSize / 1024 / 1024).toFixed(2)} MB (${outputExt})`,
     );
 
-    // Free output from MEMFS immediately after reading into JS
-    try {
-      libav.unlink(outputFile);
-    } catch (e) {}
-
-    const blob = new Blob([mergedData], { type: mimeType });
-    // Free the raw buffer immediately — Blob owns the data now
-    mergedData = null;
     let blobUrl = null;
     try {
-      blobUrl = URL.createObjectURL(blob);
+      // createObjectURL with a File backed by OPFS uses no JS heap!
+      blobUrl = URL.createObjectURL(mergedBlob);
       const finalFilename = ensureExtension(filename, outputExt);
+
 
       const downloadId = await new Promise((resolve, reject) => {
         chrome.runtime.sendMessage(

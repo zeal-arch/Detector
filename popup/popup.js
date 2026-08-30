@@ -302,9 +302,12 @@ function renderVideo(info) {
   const muxed = [];
   const videoOnly = [];
   const audioOnly = [];
+  const models = [];
 
   for (const f of formats) {
-    if (f.isMuxed || (f.isVideo && f.codecs?.includes("mp4a"))) {
+    if (f.isModel) {
+      models.push(f);
+    } else if (f.isMuxed || (f.isVideo && f.codecs?.includes("mp4a"))) {
       muxed.push(f);
     } else if (f.isVideo) {
       videoOnly.push(f);
@@ -433,6 +436,72 @@ function renderVideo(info) {
         }, 2000);
       }
     });
+    attachThumbFallbacks();
+    return;
+  }
+
+  // Handle 3D Model specific UI
+  if (models.length > 0) {
+    const thumbUrl =
+      thumbnail ||
+      (videoId
+        ? `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
+        : "icons/icon48.png");
+
+    content.innerHTML = `
+    <div class="video-card" id="vcard">
+      <div class="video-header">
+        <div class="video-thumb">
+          <img src="${thumbUrl}" alt="" class="thumb-img">
+          <span class="thumb-quality">3D</span>
+        </div>
+        <div class="video-info">
+          <div class="video-title">${escapeHtml(title || "3D Model")}</div>
+          <div class="video-meta">
+            ${author ? `<span class="video-meta-tag">${escapeHtml(author)}</span>` : ""}
+          </div>
+        </div>
+      </div>
+      <div class="video-controls">
+        <span class="quality-tag">Entire Model · ${models.length} files</span>
+        <button class="dl-btn dl-btn-primary" id="dlModelBtn" title="Download Model">${ICONS.download} Download</button>
+      </div>
+      <div class="progress-wrap" id="progressWrap" style="display: none;">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="progressFill" style="width: 0%"></div>
+        </div>
+        <span class="progress-text" id="progressText">0%</span>
+      </div>
+    </div>`;
+
+    document.getElementById("dlModelBtn")?.addEventListener("click", () => {
+      const btn = document.getElementById("dlModelBtn");
+      if (btn) {
+        btn.innerHTML = "Starting...";
+        btn.disabled = true;
+      }
+      
+      let delay = 0;
+      const safeTitle = (title || "model").replace(/[<>:"/\\|?*]/g, "").replace(/\\s+/g, " ").trim().substring(0, 40);
+      
+      for (const fmt of models) {
+        if (!fmt.url) continue;
+        setTimeout(() => {
+          // Use fmt.filename (e.g. geometry.binz or textures/tex.png) inside a folder for this model
+          const dlName = fmt.filename ? `${safeTitle}/${fmt.filename}` : generateFilename(safeTitle, fmt.quality, fmt.ext);
+          downloadFormat(fmt.url, dlName, false);
+        }, delay);
+        delay += 300; // Stagger downloads slightly to prevent browser blocking
+      }
+
+      setTimeout(() => {
+        if (btn) {
+          btn.innerHTML = `${ICONS.download} Download`;
+          btn.disabled = false;
+        }
+      }, delay + 1000);
+    });
+    
     attachThumbFallbacks();
     return;
   }
@@ -716,12 +785,13 @@ function handleDownloadClick() {
   }
 }
 
-async function downloadFormat(url, filename) {
+async function downloadFormat(url, filename, saveAs = true) {
   try {
     const resp = await chrome.runtime.sendMessage({
       action: "DOWNLOAD_VIDEO",
       url,
       filename,
+      saveAs
     });
     if (!resp?.success) console.error("Download failed:", resp?.error);
   } catch (err) {

@@ -32,7 +32,7 @@ class GenericExtractor extends BaseExtractor {
         match: /^https?:\/\//,
 
         exclude:
-          /^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be|twitter\.com|x\.com|instagram\.com)\//,
+          /^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be|twitter\.com|x\.com|instagram\.com|sketchfab\.com|sketchfab\.co)\//,
       },
     ];
   }
