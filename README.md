@@ -45,7 +45,7 @@ If your site isn't supported, open an issue or better yet, add it yourself and s
 
 ## Legal Stuff
 
-This is open source (see LICENSE). Use it responsibly. Don't pirate content, respect copyright, don't violate ToS, etc. You're an adult, act like one.
+This is open source (see [LICENSE](LICENSE)). Please review [DISCLAIMER.md](DISCLAIMER.md) for terms of use and compliance guidelines. Use it responsibly. Don't pirate content, respect copyright, don't violate ToS, etc. You're an adult, act like one.
 
 ## Contributing
 
