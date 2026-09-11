@@ -266,6 +266,7 @@
             console.log(TAG, "MediaElement.src set:", val);
             sendOne(val);
           }
+          // eslint-disable-next-line no-setter-return
           return origSet.call(this, val);
         },
       });

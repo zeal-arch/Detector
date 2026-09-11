@@ -62,6 +62,10 @@ const sniffedStreams = new Map();
 const contentHashes = new Map();
 const mergeProgress = new Map();
 const sniffedYouTubeUrls = new Map(); // tabId → Map(itag → {url, mime, clen, expire, ts})
+const injectedTabs = new Map();
+let tabDataPersistScheduled = false;
+let tabDataPersistQueued = false;
+let tabDataPersistChain = Promise.resolve();
 const REFERER_RULE_ID = 1;
 let activeMergeId = null;
 let mergeKeepaliveTimer = null; // Keeps SW alive during merge
@@ -1150,9 +1154,24 @@ bcIn.onmessage = (e) => {
 };
 
 function persistTabData() {
-  const obj = {};
-  for (const [tabId, data] of tabData) obj[tabId] = data;
-  chrome.storage.session.set({ tabDataCache: obj }).catch(() => {});
+  tabDataPersistQueued = true;
+  if (tabDataPersistScheduled) return;
+
+  // Several detection paths can update the same tab within one event burst.
+  // Coalesce those updates and serialize writes so an older snapshot cannot
+  // finish after a newer one and overwrite it.
+  tabDataPersistScheduled = true;
+  Promise.resolve().then(() => {
+    tabDataPersistScheduled = false;
+    if (!tabDataPersistQueued) return;
+    tabDataPersistQueued = false;
+
+    const snapshot = Object.fromEntries(tabData);
+    tabDataPersistChain = tabDataPersistChain
+      .catch(() => {})
+      .then(() => chrome.storage.session.set({ tabDataCache: snapshot }))
+      .catch(() => {});
+  });
 }
 
 chrome.storage.session.get(["tabDataCache", "activeMerge"], (result) => {
@@ -3223,81 +3242,6 @@ async function ensureOffscreen() {
   ]);
 }
 
-async function sandboxEval(fnCode, params) {
-  await ensureOffscreen();
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      console.warn("[BG] Sandbox eval timed out (12s)");
-      reject(new Error("Sandbox N-sig eval timed out"));
-    }, 12000);
-
-    chrome.runtime.sendMessage(
-      { target: "offscreen", action: "EVAL_NSIG", fnCode, params },
-      (response) => {
-        clearTimeout(timeout);
-        if (chrome.runtime.lastError) {
-          console.warn(
-            "[BG] Sandbox message error:",
-            chrome.runtime.lastError.message,
-          );
-          reject(
-            new Error(
-              "Sandbox communication failed: " +
-                chrome.runtime.lastError.message,
-            ),
-          );
-          return;
-        }
-        if (response?.timedOut || response?.error) {
-          console.warn("[BG] Sandbox eval error:", response.error);
-          reject(
-            new Error("Sandbox eval failed: " + (response.error || "unknown")),
-          );
-          return;
-        }
-        resolve(response?.results || params);
-      },
-    );
-  });
-}
-
-async function sandboxEvalCipher(cipherCode, argName, sigs) {
-  await ensureOffscreen();
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      console.warn("[BG] Sandbox cipher eval timed out (12s)");
-      reject(new Error("Sandbox cipher eval timed out"));
-    }, 12000);
-
-    chrome.runtime.sendMessage(
-      { target: "offscreen", action: "EVAL_CIPHER", cipherCode, argName, sigs },
-      (response) => {
-        clearTimeout(timeout);
-        if (chrome.runtime.lastError) {
-          console.warn(
-            "[BG] Sandbox cipher error:",
-            chrome.runtime.lastError.message,
-          );
-          reject(new Error("Sandbox cipher communication failed"));
-          return;
-        }
-        if (response?.timedOut || response?.error) {
-          console.warn("[BG] Sandbox cipher eval error:", response.error);
-          reject(
-            new Error(
-              "Sandbox cipher eval failed: " + (response.error || "unknown"),
-            ),
-          );
-          return;
-        }
-        resolve(response?.results || sigs);
-      },
-    );
-  });
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // yt-dlp-style full player.js solver
 // Sends the ENTIRE ~1MB player.js to the sandbox, which uses meriyah (AST
@@ -4288,19 +4232,41 @@ function extractDispatchCipherRaw(js, cipherFuncName, dispatchValue, pageHtml) {
   return { code, argName };
 }
 
+const CIPHER_DISPATCH_CALL_RE =
+  /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/;
+
+const CIPHER_LOOKUP_RE =
+  /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/;
+
+const CIPHER_NAME_PATTERNS = [
+  /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
+  /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
+  /\bm=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(h\.s\)\)/,
+  /\bc\s*&&\s*d\.set\([^,]+\s*,\s*(?:encodeURIComponent\s*\()([a-zA-Z0-9$]+)\(/,
+  /\bc\s*&&\s*[a-z]\.set\([^,]+\s*,\s*([a-zA-Z0-9$]+)\(/,
+  /\bc\s*&&\s*[a-z]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
+  /[$_a-zA-Z0-9]+\.set\((?:[$_a-zA-Z0-9]+\.[$_a-zA-Z0-9]+\|\|)?"signature",\s*([$_a-zA-Z0-9]+)\s*\(/,
+  /\.set\([^,]+,encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
+  /=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(\w+\.s\)\)/,
+  /&&\(\w+=([a-zA-Z0-9$]+)\("[^"]*",decodeURIComponent/,
+  /&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/,
+];
+
+const CIPHER_SPLIT_PATTERNS = [
+  /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
+  /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*\((\w+)\)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
+  /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*(\w+)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
+];
+
 function extractCipherActions(js, pageHtml) {
   // === Try new-style dispatch cipher first (2025+) ===
   // Pattern 1: literal property access — FUNC(N, decodeURIComponent(x.s))
-  let dispatchCallMatch = js.match(
-    /=\s*([a-zA-Z0-9$_]+)\s*\(\s*(\d+)\s*,\s*decodeURIComponent\s*\(\s*\w+\.\s*s\s*\)\s*\)/,
-  );
+  let dispatchCallMatch = js.match(CIPHER_DISPATCH_CALL_RE);
 
   // Pattern 2: lookup-array property access — FUNC(N, decodeURIComponent(x[LOOKUP[S_IDX]]))
   // YouTube 2025+ may use x[J[49]] instead of x.s where J[49]="s"
   if (!dispatchCallMatch) {
-    const lookupRe =
-      /(?:var\s+|[;,]\s*)([a-zA-Z0-9$_]+)\s*=\s*(?:"([^"]{200,})"|'([^']{200,})')\s*\.\s*split\s*\(\s*(?:"([^"]+)"|'([^']+)')\s*\)/;
-    const lookupM = js.match(lookupRe);
+    const lookupM = js.match(CIPHER_LOOKUP_RE);
     if (lookupM) {
       const lookupStr = lookupM[2] || lookupM[3];
       const lookupDelim = lookupM[4] || lookupM[5];
@@ -4335,25 +4301,7 @@ function extractCipherActions(js, pageHtml) {
 
   // === Legacy patterns (pre-2025) ===
   let fn = null;
-  const namePatterns = [
-    /\b[cs]\s*&&\s*[adf]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
-    /\b[a-zA-Z0-9]+\s*&&\s*[a-zA-Z0-9]+\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
-    /\bm=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(h\.s\)\)/,
-    /\bc\s*&&\s*d\.set\([^,]+\s*,\s*(?:encodeURIComponent\s*\()([a-zA-Z0-9$]+)\(/,
-    /\bc\s*&&\s*[a-z]\.set\([^,]+\s*,\s*([a-zA-Z0-9$]+)\(/,
-    /\bc\s*&&\s*[a-z]\.set\([^,]+\s*,\s*encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
-
-    /[$_a-zA-Z0-9]+\.set\((?:[$_a-zA-Z0-9]+\.[$_a-zA-Z0-9]+\|\|)?"signature",\s*([$_a-zA-Z0-9]+)\s*\(/,
-
-    /\.set\([^,]+,encodeURIComponent\(([a-zA-Z0-9$]+)\(/,
-
-    /=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(\w+\.s\)\)/,
-
-    /&&\(\w+=([a-zA-Z0-9$]+)\("[^"]*",decodeURIComponent/,
-    /&&\(\w+=([a-zA-Z0-9$]+)\(decodeURIComponent/,
-  ];
-
-  for (const re of namePatterns) {
+  for (const re of CIPHER_NAME_PATTERNS) {
     const m = js.match(re);
     if (m && m[1]) {
       fn = m[1];
@@ -4362,12 +4310,7 @@ function extractCipherActions(js, pageHtml) {
   }
   if (!fn) {
     // Fallback: find cipher function by the a=a.split("") signature
-    const cipherSplitPatterns = [
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*function\s*\((\w+)\)\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*\((\w+)\)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
-      /(?:^|[;,\n])\s*([a-zA-Z0-9$_]+)\s*=\s*(\w+)\s*=>\s*\{\s*\2\s*=\s*\2\.split\(\s*""\s*\)/m,
-    ];
-    for (const re of cipherSplitPatterns) {
+    for (const re of CIPHER_SPLIT_PATTERNS) {
       const m = re.exec(js);
       if (m) {
         fn = m[1];
@@ -4725,7 +4668,6 @@ async function doMergedDownload(msg) {
     videoId,
     videoTitle,
     videoThumbnail,
-    isRetry403,
   } = msg;
 
   if (!videoUrl || !audioUrl) {
@@ -5061,9 +5003,13 @@ function escRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-chrome.tabs.onRemoved.addListener((id) => {
-  tabData.delete(id);
-  sniffedStreams.delete(id);
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabData.delete(tabId);
+  sniffedStreams.delete(tabId);
+  sniffedYouTubeUrls.delete(tabId);
+  contentHashes.delete(tabId);
+  injectedTabs.delete(tabId);
+  mergeProgress.delete(tabId);
   persistTabData();
 });
 
@@ -5126,26 +5072,6 @@ function isYouTubeTab(tabId) {
   const data = tabData.get(tabId);
   if (data?.videoId) return true;
   return false;
-}
-
-function getTabHost(tabId) {
-  return new Promise((resolve) => {
-    try {
-      chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError || !tab?.url) {
-          resolve(null);
-          return;
-        }
-        try {
-          resolve(new URL(tab.url).hostname);
-        } catch {
-          resolve(null);
-        }
-      });
-    } catch {
-      resolve(null);
-    }
-  });
 }
 
 chrome.webRequest.onResponseStarted.addListener(
@@ -5477,17 +5403,12 @@ function findTabIdForVideoId(videoId) {
   return null;
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  sniffedStreams.delete(tabId);
-  sniffedYouTubeUrls.delete(tabId);
-  contentHashes.delete(tabId);
-});
-
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0 && details.tabId >= 0) {
     sniffedStreams.delete(details.tabId);
     sniffedYouTubeUrls.delete(details.tabId);
     contentHashes.delete(details.tabId);
+    injectedTabs.delete(details.tabId);
   }
 });
 
@@ -5505,8 +5426,6 @@ const DEDICATED_SITES = new Set([
   "x.com",
   "instagram.com",
 ]);
-
-const injectedTabs = new Map();
 
 function findSpecialistForHost(hostname) {
   if (SITE_EXTRACTOR_MAP[hostname]) return SITE_EXTRACTOR_MAP[hostname];
@@ -5730,10 +5649,6 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   } catch (e) {}
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  injectedTabs.delete(tabId);
-});
-
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;
 
@@ -5799,7 +5714,8 @@ async function onSpecialistDetected(msg, tabId) {
             isDASH: f.isDASH === true,
             ext: f.ext || "mp4",
             isModel: f.isModel === true,
-            filename: f.filename || null
+            filename: f.filename || null,
+            headers: f.headers || specialistHeaders || undefined,
           });
         }
       }
@@ -5815,6 +5731,7 @@ async function onSpecialistDetected(msg, tabId) {
         isHLS: videoType === "HLS" || videoType === "M3U8",
         isDASH: videoType === "DASH" || videoType === "MPD",
         isDRM: videoType === "DRM_PROTECTED",
+        headers: specialistHeaders || undefined,
       });
     }
   } else if (msg.protocol === "LALHLIMPUII_JAHAU") {
@@ -6020,65 +5937,53 @@ async function parseHLSMasterPlaylist(masterUrl, headers) {
     // Check if this is a master playlist (contains #EXT-X-STREAM-INF)
     if (!text.includes("#EXT-X-STREAM-INF")) return null;
 
-    const lines = text.split("\n").map((l) => l.trim());
     const variants = [];
-    const baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
-    // Preserve query parameters from master URL for relative variant URLs
     let masterQuery = "";
     try {
-      const parsed = new URL(masterUrl);
-      masterQuery = parsed.search || "";
+      masterQuery = new URL(masterUrl).search || "";
     } catch {}
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+    // Consume each STREAM-INF and its following URI in one pass. This avoids
+    // repeatedly scanning forward through comment lines for every variant.
+    let pending = null;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
 
-      // Parse attributes from the STREAM-INF line
-      const attrs = line.substring("#EXT-X-STREAM-INF:".length);
-      let bandwidth = 0;
-      let width = 0;
-      let height = 0;
-      let resolution = "";
-      let codecs = "";
-      let name = "";
-
-      const bwMatch = attrs.match(/BANDWIDTH=(\d+)/i);
-      if (bwMatch) bandwidth = parseInt(bwMatch[1]);
-
-      const resMatch = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
-      if (resMatch) {
-        width = parseInt(resMatch[1]);
-        height = parseInt(resMatch[2]);
-        resolution = `${width}x${height}`;
+      if (line.startsWith("#EXT-X-STREAM-INF:")) {
+        const attrs = line.substring("#EXT-X-STREAM-INF:".length);
+        const bwMatch = attrs.match(/BANDWIDTH=(\d+)/i);
+        const resMatch = attrs.match(/RESOLUTION=(\d+)x(\d+)/i);
+        const codecMatch = attrs.match(/CODECS="([^"]+)"/i);
+        const nameMatch = attrs.match(/NAME="([^"]+)"/i);
+        pending = {
+          bandwidth: bwMatch ? parseInt(bwMatch[1]) : 0,
+          width: resMatch ? parseInt(resMatch[1]) : 0,
+          height: resMatch ? parseInt(resMatch[2]) : 0,
+          codecs: codecMatch ? codecMatch[1] : "",
+          name: nameMatch ? nameMatch[1] : "",
+        };
+        continue;
       }
 
-      const codecMatch = attrs.match(/CODECS="([^"]+)"/i);
-      if (codecMatch) codecs = codecMatch[1];
+      if (line.startsWith("#") || !pending) continue;
 
-      const nameMatch = attrs.match(/NAME="([^"]+)"/i);
-      if (nameMatch) name = nameMatch[1];
-
-      // Next non-empty, non-comment line is the variant URL
-      let variantUrl = "";
-      for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j] && !lines[j].startsWith("#")) {
-          variantUrl = lines[j];
-          break;
-        }
-      }
-
-      if (!variantUrl) continue;
-
-      // Resolve the variant URL
-      if (!variantUrl.startsWith("http")) {
-        // Relative URL — resolve against master playlist base
-        variantUrl = baseUrl + variantUrl;
-        // Add master query params if the variant doesn't have its own
-        if (masterQuery && !variantUrl.includes("?")) {
+      let variantUrl;
+      try {
+        variantUrl = new URL(line, masterUrl).href;
+        // Preserve query parameters from the master URL for relative variants
+        // that do not provide their own query string.
+        const isRelative = !/^https?:\/\//i.test(line) && !line.startsWith("//");
+        if (isRelative && !line.includes("?") && masterQuery && !variantUrl.includes("?")) {
           variantUrl += masterQuery;
         }
+      } catch {
+        pending = null;
+        continue;
       }
+
+      const { bandwidth, width, height, codecs, name } = pending;
+      pending = null;
 
       const qualityLabel = height
         ? `${height}p`
@@ -6383,14 +6288,6 @@ async function onIframeStreamDetected(msg, tabId) {
   console.log(
     `[BG] Iframe stream detected on tab ${tabId} from ${msg.frameUrl || "unknown"}: ${url.substring(0, 120)}`,
   );
-
-  // Treat hlsContent and proxyDetected as HLS
-  const streamType =
-    isM3u8 || isHlsContent || isProxyDetected
-      ? "hls"
-      : isMpd
-        ? "dash"
-        : "direct";
 
   // Try to merge into existing specialist tabData
   const existing = tabData.get(tabId);

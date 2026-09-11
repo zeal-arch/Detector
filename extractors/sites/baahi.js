@@ -90,6 +90,7 @@
       get: srcDescriptor.get,
       set(val) {
         detectAudioUrl(val);
+        // eslint-disable-next-line no-setter-return
         return srcDescriptor.set.call(this, val);
       },
       configurable: true,

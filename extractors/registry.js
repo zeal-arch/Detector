@@ -46,11 +46,10 @@ class ExtractorRegistry {
   }
 
   async activate(url) {
-
     const normalizeUrl = (u) => {
       try {
         const parsed = new URL(u);
-        return parsed.origin + parsed.pathname;
+        return parsed.origin + parsed.pathname + parsed.search;
       } catch {
         return u;
       }
@@ -62,39 +61,47 @@ class ExtractorRegistry {
       return this._activeExtractor;
     }
 
-    const extractor = this.getExtractor(url);
-    if (!extractor) {
+    let matchedEntry = null;
+    for (const entry of this._extractors) {
+      try {
+        if (entry.cls.canHandle(url)) {
+          matchedEntry = entry;
+          break;
+        }
+      } catch (e) {
+        console.warn(`[Registry] Error checking ${entry.name}:`, e.message);
+      }
+    }
+
+    if (!matchedEntry) {
       console.log("[Registry] No extractor matched for:", url.substring(0, 80));
       this._deactivate();
       return null;
     }
 
-    if (
-      this._activeExtractor &&
-      this._activeExtractor.name !== extractor.name
-    ) {
+    if (this._activeExtractor) {
+      if (this._activeExtractor.name === matchedEntry.name) {
+        this._currentUrl = url;
+        return this._activeExtractor;
+      }
       console.log(
-        `[Registry] Switching from ${this._activeExtractor.name} to ${extractor.name}`,
+        `[Registry] Switching from ${this._activeExtractor.name} to ${matchedEntry.name}`,
       );
       this._deactivate();
     }
 
-    if (
-      this._activeExtractor &&
-      this._activeExtractor.name === extractor.name
-    ) {
-      this._currentUrl = url;
-      return this._activeExtractor;
-    }
-
     try {
+      console.log(
+        `[Registry] Matched: ${matchedEntry.name} for ${url.substring(0, 80)}`,
+      );
+      const extractor = new matchedEntry.cls();
       await extractor.init();
       this._activeExtractor = extractor;
       this._currentUrl = url;
       console.log(`[Registry] Activated: ${extractor.name}`);
       return extractor;
     } catch (e) {
-      console.error(`[Registry] Failed to init ${extractor.name}:`, e);
+      console.error(`[Registry] Failed to init ${matchedEntry.name}:`, e);
       return null;
     }
   }

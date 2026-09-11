@@ -212,6 +212,7 @@
               } catch {}
               return;
             }
+            // eslint-disable-next-line no-setter-return
             return origLocationSet.call(this, val);
           },
           configurable: true,

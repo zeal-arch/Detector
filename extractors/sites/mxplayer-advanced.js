@@ -45,7 +45,8 @@ class MXPlayerExtractor extends BaseExtractor {
 
   _injectSpecialistFile() {
     try {
-      const url = chrome.runtime.getURL("extractors/sites/mxplayer.js");
+      const url = this.getURL("extractors/sites/mxplayer.js");
+      if (!url) return;
       const script = document.createElement("script");
       script.src = url;
       script.dataset.extractor = "mxplayer";

@@ -91,7 +91,8 @@ class BaahiExtractor extends BaseExtractor {
 
   _injectSpecialistFile() {
     try {
-      const url = chrome.runtime.getURL("extractors/sites/baahi.js");
+      const url = this.getURL("extractors/sites/baahi.js");
+      if (!url) return;
       const script = document.createElement("script");
       script.src = url;
       script.dataset.extractor = "baahi";

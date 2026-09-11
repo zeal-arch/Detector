@@ -1,3 +1,8 @@
+const INLINE_MEDIA_HINT_RE =
+  /m3u8|mpd|(?:mp4|webm|mov|mkv|flv|f4v|m4v|avi)|(?:mp3|m4a|aac|ogg|opus|flac|wav)|video|stream|hls|dash|playback|manifest|media/i;
+const INLINE_MEDIA_CONFIG_RE =
+  /["']?(?:video_?url|video_?src|stream_?url|hls_?url|dash_?url|manifest_?url|playback_?url|media_?url|file_?url|clip_?url|content_?url|download_?url|source_?url|asset_?url)["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/gi;
+
 class GenericExtractor extends BaseExtractor {
   constructor() {
     super("Generic");
@@ -450,7 +455,13 @@ class GenericExtractor extends BaseExtractor {
 
     for (const script of document.querySelectorAll("script:not([src])")) {
       const text = script.textContent;
-      if (!text || text.length < 20) continue;
+      if (
+        !text ||
+        text.length < 20 ||
+        text.length > 5000000 ||
+        !INLINE_MEDIA_HINT_RE.test(text)
+      )
+        continue;
 
       const m3u8Matches = text.matchAll(
         /(https?:\/\/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?)/gi,
@@ -551,29 +562,24 @@ class GenericExtractor extends BaseExtractor {
       }
 
       // Video config object patterns: key: "value" or "key": "value"
-      const configPatterns = [
-        /["']?(?:video_?url|video_?src|stream_?url|hls_?url|dash_?url|manifest_?url|playback_?url|media_?url|file_?url|clip_?url|content_?url|download_?url|source_?url|asset_?url)["']?\s*[:=]\s*["'](https?:\/\/[^"']+)["']/gi,
-      ];
-      for (const pat of configPatterns) {
-        const configMatches = text.matchAll(pat);
-        for (const cm of configMatches) {
-          const url = cm[1];
-          if (url.length > 500 || this._detectedUrls.has(url)) continue;
-          if (/thumb|poster|preview|sprite|logo|icon/i.test(url)) continue;
-          this._detectedUrls.add(url);
-          const mime = this._guessMimeFromUrl(url);
-          formats.push(
-            this.buildFormat({
-              url,
-              mimeType: mime,
-              quality: "Config Value",
-              qualityLabel: "Script Config URL",
-              isVideo: true,
-              isMuxed: true,
-              ext: this.guessExtension(mime),
-            }),
-          );
-        }
+      const configMatches = text.matchAll(INLINE_MEDIA_CONFIG_RE);
+      for (const cm of configMatches) {
+        const url = cm[1];
+        if (url.length > 500 || this._detectedUrls.has(url)) continue;
+        if (/thumb|poster|preview|sprite|logo|icon/i.test(url)) continue;
+        this._detectedUrls.add(url);
+        const mime = this._guessMimeFromUrl(url);
+        formats.push(
+          this.buildFormat({
+            url,
+            mimeType: mime,
+            quality: "Config Value",
+            qualityLabel: "Script Config URL",
+            isVideo: true,
+            isMuxed: true,
+            ext: this.guessExtension(mime),
+          }),
+        );
       }
     }
 
@@ -1867,8 +1873,6 @@ class GenericExtractor extends BaseExtractor {
 
   _scanBackgroundImages() {
     try {
-      const formats = [];
-
       const candidates = document.querySelectorAll(
         '[style*="background"], [class*="hero"], [class*="banner"], ' +
           '[class*="cover"], [class*="bg"], [class*="background"], ' +

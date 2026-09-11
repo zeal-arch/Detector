@@ -55,7 +55,20 @@ class BaseExtractor {
       source: msg.pageData.formatSource,
     });
 
-    chrome.runtime.sendMessage(msg);
+    try {
+      if (typeof chrome !== "undefined" && chrome?.runtime?.sendMessage) {
+        chrome.runtime.sendMessage(msg, () => {
+          if (chrome.runtime.lastError) {
+            // Context invalidated or receiver closed
+          }
+        });
+      } else if (
+        typeof browser !== "undefined" &&
+        browser?.runtime?.sendMessage
+      ) {
+        browser.runtime.sendMessage(msg).catch(() => {});
+      }
+    } catch {}
   }
 
   observe(target, options, callback) {
@@ -201,6 +214,16 @@ class BaseExtractor {
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
     if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + " MB";
     return (bytes / 1073741824).toFixed(2) + " GB";
+  }
+
+  getURL(path) {
+    if (typeof chrome !== "undefined" && chrome?.runtime?.getURL) {
+      return chrome.runtime.getURL(path);
+    }
+    if (typeof browser !== "undefined" && browser?.runtime?.getURL) {
+      return browser.runtime.getURL(path);
+    }
+    return null;
   }
 
   destroy() {

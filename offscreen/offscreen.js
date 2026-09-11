@@ -107,29 +107,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 function handleEvalNSig(msg, sendResponse) {
   const id = nextId++;
-  pending.set(id, sendResponse);
+  const timer = setTimeout(() => {
+    if (pending.has(id)) {
+      console.log("[OFFSCREEN] N-sig sandbox eval timed out after 10s");
+      const entry = pending.get(id);
+      pending.delete(id);
+      const respond = entry.respond || entry;
+      respond({
+        error: "Sandbox timeout",
+        results: [],
+        timedOut: true,
+      });
+    }
+  }, 10000);
+
+  pending.set(id, { respond: sendResponse, timer });
 
   sandbox.contentWindow.postMessage(
     { id, action: "EVAL_NSIG", fnCode: msg.fnCode, params: msg.params },
     "*",
   );
-
-  setTimeout(() => {
-    if (pending.has(id)) {
-      console.log("[OFFSCREEN] N-sig sandbox eval timed out after 10s");
-      pending.get(id)({
-        error: "Sandbox timeout",
-        results: [],
-        timedOut: true,
-      });
-      pending.delete(id);
-    }
-  }, 10000);
 }
 
 function handleEvalCipher(msg, sendResponse) {
   const id = nextId++;
-  pending.set(id, sendResponse);
+  const timer = setTimeout(() => {
+    if (pending.has(id)) {
+      console.log("[OFFSCREEN] Cipher sandbox eval timed out after 10s");
+      const entry = pending.get(id);
+      pending.delete(id);
+      const respond = entry.respond || entry;
+      respond({
+        error: "Sandbox cipher timeout",
+        results: [],
+        timedOut: true,
+      });
+    }
+  }, 10000);
+
+  pending.set(id, { respond: sendResponse, timer });
 
   sandbox.contentWindow.postMessage(
     {
@@ -141,18 +157,6 @@ function handleEvalCipher(msg, sendResponse) {
     },
     "*",
   );
-
-  setTimeout(() => {
-    if (pending.has(id)) {
-      console.log("[OFFSCREEN] Cipher sandbox eval timed out after 10s");
-      pending.get(id)({
-        error: "Sandbox cipher timeout",
-        results: [],
-        timedOut: true,
-      });
-      pending.delete(id);
-    }
-  }, 10000);
 }
 
 function handleSolvePlayer(msg, sendResponse) {
@@ -175,36 +179,22 @@ function handleSolvePlayer(msg, sendResponse) {
   }
 
   const id = nextId++;
-  pending.set(id, sendResponse);
-
-  sandbox.contentWindow.postMessage(
-    {
-      id,
-      action: "SOLVE_PLAYER",
-      playerJs: msg.playerJs,
-      playerUrl: msg.playerUrl,
-      nChallenges: msg.nChallenges || [],
-      sigChallenges: msg.sigChallenges || [],
-    },
-    "*",
-  );
-
-  // Player.js parsing + execution can take a while on first run (~1-2s)
-  // Use a generous 30s timeout
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     if (pending.has(id)) {
       console.log("[OFFSCREEN] Player solver timed out after 30s");
       // Mark this player URL as failed to prevent retry storms
       if (playerUrl) {
         failedPlayerUrls.set(playerUrl, Date.now());
       }
-      pending.get(id)({
+      const entry = pending.get(id);
+      pending.delete(id);
+      const respond = entry.respond || entry;
+      respond({
         error: "Player solver timeout",
         nResults: {},
         sigResults: {},
         timedOut: true,
       });
-      pending.delete(id);
 
       // Reload the sandbox iframe to unstick it from any infinite loop
       try {
@@ -217,6 +207,20 @@ function handleSolvePlayer(msg, sendResponse) {
       }
     }
   }, 30000);
+
+  pending.set(id, { respond: sendResponse, timer });
+
+  sandbox.contentWindow.postMessage(
+    {
+      id,
+      action: "SOLVE_PLAYER",
+      playerJs: msg.playerJs,
+      playerUrl: msg.playerUrl,
+      nChallenges: msg.nChallenges || [],
+      sigChallenges: msg.sigChallenges || [],
+    },
+    "*",
+  );
 }
 
 window.addEventListener("message", (e) => {
@@ -225,8 +229,11 @@ window.addEventListener("message", (e) => {
     e.data || {};
   if (!id || !pending.has(id)) return;
 
-  const respond = pending.get(id);
+  const entry = pending.get(id);
   pending.delete(id);
+  if (entry && entry.timer) clearTimeout(entry.timer);
+
+  const respond = entry.respond || entry;
 
   // SOLVE_PLAYER responses have nResults/sigResults instead of results
   if (nResults !== undefined || sigResults !== undefined) {

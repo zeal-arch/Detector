@@ -969,6 +969,7 @@
               title: getCleanTitle(),
             });
           }
+          // eslint-disable-next-line no-setter-return
           return originalSrcSet.call(this, val);
         },
         get: srcDesc.get,

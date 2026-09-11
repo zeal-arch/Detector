@@ -3,3 +3,7 @@
 /sketchfab.com.har
 /web-app
 .markdown-collab/
+node_modules/
+eslint-report.json
+graphify-out/
+

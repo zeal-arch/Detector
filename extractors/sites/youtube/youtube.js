@@ -77,11 +77,19 @@ class YouTubeExtractor extends BaseExtractor {
 
   _injectMainWorldScript() {
     if (this._injected) return;
-    this._injected = true;
 
     try {
+      const scriptUrl = this.getURL("extractors/sites/youtube/inject.js");
+      if (!scriptUrl) {
+        console.warn(
+          this.TAG,
+          "[S49] Extension runtime context unavailable (getURL failed), skipping inject.js injection.",
+        );
+        return;
+      }
+      this._injected = true;
       const s = document.createElement("script");
-      s.src = chrome.runtime.getURL("extractors/sites/youtube/inject.js");
+      s.src = scriptUrl;
       s.onload = () => s.remove();
       s.onerror = () => {
         console.error(
@@ -111,6 +119,17 @@ class YouTubeExtractor extends BaseExtractor {
     // inject.js cannot fetch player.js due to YouTube's Service Worker
     // intercepting requests. Relay: inject.js -> content script -> background.js -> content script -> inject.js
     if (e.data.type === MAGIC + "_fetch_request" && e.data.url) {
+      if (typeof chrome === "undefined" || !chrome?.runtime?.sendMessage) {
+        window.postMessage(
+          {
+            type: MAGIC + "_fetch_response",
+            requestId: e.data.requestId,
+            error: "Extension context unavailable",
+          },
+          window.location.origin,
+        );
+        return;
+      }
       chrome.runtime
         .sendMessage({
           action: "FETCH_PLAYER_JS",
@@ -190,17 +209,19 @@ class YouTubeExtractor extends BaseExtractor {
     });
 
     try {
-      chrome.runtime
-        .sendMessage({
-          action: "VIDEO_DETECTED",
-          videoId: merged.videoId,
-          url: window.location.href,
-          pageData: merged,
-        })
-        .catch((err) => {
-          if (!err.message?.includes("Extension context invalidated"))
-            console.warn(this.TAG, "sendMessage failed:", err.message);
-        });
+      if (typeof chrome !== "undefined" && chrome?.runtime?.sendMessage) {
+        chrome.runtime
+          .sendMessage({
+            action: "VIDEO_DETECTED",
+            videoId: merged.videoId,
+            url: window.location.href,
+            pageData: merged,
+          })
+          .catch((err) => {
+            if (!err.message?.includes("Extension context invalidated"))
+              console.warn(this.TAG, "sendMessage failed:", err.message);
+          });
+      }
     } catch (ex) {
       if (!ex.message?.includes("Extension context invalidated"))
         console.warn(this.TAG, "sendMessage sync error:", ex.message);
@@ -226,21 +247,23 @@ class YouTubeExtractor extends BaseExtractor {
         const scriptData = this._scanScriptTags();
         if (scriptData.playerResponse || scriptData.playerUrl) {
           try {
-            chrome.runtime
-              .sendMessage({
-                action: "VIDEO_DETECTED",
-                videoId: videoId,
-                url: window.location.href,
-                pageData: scriptData,
-              })
-              .catch((err) => {
-                if (!err.message?.includes("Extension context invalidated"))
-                  console.warn(
-                    this.TAG,
-                    "sendMessage (navigate) failed:",
-                    err.message,
-                  );
-              });
+            if (typeof chrome !== "undefined" && chrome?.runtime?.sendMessage) {
+              chrome.runtime
+                .sendMessage({
+                  action: "VIDEO_DETECTED",
+                  videoId: videoId,
+                  url: window.location.href,
+                  pageData: scriptData,
+                })
+                .catch((err) => {
+                  if (!err.message?.includes("Extension context invalidated"))
+                    console.warn(
+                      this.TAG,
+                      "sendMessage (navigate) failed:",
+                      err.message,
+                    );
+                });
+            }
           } catch (ex) {
             if (!ex.message?.includes("Extension context invalidated"))
               console.warn(

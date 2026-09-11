@@ -212,7 +212,8 @@ class LersiaPlayExtractor extends BaseExtractor {
 
   _injectSpecialistFile() {
     try {
-      const url = chrome.runtime.getURL("extractors/sites/lersiaplay.js");
+      const url = this.getURL("extractors/sites/lersiaplay.js");
+      if (!url) return;
       const script = document.createElement("script");
       script.src = url;
       script.dataset.extractor = "lersiaplay";

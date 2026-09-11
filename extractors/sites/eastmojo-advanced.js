@@ -282,7 +282,8 @@ class EastMojoExtractor extends BaseExtractor {
 
   _injectSpecialistFile() {
     try {
-      const url = chrome.runtime.getURL("extractors/sites/eastmojo.js");
+      const url = this.getURL("extractors/sites/eastmojo.js");
+      if (!url) return;
       const script = document.createElement("script");
       script.src = url;
       script.dataset.extractor = "eastmojo";

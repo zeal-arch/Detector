@@ -40,11 +40,6 @@ function getQualityLabel(f) {
   if (f.qualityLabel) return f.qualityLabel;
   if (f.height) return `${f.height}p`;
   if (f.audioQuality) return f.audioQuality.replace("AUDIO_QUALITY_", "");
-  return f.quality || "Unknown";
-}
-
-function isHighQuality(f) {
-  return (f.height || 0) >= 720;
 }
 
 function getCodecInfo(f) {
@@ -169,7 +164,6 @@ function generateFilename(title, quality, container) {
 const content = document.getElementById("content");
 let currentView = "list";
 let currentFormats = [];
-let currentAudioFormats = [];
 let currentVideoTitle = "";
 let currentVideoId = null;
 let currentVideoInfo = null;
@@ -315,8 +309,6 @@ function renderVideo(info) {
       audioOnly.push(f);
     }
   }
-
-  currentAudioFormats = audioOnly;
 
   muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
   videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0));

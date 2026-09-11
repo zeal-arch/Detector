@@ -1,0 +1,24 @@
+{
+  "name": "detector-extension",
+  "version": "1.0.0",
+  "description": "Multi-browser streaming video/audio detector extension",
+  "private": true,
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "lint:html": "htmlhint popup/popup.html offscreen/offscreen.html sandbox/sandbox.html",
+    "lint:css": "stylelint \"web-app/public/**/*.css\"",
+    "dupes": "jscpd --ignore \"**/node_modules/**,**/graphify-out/**,**/vendor/**,**/lib/libav*\" .",
+    "check": "npm run lint && npm run lint:html && npm run lint:css",
+    "check:all": "npm run check && npm run dupes"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^15.15.0",
+    "htmlhint": "^1.9.2",
+    "jscpd": "^4.3.0",
+    "stylelint": "^16.26.1",
+    "stylelint-config-standard": "^36.0.1"
+  }
+}

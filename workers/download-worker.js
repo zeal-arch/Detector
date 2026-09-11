@@ -315,25 +315,50 @@ function cyrb53(str, seed = 0) {
 }
 
 function hashSegmentData(data) {
-  const len = data.byteLength;
-  if (len < 1048576) {
-    let key = String(len) + ":";
-    for (let i = 0; i < len; i++) key += String.fromCharCode(data[i]);
-    return cyrb53(key);
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const len = bytes.length;
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+
+  // Mix in length
+  h1 = Math.imul(h1 ^ len, 2654435761);
+  h2 = Math.imul(h2 ^ len, 1597334677);
+
+  if (len <= 16384) {
+    for (let i = 0; i < len; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 2654435761);
+      h2 = Math.imul(h2 ^ b, 1597334677);
+    }
+  } else {
+    // Sample head (8KB), mid (4KB), tail (4KB)
+    const headEnd = 8192;
+    const midStart = (len >> 1) - 2048;
+    const midEnd = midStart + 4096;
+    const tailStart = len - 4096;
+
+    for (let i = 0; i < headEnd; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 2654435761);
+      h2 = Math.imul(h2 ^ b, 1597334677);
+    }
+    for (let i = midStart; i < midEnd; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 2654435761);
+      h2 = Math.imul(h2 ^ b, 1597334677);
+    }
+    for (let i = tailStart; i < len; i++) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 2654435761);
+      h2 = Math.imul(h2 ^ b, 1597334677);
+    }
   }
 
-  const headSize = 8192;
-  const midStart = Math.floor(len / 2) - 2048;
-  const midSize = 4096;
-  const tailStart = len - 4096;
-  const tailSize = 4096;
-  let key = String(len) + ":";
-  for (let i = 0; i < headSize; i++) key += String.fromCharCode(data[i]);
-  for (let i = midStart; i < midStart + midSize; i++)
-    key += String.fromCharCode(data[i]);
-  for (let i = tailStart; i < tailStart + tailSize; i++)
-    key += String.fromCharCode(data[i]);
-  return cyrb53(key);
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
 
 const activeDownloads = new Map();

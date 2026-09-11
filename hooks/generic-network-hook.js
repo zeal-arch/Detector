@@ -900,6 +900,7 @@
               "*",
             );
           }
+          // eslint-disable-next-line no-setter-return
           return origSrcObjSet.call(this, value);
         },
         get: srcObjDesc.get ? srcObjDesc.get : undefined,

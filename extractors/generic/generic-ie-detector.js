@@ -9,7 +9,7 @@
   const processedVideos = new Set();
   let detectionAttempted = false;
 
-  const SPECIALIST_SITES = [
+  const SPECIALIST_SITES = new Set([
     // Video platforms
     "youtube.com",
     "youtu.be",
@@ -121,91 +121,88 @@
     "bbc.com",
     "reuters.com",
     "bloomberg.com",
-    "cbsnews.com",
-    "nbcnews.com",
     "aljazeera.com",
     "france24.com",
     "dw.com",
     "skynews.com",
-    "sky.com",
+    "abcnews.go.com",
+    "cbsnews.com",
+    "nbcnews.com",
     "nytimes.com",
     "washingtonpost.com",
-    "espn.com",
-    "abcnews.go.com",
+    "eastmojo.com",
+    "northeasttoday.in",
 
-    // Asian platforms
-    "bilibili.com",
-    "acfun.cn",
-    "iq.com",
-    "iqiyi.com",
-    "youku.com",
-    "mgtv.com",
-    "douyin.com",
-    "niconico.jp",
+    // Regional / international TV
+    "ardmediathek.de",
+    "zdf.de",
+    "arte.tv",
+    "francetvinfo.fr",
+    "france.tv",
+    "raiplay.it",
+    "rtve.es",
+    "cda.pl",
+    "svtplay.se",
+    "nrk.no",
+    "drtv.dk",
+    "ertflix.gr",
+    "tver.jp",
+    "abema.tv",
+    "nhk.or.jp",
     "nicovideo.jp",
-    "naver.com",
-    "vlive.tv",
-    "daum.net",
     "hotstar.com",
     "sonyliv.com",
     "zee5.com",
-    "viu.com",
+    "mxplayer.in",
+    "baahi.in",
+    "lersiaplay.com",
+    "bilibili.com",
+    "douyin.com",
+    "youku.com",
+    "iqiyi.com",
+    "mgtv.com",
+    "cctv.com",
+    "acfun.cn",
+    "naver.com",
+    "daum.net",
+    "9now.com.au",
+    "7plus.com.au",
+    "iview.abc.net.au",
+    "sbs.com.au",
+    "itv.com",
+    "channel4.com",
     "shahid.mbc.net",
-    "tver.jp",
-    "abema.tv",
+    "globoplay.globo.com",
+    "viu.com",
 
-    // Education
+    // Learning / courses
+    "khanacademy.org",
     "coursera.org",
     "udemy.com",
     "skillshare.com",
     "masterclass.com",
-    "khanacademy.org",
-    "egghead.io",
     "pluralsight.com",
+    "egghead.io",
     "ted.com",
 
-    // Public broadcasters
-    "ard.de",
-    "ardmediathek.de",
-    "zdf.de",
-    "arte.tv",
-    "france.tv",
-    "rai.it",
-    "raiplay.it",
-    "itv.com",
-    "channel4.com",
-    "svtplay.se",
-    "svt.se",
-    "nrk.no",
-    "dr.dk",
-    "ertflix.gr",
-    "9now.com.au",
-    "sbs.com.au",
-    "nhk.or.jp",
-    "cctv.com",
-    "cda.pl",
-
-    // Hosting / tools / misc
-    "imgur.com",
-    "flickr.com",
-    "archive.org",
+    // Cloud storage / file hosting
     "dropbox.com",
-    "loom.com",
-    "vidyard.com",
-    "wistia.com",
-    "canva.com",
-    "floatplane.com",
-    "patreon.com",
-    "steam.com",
-    "steampowered.com",
-    "medal.tv",
+    "archive.org",
+    "imgur.com",
     "gfycat.com",
     "redgifs.com",
-    "telegram.org",
+
+    // Video hosting / enterprise
+    "wistia.com",
+    "vidyard.com",
+    "loom.com",
+    "floatplane.com",
+    "patreon.com",
+    "steamcommunity.com",
+    "store.steampowered.com",
     "t.me",
-    "web.telegram.org",
-    "globo.com",
-    "globoplay.com",
+    "telegram.org",
+    "medal.tv",
 
     // Embed / player CDNs
     "brightcove.com",
@@ -222,14 +219,22 @@
     "ign.com",
     "cspan.org",
     "9gag.com",
-  ];
+  ]);
 
   const hostname = window.location.hostname
-    .replace("www.", "")
-    .replace("m.", "");
-  const hasSpecialist = SPECIALIST_SITES.some((site) =>
-    hostname.includes(site),
-  );
+    .replace(/^www\./, "")
+    .replace(/^m\./, "");
+
+  function checkHasSpecialist(host) {
+    if (SPECIALIST_SITES.has(host)) return true;
+    const parts = host.split(".");
+    for (let i = 1; i < parts.length - 1; i++) {
+      if (SPECIALIST_SITES.has(parts.slice(i).join("."))) return true;
+    }
+    return false;
+  }
+
+  const hasSpecialist = checkHasSpecialist(hostname);
 
   if (hasSpecialist) {
     console.log(

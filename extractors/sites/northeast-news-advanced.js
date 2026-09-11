@@ -258,7 +258,8 @@ class NortheastNewsExtractor extends BaseExtractor {
 
   _injectSpecialistFile() {
     try {
-      const url = chrome.runtime.getURL("extractors/sites/northeast-news.js");
+      const url = this.getURL("extractors/sites/northeast-news.js");
+      if (!url) return;
       const script = document.createElement("script");
       script.src = url;
       script.dataset.extractor = "northeast-news";

@@ -9,15 +9,24 @@
 
   function injectMainWorldScript() {
     if (injected) return;
-    injected = true;
 
-    const s = document.createElement("script");
-    s.src = chrome.runtime.getURL("extractors/sites/youtube/inject.js");
-    s.onload = function () {
-      s.remove();
-    };
-    (document.head || document.documentElement).appendChild(s);
-    console.log("[YT-DL] inject.js injected into MAIN world");
+    try {
+      const getURL =
+        (typeof chrome !== "undefined" && chrome?.runtime?.getURL?.bind(chrome.runtime)) ||
+        (typeof browser !== "undefined" && browser?.runtime?.getURL?.bind(browser.runtime));
+      if (!getURL) return;
+
+      injected = true;
+      const s = document.createElement("script");
+      s.src = getURL("extractors/sites/youtube/inject.js");
+      s.onload = function () {
+        s.remove();
+      };
+      (document.head || document.documentElement).appendChild(s);
+      console.log("[YT-DL] inject.js injected into MAIN world");
+    } catch (e) {
+      console.warn("[YT-DL] inject.js injection failed:", e.message);
+    }
   }
 
   function getVideoId() {
