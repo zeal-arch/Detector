@@ -7,7 +7,6 @@ export default [
       "node_modules/**",
       "graphify-out/**",
       "lib/libav*",
-      "web-app/**",
       "sandbox/vendor/**",
     ],
   },

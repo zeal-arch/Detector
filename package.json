@@ -7,9 +7,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "lint:html": "htmlhint popup/popup.html offscreen/offscreen.html sandbox/sandbox.html",
-    "lint:css": "stylelint \"web-app/public/**/*.css\"",
     "dupes": "jscpd --ignore \"**/node_modules/**,**/graphify-out/**,**/vendor/**,**/lib/libav*\" .",
-    "check": "npm run lint && npm run lint:html && npm run lint:css",
+    "check": "npm run lint && npm run lint:html",
     "check:all": "npm run check && npm run dupes"
   },
   "devDependencies": {
