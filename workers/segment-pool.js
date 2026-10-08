@@ -872,6 +872,19 @@ class SegmentPool {
               // Cleanup handled below
             }
 
+            // In a worker, redirect:"manual" yields an opaque status-0 response
+            // with no Location, so the loop detection below cannot work.
+            // Let the browser follow the redirect natively instead.
+            if (resp.type === "opaqueredirect") {
+              resp = await fetch(fetchUrl, {
+                headers,
+                signal: controller.signal,
+                cache: "no-cache",
+                redirect: "follow",
+              });
+              break;
+            }
+
             // S41: Check for redirect responses (3xx status codes)
             if (resp.status >= 300 && resp.status < 400) {
               const location = resp.headers.get("Location");
@@ -1247,6 +1260,18 @@ class SegmentPool {
             this.cancel();
           }
           throw err; // permanent — no retry
+        }
+
+        // Errors that are permanent by nature: retrying cannot change the
+        // outcome. Ad-server / junk-content errors are deliberately NOT here:
+        // for pirate CDNs the outer retry gives each attempt a fresh ad-retry
+        // budget (see the adRetries reset below).
+        if (
+          /HTTP 451|HTTP 404|Permanent 404|Redirect loop|Too many redirects|redirect with no Location|Video removed|Multiple 403/i.test(
+            err.message || "",
+          )
+        ) {
+          throw err;
         }
 
         // For pirate CDNs, reset ad retry budget on general retry so each

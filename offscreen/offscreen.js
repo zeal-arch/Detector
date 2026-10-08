@@ -414,11 +414,12 @@ async function cleanupMergeOPFS() {
     const root = await getOPFSRoot();
     let removed = 0;
     for await (const [name] of root) {
+      // Only merge scratch files. m3u8_<id>_ folders belong to HLS downloads
+      // that may still be running; those clean up via cleanupOPFSByPrefix.
       if (
-        name.startsWith("merge_video_") ||
-        name.startsWith("merge_audio_") ||
-        name.startsWith("merge_output_") ||
-        name.startsWith("m3u8_")
+        name.startsWith("merge_video") ||
+        name.startsWith("merge_audio") ||
+        name.startsWith("merge_output_")
       ) {
         await root.removeEntry(name, { recursive: true }).catch(() => {});
         removed++;
@@ -1221,8 +1222,16 @@ function handleStartWorkerDownload(msg, sendResponse) {
                 finalFilename = guessExtension(
                   filename,
                   msgData.mimeType || msgData.contentType,
-                );
+                ).replace(/(\.[^./\\]+)$/, "_NO-AUDIO$1");
                 finalSize = msgData.size || 0;
+                bc.postMessage({
+                  type: "WORKER_PROGRESS",
+                  downloadId,
+                  phase: "merging",
+                  message: "Audio merge failed - saving video only",
+                  percent: -1,
+                  filename: finalFilename,
+                });
                 // Revoke only the audio blob URL since we're using video blob URL
                 URL.revokeObjectURL(msgData.audioBlobUrl);
               }

@@ -70,7 +70,7 @@
 
                 if (wistiaId) {
                     notifyBackground({
-                        url: `wistia://${wistiaId[1] || wistiaId}`,
+                        url: `wistia://${Array.isArray(wistiaId) ? wistiaId[1] : wistiaId}`,
                         title: document.title,
                         type: 'WISTIA'
                     });

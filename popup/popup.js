@@ -259,6 +259,12 @@ function renderVideo(info) {
     drmType,
     drmConfidence,
   } = info;
+  // Formats without an itag (generic extractor) would all share "d:0" /
+  // "d:undefined" and resolve to the first entry; give each a unique key.
+  let syntheticKey = 70000;
+  for (const f of formats || []) {
+    if (!f.itag) f.itag = syntheticKey++;
+  }
   currentFormats = formats;
   currentVideoTitle = title || "Video";
   currentVideoId = videoId || null;
@@ -363,7 +369,7 @@ function renderVideo(info) {
     <div class="video-card" id="vcard">
       <div class="video-header">
         <div class="video-thumb">
-          <img src="${thumbUrl}" alt="" class="thumb-img">
+          <img src="${escapeHtml(thumbUrl)}" alt="" class="thumb-img">
           ${lengthSeconds ? `<span class="thumb-badge">${formatDuration(lengthSeconds)}</span>` : ""}
           ${qualityBadge ? `<span class="thumb-quality">${qualityBadge}</span>` : ""}
         </div>
@@ -395,6 +401,9 @@ function renderVideo(info) {
         alert("This video is DRM protected and cannot be downloaded.");
         return;
       }
+      // Button is in "Stop" mode (own onclick set by workerDownload); this
+      // listener is still attached and must not start another download.
+      if (document.getElementById("dlBtn")?.onclick) return;
       const fmt = bestFmt;
       if (!fmt?.url) return;
       const filename = generateFilename(
@@ -444,7 +453,7 @@ function renderVideo(info) {
     <div class="video-card" id="vcard">
       <div class="video-header">
         <div class="video-thumb">
-          <img src="${thumbUrl}" alt="" class="thumb-img">
+          <img src="${escapeHtml(thumbUrl)}" alt="" class="thumb-img">
           <span class="thumb-quality">3D</span>
         </div>
         <div class="video-info">
@@ -556,7 +565,7 @@ function renderVideo(info) {
     <div class="video-card" id="vcard">
       <div class="video-header">
         <div class="video-thumb">
-          <img src="${thumbUrl}" alt="" class="thumb-img">
+          <img src="${escapeHtml(thumbUrl)}" alt="" class="thumb-img">
           ${lengthSeconds ? `<span class="thumb-badge">${formatDuration(lengthSeconds)}</span>` : ""}
           ${qualityBadge ? `<span class="thumb-quality">${qualityBadge}</span>` : ""}
         </div>
@@ -701,7 +710,7 @@ function renderStreamItem(stream) {
         <div class="stream-url" title="${escapeHtml(stream.url)}">${escapeHtml(urlDisplay)}</div>
         <div class="stream-meta">${escapeHtml(stream.contentType || "")}${sizeDisplay ? " · " + sizeDisplay : ""}${stream.isBlobUrl ? " · requires page context" : ""}</div>
       </div>
-      <button class="stream-dl-btn" data-url="${escapeHtml(stream.url)}" data-type="${stream.type}"${stream.isBlobUrl ? ' data-blob="true"' : ""}>${btnLabel}</button>
+      <button class="stream-dl-btn" data-url="${escapeHtml(stream.url)}" data-type="${escapeHtml(String(stream.type))}"${stream.isBlobUrl ? ' data-blob="true"' : ""}>${btnLabel}</button>
     </div>`;
 }
 
@@ -723,6 +732,9 @@ function handleDownloadClick() {
   const select = document.getElementById("qualitySelect");
   const btn = document.getElementById("dlBtn");
   if (!select || !btn || btn.disabled) return;
+  // While a download runs the button is in "Stop" mode and has its own
+  // onclick; this listener is still attached and must not start a second one.
+  if (btn.onclick) return;
 
   const value = select.value;
   if (!value) return;

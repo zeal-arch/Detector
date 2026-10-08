@@ -2010,6 +2010,48 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       respond({ hasSpecialist: !!scriptFile, scriptFile: scriptFile || null });
       return false;
     }
+
+    case "FETCH_PLAYER_JS": {
+      // Relay for inject.js: YouTube's service worker blocks in-page fetches.
+      let playerHost = "";
+      try {
+        playerHost = new URL(msg.url).hostname;
+      } catch {}
+      if (
+        !sender.tab ||
+        !(playerHost === "www.youtube.com" || playerHost === "youtube.com")
+      ) {
+        respond({ error: "Refused: not a YouTube player URL" });
+        return false;
+      }
+      fetch(msg.url, { cache: "force-cache" })
+        .then(async (r) => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          respond({ text: await r.text() });
+        })
+        .catch((e) => respond({ error: e.message }));
+      return true;
+    }
+
+    case "ADD_KEY_HOST_HEADERS": {
+      // Extra header rules for HLS key hosts that differ from the segment host.
+      const hosts = Array.isArray(msg.hosts)
+        ? msg.hosts.filter((h) => typeof h === "string" && /^[\w.-]+$/.test(h))
+        : [];
+      Promise.all(
+        hosts.map((h) => addSessionHeaders("||" + h + "/", msg.headers || {})),
+      )
+        .then((ruleIds) => respond({ ruleIds }))
+        .catch((e) => respond({ ruleIds: [], error: e.message }));
+      return true;
+    }
+
+    case "REFRESH_YOUTUBE_URLS":
+      // URL refresh is not implemented. Reply with an error so the sender's
+      // callback is not left with an unchecked "no receiver" lastError.
+      // (offscreen.js only logs this; the worker still times out on its own.)
+      respond({ error: "URL refresh not supported" });
+      return false;
   }
 });
 
@@ -3250,6 +3292,40 @@ async function ensureOffscreen() {
 // solve all challenges in one shot.  This is the same approach yt-dlp uses
 // with Deno/Node — but we use the Chrome MV3 sandbox iframe instead.
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Evaluates extracted legacy cipher code for a batch of signatures inside the
+// sandboxed iframe (via the offscreen document). Resolves to string[].
+async function sandboxEvalCipher(cipherCode, argName, sigs) {
+  await ensureOffscreen();
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("Cipher eval timed out")),
+      15000,
+    );
+    chrome.runtime.sendMessage(
+      {
+        target: "offscreen",
+        action: "EVAL_CIPHER",
+        cipherCode,
+        argName,
+        sigs: sigs || [],
+      },
+      (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (response?.error || !Array.isArray(response?.results)) {
+          reject(new Error(response?.error || "Cipher eval failed"));
+          return;
+        }
+        resolve(response.results);
+      },
+    );
+  });
+}
 
 async function sandboxSolvePlayer(
   playerJs,
@@ -5667,11 +5743,15 @@ async function onSpecialistDetected(msg, tabId) {
   let thumbnail = null;
   let duration = null;
   let platform = null;
+  // Declared here (not inside the MAGIC_M3U8 branch) because they are used
+  // again further down when setting up CDN header rules and HLS variants.
+  let specialistHeaders = null;
+  let videoUrl = null;
 
   if (msg.protocol === "MAGIC_M3U8") {
     const d = msg.payload || {};
     videoId = d.videoId || d.id || null;
-    const videoUrl = d.url;
+    videoUrl = d.url;
     const videoType = (d.type || "MP4").toUpperCase();
     const opts = d.options || {};
     title = opts.customTitle || opts.title || null;
@@ -5682,7 +5762,7 @@ async function onSpecialistDetected(msg, tabId) {
     if (!videoUrl) return { success: false, error: "No video URL" };
 
     // Specialists can provide required HTTP headers (e.g. Referer for CDNs)
-    const specialistHeaders = opts.headers || null;
+    specialistHeaders = opts.headers || null;
 
     let mimeType = "video/mp4";
     if (videoType === "HLS" || videoType === "M3U8")

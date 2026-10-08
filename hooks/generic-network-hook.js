@@ -25,6 +25,13 @@
     }
   }
 
+  // Injected by both manifest.json and background.js (iframe hooks); a second
+  // run would wrap every patched API again. Symbol keys are invisible to
+  // enumeration, unlike a plain window property.
+  var _loadedKey = Symbol.for("__gnh");
+  if (window[_loadedKey]) return;
+  window[_loadedKey] = true;
+
   const MAGIC = "__generic_extractor__";
   const seen = new Set();
   const blobMap = new Map();
@@ -1123,14 +1130,22 @@
           return origAddEventListener(type, listener, options);
         };
 
-        // Also intercept onmessage setter
+        // Also intercept the onmessage setter. The page's handler must still
+        // be registered natively, otherwise the site stops receiving messages.
         var origOnMessage = null;
+        var onMessageWrapper = null;
         Object.defineProperty(ws, "onmessage", {
           get: function () {
             return origOnMessage;
           },
           set: function (handler) {
-            origOnMessage = function (event) {
+            if (onMessageWrapper) {
+              ws.removeEventListener("message", onMessageWrapper);
+              onMessageWrapper = null;
+            }
+            origOnMessage = handler;
+            if (typeof handler !== "function") return;
+            onMessageWrapper = function (event) {
               wsMessageCount++;
               if (wsMessageCount % 5 === 1) {
                 try {
@@ -1153,8 +1168,9 @@
                   }
                 } catch (e) {}
               }
-              return handler.call(this, event);
+              return handler.call(ws, event);
             };
+            origAddEventListener("message", onMessageWrapper);
           },
           configurable: true,
           enumerable: true,
@@ -1232,6 +1248,9 @@
         return es;
       };
 
+      window.EventSource.CONNECTING = OrigEventSource.CONNECTING;
+      window.EventSource.OPEN = OrigEventSource.OPEN;
+      window.EventSource.CLOSED = OrigEventSource.CLOSED;
       window.EventSource.prototype = OrigEventSource.prototype;
     } catch (e) {}
   }

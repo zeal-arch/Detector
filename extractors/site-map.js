@@ -37,7 +37,6 @@ const SITE_EXTRACTOR_MAP = {
   "max.com": "hbomax.js",
   "hulu.com": "hulu.js",
   "primevideo.com": "primevideo.js",
-  "amazon.com": "primevideo.js",
   "peacocktv.com": "peacock.js",
   "paramountplus.com": "paramountplus.js",
   "starz.com": "starz.js",
@@ -171,6 +170,7 @@ const SITE_EXTRACTOR_MAP = {
   "cda.pl": "cda.js",
 
   "imgur.com": "imgur.js",
+  "9gag.com": "ninegag.js",
   "flickr.com": "flickr.js",
   "archive.org": "archive.js",
   "dropbox.com": "dropbox.js",
@@ -180,7 +180,6 @@ const SITE_EXTRACTOR_MAP = {
   "canva.com": "canva.js",
   "floatplane.com": "floatplane.js",
   "patreon.com": "patreon.js",
-  "steam.com": "steam.js",
   "steampowered.com": "steam.js",
   "medal.tv": "medal.js",
   "gfycat.com": "gfycat.js",

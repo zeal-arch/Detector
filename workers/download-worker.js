@@ -822,7 +822,7 @@ async function downloadM3U8(
       lastSpeedBytes = totalBytesDownloaded;
     }
     return currentSpeed > 0
-      ? ` â€¢ ${formatBytes(Math.round(currentSpeed))}/s`
+      ? ` • ${formatBytes(Math.round(currentSpeed))}/s`
       : "";
   }
 
@@ -930,7 +930,7 @@ async function downloadM3U8(
       .catch((err) => {
         // yt-dlp inspired: skip unavailable fragments instead of aborting entire download
         // First segment is always fatal (like yt-dlp's is_fatal logic)
-        if (i === 0) throw err;
+        if (i === 0 || isCancelled(downloadId)) throw err;
         skippedFragments++;
         console.log(
           `[Worker] Skipping unavailable segment ${i}: ${err.message} (${skippedFragments} skipped so far)`,
@@ -952,6 +952,14 @@ async function downloadM3U8(
   await Promise.all(downloadPromises);
 
   if (isCancelled(downloadId)) throw new Error("Cancelled");
+
+  // Tolerate a few dead fragments, but do not report a badly incomplete
+  // download as a success.
+  if (skippedFragments > Math.max(1, Math.floor(mediaSegments.length * 0.05))) {
+    throw new Error(
+      `Download incomplete: ${skippedFragments} of ${mediaSegments.length} segments could not be fetched`,
+    );
+  }
 
   reportProgress(downloadId, "merging", 82, "Concatenating segments...");
 
@@ -1163,7 +1171,7 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
       dashSpeedStart = now;
       dashLastSpeedBytes = dashBytesDownloaded;
     }
-    return dashSpeed > 0 ? ` â€¢ ${formatBytes(Math.round(dashSpeed))}/s` : "";
+    return dashSpeed > 0 ? ` • ${formatBytes(Math.round(dashSpeed))}/s` : "";
   }
 
   reportProgress(downloadId, "downloading", 0, `0 / ${total} segments`);
@@ -1192,9 +1200,10 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
         }
         seenHashes.add(segHash);
 
+        // `??` not `||`: the init segment has index 0, which must stay 0.
         if (seg.track === "video")
-          videoChunks.push({ index: seg.index || i, data });
-        else audioChunks.push({ index: seg.index || i, data });
+          videoChunks.push({ index: seg.index ?? i, data });
+        else audioChunks.push({ index: seg.index ?? i, data });
 
         dashBytesDownloaded += data.byteLength;
         completed++;
@@ -1208,7 +1217,12 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
       .catch((err) => {
         // yt-dlp inspired: skip unavailable fragments instead of aborting entire download
         // First segment of each track is always fatal (use seg.index, not allSegments index i)
-        if (seg.index === 0 || (seg.index === undefined && i === 0)) throw err;
+        if (
+          seg.index === 0 ||
+          (seg.index === undefined && i === 0) ||
+          isCancelled(downloadId)
+        )
+          throw err;
         skippedFragments++;
         console.log(
           `[Worker] Skipping unavailable DASH segment ${i} (${seg.track}): ${err.message}`,
@@ -1226,6 +1240,12 @@ async function downloadDASH(downloadId, mpdUrl, filename, headers = {}) {
   await Promise.all(promises);
 
   if (isCancelled(downloadId)) throw new Error("Cancelled");
+
+  if (skippedFragments > Math.max(1, Math.floor(total * 0.05))) {
+    throw new Error(
+      `Download incomplete: ${skippedFragments} of ${total} segments could not be fetched`,
+    );
+  }
 
   reportProgress(downloadId, "merging", 82, "Concatenating...");
 

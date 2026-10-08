@@ -8,6 +8,11 @@ export default [
       "graphify-out/**",
       "lib/libav*",
       "sandbox/vendor/**",
+      // Third-party / unrelated trees that live next to the extension
+      "web-app/**",
+      "KeepStreams/**",
+      "StreamFab_*/**",
+      "yt-dlp/**",
     ],
   },
   {
@@ -82,7 +87,15 @@ export default [
         chrome: "readonly",
         browser: "readonly",
         self: "readonly",
+        SegmentPool: "writable",
+        // Loaded with importScripts() / manifest background.scripts
+        DRMDetection: "readonly",
+        SITE_EXTRACTOR_MAP: "readonly",
       },
+    },
+    rules: {
+      // Catches use-outside-scope bugs (e.g. a `const` declared in one branch)
+      "no-undef": "error",
     },
   },
 ];

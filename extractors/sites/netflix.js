@@ -61,6 +61,6 @@
             lastUrl = location.href;
             setTimeout(extractVideo, 1000);
         }
-    }).observe(document.body, { subtree: true, childList: true });
+    }).observe(document.body || document.documentElement, { subtree: true, childList: true });
 
 })();

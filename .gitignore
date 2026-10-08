@@ -7,3 +7,8 @@ node_modules/
 eslint-report.json
 graphify-out/
 
+
+# Third-party / proprietary software, never commit
+KeepStreams/
+StreamFab_*/
+keepstreams_online_*.exe
