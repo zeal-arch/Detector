@@ -53,7 +53,8 @@
         "webRequest",
         "notifications",
         "scripting",
-        "alarms"
+        "alarms",
+        "sidePanel"
     ],
     "host_permissions": [
         "*://*.youtube.com/*",
@@ -443,6 +444,9 @@
             ]
         }
     ],
+    "side_panel": {
+        "default_path": "popup/sidepanel.html"
+    },
     "sandbox": {
         "pages": [
             "sandbox/sandbox.html"

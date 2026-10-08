@@ -33,37 +33,35 @@ function pruneFailedPlayerUrls() {
 // S34 fix: Merge queue to prevent concurrent large merges from exhausting memory
 // Each merge holds video + audio buffers (~1-2 GB each) in memory simultaneously.
 // Serialize large merges to avoid OOM crashes.
-let activeMerge = null; // Promise for the current merge operation
-const MERGE_MEMORY_THRESHOLD = 500 * 1024 * 1024; // 500 MB — serialize if either track > this
+// One libav instance and fixed MEMFS/OPFS file names are shared by every
+// merge and transmux, so they must run strictly one at a time.
+let libavLock = Promise.resolve();
 
 /**
- * Queue and serialize merge operations to prevent memory exhaustion.
- * @param {Function} mergeFn - The merge function to execute
- * @param {number} estimatedSize - Estimated memory usage in bytes
- * @returns {Promise} - Resolves when merge completes
+ * Acquire the libav lock. Resolves to a release function once every earlier
+ * holder has released; callers must call it in a finally block.
  */
-async function queueMerge(mergeFn, estimatedSize = 0) {
-  // If the merge is large, wait for the current merge to finish
-  if (estimatedSize > MERGE_MEMORY_THRESHOLD && activeMerge) {
-    console.log(
-      `[OFFSCREEN] Large merge (${(estimatedSize / 1024 / 1024).toFixed(1)} MB) queued, waiting for active merge...`,
-    );
-    try {
-      await activeMerge;
-    } catch {}
-  }
+function acquireLibavLock() {
+  let release;
+  const next = new Promise((resolve) => {
+    release = resolve;
+  });
+  const ready = libavLock.then(() => release);
+  libavLock = libavLock.then(() => next);
+  return ready;
+}
 
-  // Execute the merge
-  const mergePromise = mergeFn();
-  activeMerge = mergePromise;
-
+/**
+ * Serialize merge operations (they share one libav instance and file names).
+ * @param {Function} mergeFn - The merge function to execute
+ * @returns {Promise} - Resolves when the merge completes
+ */
+async function queueMerge(mergeFn) {
+  const release = await acquireLibavLock();
   try {
-    return await mergePromise;
+    return await mergeFn();
   } finally {
-    // Clear activeMerge when this merge completes
-    if (activeMerge === mergePromise) {
-      activeMerge = null;
-    }
+    release();
   }
 }
 
@@ -630,7 +628,7 @@ async function handleMergeAndDownload(msg, sendResponse) {
   // Queue the merge if it's large; pass known sizes for accurate progress
   return queueMerge(async () => {
     return await _doMerge(msg, sendResponse, knownVideoLength, knownAudioLength);
-  }, estimatedSize);
+  });
 }
 
 /**
@@ -1069,8 +1067,13 @@ function handleStartWorkerDownload(msg, sendResponse) {
           );
           break;
 
-        case "download_result":
+        case "download_result": {
+          // Merge / transmux use the shared libav instance: take the lock.
+          let releaseLibav = null;
           try {
+            if (msgData.audioBlobUrl || msgData.needsTransmux) {
+              releaseLibav = await acquireLibavLock();
+            }
             let finalBlobUrl;
             let finalFilename = filename;
             let finalSize = msgData.size || 0;
@@ -1536,9 +1539,12 @@ function handleStartWorkerDownload(msg, sendResponse) {
             worker.terminate();
             activeWorkers.delete(downloadId);
             cleanupAllHeaders();
+          } finally {
+            if (releaseLibav) releaseLibav();
           }
 
           break;
+        }
 
         case "download_error":
           console.log("[OFFSCREEN] Worker error:", msgData.error);

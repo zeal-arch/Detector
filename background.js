@@ -155,6 +155,67 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Also check on service worker startup
 checkForUpdate();
 
+// ========== Re-inject content scripts into already-open tabs ==========
+// Chrome does not inject manifest content scripts into tabs that were open
+// when the extension was installed or updated, so detection would not work
+// until each tab was reloaded. Re-run the manifest's own content_scripts.
+
+/** Convert a manifest match pattern (e.g. "*://*.x.com/*") to a RegExp. */
+function matchPatternToRegExp(pattern) {
+  if (pattern === "<all_urls>") return /^(?:https?|file|ftp):\/\//;
+  const m = /^(\*|https?|file|ftp):\/\/([^/]*)(\/.*)$/.exec(pattern);
+  if (!m) return null;
+  const esc = (t) => t.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  const scheme = m[1] === "*" ? "https?" : m[1];
+  let host;
+  if (m[2] === "*") host = "[^/]*";
+  else if (m[2].startsWith("*.")) host = "(?:[^/]*\\.)?" + esc(m[2].slice(2));
+  else host = esc(m[2]);
+  const path = esc(m[3]).replace(/\*/g, ".*");
+  return new RegExp("^" + scheme + "://" + host + path + "$");
+}
+
+async function reinjectContentScripts() {
+  const entries = (chrome.runtime.getManifest().content_scripts || [])
+    .filter((cs) => Array.isArray(cs.js) && cs.js.length)
+    .map((cs) => ({
+      cs,
+      include: (cs.matches || []).map(matchPatternToRegExp).filter(Boolean),
+      exclude: (cs.exclude_matches || [])
+        .map(matchPatternToRegExp)
+        .filter(Boolean),
+    }));
+
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  let injected = 0;
+  for (const tab of tabs) {
+    if (tab.discarded || !tab.url) continue;
+    for (const { cs, include, exclude } of entries) {
+      if (!include.some((re) => re.test(tab.url))) continue;
+      if (exclude.some((re) => re.test(tab.url))) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: !!cs.all_frames },
+          files: cs.js,
+          world: cs.world === "MAIN" ? "MAIN" : "ISOLATED",
+        });
+        injected++;
+      } catch {
+        // Restricted pages (web store, PDF viewer) reject injection.
+      }
+    }
+  }
+  console.log(`[BG] Re-injected content scripts: ${injected} injection(s)`);
+}
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "install" || details.reason === "update") {
+    reinjectContentScripts().catch((e) =>
+      console.warn("[BG] Content script re-injection failed:", e.message),
+    );
+  }
+});
+
 // ========== YouTube itag → format metadata lookup (IDM-style sniffing) ==========
 // When YouTube's player.js fetches a videoplayback URL, cipher & N-sig are already
 // applied. We capture those URLs and use this table to reconstruct format metadata.
@@ -2088,7 +2149,24 @@ function extractVideoIdFromUrl(url) {
 async function onVideoDetected(msg, tabId) {
   console.log("[BG] Video detected:", msg.videoId, "tab:", tabId);
   try {
-    const info = await getFormats(msg.videoId, msg.pageData || {}, tabId);
+    // Only YouTube pages need the InnerTube / player.js tiers. Every other
+    // extractor (Generic, Twitter, Instagram, ...) sets `extractor` and
+    // already supplies its formats; sending its page-derived id to youtube.com
+    // (with the user's YouTube cookies) would be wrong and slow.
+    const nonYouTube = !!msg.extractor && msg.extractor !== "YouTube";
+    const pageDataIn = msg.pageData || {};
+    const info = await getFormats(
+      msg.videoId,
+      nonYouTube ? { ...pageDataIn, nonYouTube: true } : pageDataIn,
+      tabId,
+    );
+
+    // Later detection messages often carry no subtitles; keep the ones the
+    // tab already found instead of overwriting them.
+    if (!info.subtitles?.length) {
+      const prevSubs = tabData.get(tabId)?.info?.subtitles;
+      if (prevSubs?.length) info.subtitles = prevSubs;
+    }
 
     // Check for DRM protection
     const drmCheck = DRMDetection.checkVideoData({
@@ -2187,6 +2265,27 @@ async function getFormats(videoId, pageData, tabId = null) {
 }
 
 async function getFormatsInner(videoId, pageData, tabId = null) {
+  // Non-YouTube extractors: use the formats they resolved, no YouTube calls.
+  if (pageData.nonYouTube) {
+    const formats = pageData.resolvedFormats || [];
+    if (!formats.length) throw new Error("No formats detected");
+    let nextItag = 80000;
+    for (const f of formats) {
+      if (!f.itag) f.itag = nextItag++;
+    }
+    return {
+      videoId,
+      title: pageData.title || "Video",
+      author: pageData.author || "",
+      lengthSeconds: pageData.duration || 0,
+      thumbnail: pageData.thumbnail || "",
+      formats,
+      subtitles: pageData.subtitles || [],
+      clientUsed: pageData.formatSource || "extractor",
+      loggedIn: null,
+    };
+  }
+
   // ============ Common setup (shared by all tiers) ============
   // Tier priority (2026+ architecture):
   //   Tier 1: InnerTube API clients (android_vr, web) — most reliable
@@ -2763,6 +2862,7 @@ async function getFormatsInner(videoId, pageData, tabId = null) {
       thumbnail:
         vd.thumbnail?.thumbnails?.slice(-1)[0]?.url || pageData.thumbnail || "",
       formats: pageData.resolvedFormats,
+      subtitles: pageData.subtitles || [],
       clientUsed: pageData.formatSource || "page_deciphered",
       loggedIn: pageData.loggedIn ?? null,
     };

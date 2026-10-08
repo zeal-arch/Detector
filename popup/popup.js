@@ -789,6 +789,42 @@ function handleDownloadClick() {
   }
 }
 
+/**
+ * Appends a "Subtitles" list under the video card when the page exposed
+ * subtitle tracks (<track>, .srt/.vtt links). Only http(s) URLs are offered.
+ */
+function renderSubtitles(info) {
+  const subs = ((info && info.subtitles) || [])
+    .filter((s) => s && /^https?:\/\//i.test(s.url || ""))
+    .slice(0, 12);
+  if (!subs.length || !content) return;
+
+  const wrap = document.createElement("div");
+  wrap.className = "subs-section";
+  wrap.innerHTML =
+    `<div class="video-meta-tag">Subtitles</div>` +
+    subs
+      .map(
+        (s, i) =>
+          `<button class="stream-dl-btn" data-sub="${i}">${escapeHtml(
+            s.label || s.language || "Subtitle",
+          )}${s.language && s.language !== "unknown" ? " (" + escapeHtml(s.language) + ")" : ""}</button>`,
+      )
+      .join(" ");
+  content.appendChild(wrap);
+
+  wrap.querySelectorAll("[data-sub]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const s = subs[Number(b.dataset.sub)];
+      const ext =
+        (s.url.split(/[?#]/)[0].match(/\.(srt|vtt|ass|ssa|sub|ttml)$/i) || [])[1] ||
+        "vtt";
+      const lang = s.language && s.language !== "unknown" ? "." + s.language : "";
+      downloadFormat(s.url, `${currentVideoTitle || "subtitle"}${lang}.${ext}`);
+    });
+  });
+}
+
 async function downloadFormat(url, filename, saveAs = true) {
   try {
     const resp = await chrome.runtime.sendMessage({
@@ -1499,6 +1535,7 @@ async function init() {
 
       if (response?.formats?.length > 0) {
         renderVideo(response);
+        renderSubtitles(response);
       } else if (response?.formats) {
         renderError(
           "No downloadable formats",
@@ -1525,6 +1562,7 @@ async function init() {
 
       if (response?.formats?.length > 0) {
         renderVideo(response);
+        renderSubtitles(response);
         if (sniffedStreams.length > 0) appendSniffedStreams(sniffedStreams);
       } else if (sniffedStreams.length > 0) {
         renderSniffedStreams(sniffedStreams);
@@ -1673,6 +1711,45 @@ async function init() {
     try {
       await showActiveDownloads();
     } catch {}
+  }
+}
+
+// ─── Side panel support ──────────────────────────────────────────────
+// popup.html?mode=panel is loaded by popup/sidepanel.html. In that mode the
+// layout fills the panel and the view follows the active tab, because a
+// side panel (unlike the popup) stays open while the user switches tabs.
+const IS_PANEL = new URLSearchParams(location.search).get("mode") === "panel";
+if (IS_PANEL) {
+  document.body.classList.add("panel");
+  let panelRefreshTimer = null;
+  const refreshPanel = () => {
+    clearTimeout(panelRefreshTimer);
+    panelRefreshTimer = setTimeout(() => {
+      if (currentView === "list" && !activeMergeInProgress && !activeWorkerDownloadId)
+        init();
+    }, 400);
+  };
+  chrome.tabs.onActivated.addListener(refreshPanel);
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+    if (tab.active && changeInfo.status === "complete") refreshPanel();
+  });
+} else if (chrome.sidePanel?.open) {
+  const panelBtn = document.getElementById("panelBtn");
+  if (panelBtn) {
+    panelBtn.style.display = "";
+    panelBtn.addEventListener("click", async () => {
+      try {
+        const [tab] = await chrome.tabs.query({
+          active: true,
+          currentWindow: true,
+        });
+        // open() must run inside the click's user gesture
+        await chrome.sidePanel.open({ windowId: tab.windowId });
+        window.close();
+      } catch (e) {
+        console.warn("Could not open side panel:", e.message);
+      }
+    });
   }
 }
 

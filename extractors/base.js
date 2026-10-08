@@ -45,6 +45,7 @@ class BaseExtractor {
         title: data.title || document.title,
         duration: data.duration || null,
         thumbnail: data.thumbnail || null,
+        subtitles: Array.isArray(data.subtitles) ? data.subtitles : [],
         ...data.extra,
       },
     };
